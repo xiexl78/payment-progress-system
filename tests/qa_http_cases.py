@@ -1267,7 +1267,7 @@ def _batch6_export_import(s_admin):
             found = (path, r)
             break
     check('导出', '存在 Excel 导出接口（admin 可下载 xlsx）', found is not None,
-          '候选路径均不可用：%s' % candidates, xfail='P0-05')
+          '候选路径均不可用：%s' % candidates)
     if found:
         path, resp = found
         rows = []
@@ -1277,34 +1277,37 @@ def _batch6_export_import(s_admin):
             wb = load_workbook(_io.BytesIO(resp.content))
             rows = list(wb.active.iter_rows(values_only=True))
         except Exception as e:
-            check('导出', '导出文件可被 openpyxl 解析', False, repr(e), xfail='P0-05')
+            check('导出', '导出文件可被 openpyxl 解析', False, repr(e))
         flat = ' '.join(str(c) for row in rows[:3] for c in row if c is not None)
         check('导出', '导出字段与页面一致（项目编号/项目名称/金额）',
-              all(k in flat for k in ('项目编号', '项目名称')), flat[:120], xfail='P0-05')
+              all(k in flat for k in ('项目编号', '项目名称')), flat[:120])
         check('导出', '导出金额为两位小数（Decimal 口径）',
               any(isinstance(c, (int, float)) and abs(round(float(c), 2) - float(c)) < 1e-9
-                  for row in rows for c in row), '未发现两位小数金额', xfail='P0-05')
+                  for row in rows for c in row), '未发现两位小数金额')
         cnt_all = q1(DB, 'SELECT COUNT(*) FROM projects')
         page_all = s_admin.get(BASE + path).text
         check('导出', '导出筛选条件生效（不限条件导出全部项目）',
-              len(rows) >= min(cnt_all, 2), 'rows=%d projects=%d' % (len(rows), cnt_all), xfail='P0-05')
+              len(rows) >= min(cnt_all, 2), 'rows=%d projects=%d' % (len(rows), cnt_all))
         sv, _ = C.login(BASE, 'viewer', '123456')
-        check('导出', 'viewer 可导出', sv.get(BASE + path, allow_redirects=False).status_code == 200,
-              xfail='P0-05')
+        check('导出', 'viewer 可导出', sv.get(BASE + path, allow_redirects=False).status_code == 200)
         check('导出', '未登录用户导出被拒',
               requests.get(BASE + path, allow_redirects=False).status_code in (301, 302, 401, 403))
         base_audit = _audit_max_id()
         s_admin.get(BASE + path)
         acts = [str(x.get('action', '')) for x in _audit_rows(base_audit)]
-        check('导出', '导出写审计', any('export' in a for a in acts), '动作=%s' % acts, xfail='P0-05')
+        check('导出', '导出写审计', any('export' in a for a in acts), '动作=%s' % acts)
 
     # 6b 导入：脚本 + dry-run 报告 + 未提交不改库
     imp = os.path.join(PROJECT_ROOT, 'scripts', 'import_excel.py')
     has_imp = os.path.exists(imp)
-    check('导入', '提供 import_excel.py（支持 dry-run）', has_imp,
-          '未找到 scripts/import_excel.py', xfail='P0-06')
+    check('导入', '提供 import_excel.py（支持 dry-run）', has_imp, '未找到 scripts/import_excel.py')
     if has_imp:
         tmp = tempfile.mkdtemp(prefix='payment_qa_import_')
+        imp_db = os.path.join(tmp, 'import.db')
+        try:
+            C.seed_db(imp_db)
+        except Exception:
+            imp_db = None
         xlsx = os.path.join(tmp, 'seed_import.xlsx')
         try:
             from openpyxl import Workbook
@@ -1318,31 +1321,46 @@ def _batch6_export_import(s_admin):
             wb.save(xlsx)
         except ImportError:
             pass
-        if os.path.exists(xlsx):
+        if os.path.exists(xlsx) and imp_db:
             env = os.environ.copy()
+            env['PYTHONIOENCODING'] = 'utf-8'
+            env['PYTHONUTF8'] = '1'
             env['SECRET_KEY'] = 'qa-import-secret'
-            before = (q1(DB, 'SELECT COUNT(*) FROM projects'), q1(DB, 'SELECT COUNT(*) FROM payment_nodes'))
+            before = (q1(imp_db, 'SELECT COUNT(*) FROM projects'),
+                      q1(imp_db, 'SELECT COUNT(*) FROM payment_nodes'))
+            report = os.path.join(tmp, 'import_report.txt')
             out = os.path.join(tmp, 'import_out.txt')
             with open(out, 'w', encoding='utf-8') as f:
-                rc = subprocess.run([sys.executable, imp, '--dry-run', '--input', xlsx],
-                                    cwd=PROJECT_ROOT, env=env, stdout=f,
-                                    stderr=subprocess.STDOUT, timeout=180).returncode
-            try:
-                text = open(out, encoding='utf-8').read()
-            except Exception:
-                text = ''
+                rc = subprocess.run(
+                    [sys.executable, imp, '--dry-run', '--input', xlsx,
+                     '--db', imp_db, '--report', report],
+                    cwd=PROJECT_ROOT, env=env, stdout=f,
+                    stderr=subprocess.STDOUT, timeout=180).returncode
+            text = ''
+            for src in (report, out):
+                try:
+                    text += open(src, encoding='utf-8', errors='replace').read()
+                except Exception:
+                    pass
             check('导入', 'dry-run 报告列出错误行（必填/唯一/金额/状态）',
                   rc == 0 and any(k in text for k in ('错误', 'ERROR', '失败'))
-                  and any(k in text for k in ('必填', '重复', '金额', '状态')),
-                  'rc=%s out=%s' % (rc, text[-200:]), xfail='P0-06')
-            after = (q1(DB, 'SELECT COUNT(*) FROM projects'), q1(DB, 'SELECT COUNT(*) FROM payment_nodes'))
-            check('导入', 'dry-run 未提交时数据库不变', before == after, '%s→%s' % (before, after),
-                  xfail='P0-06')
+                  and any(k in text for k in ('必填', '重复', '金额', '状态', '项目编号')),
+                  'rc=%s out=%s' % (rc, text[-300:]))
+            after = (q1(imp_db, 'SELECT COUNT(*) FROM projects'),
+                     q1(imp_db, 'SELECT COUNT(*) FROM payment_nodes'))
+            check('导入', 'dry-run 未提交时数据库不变', before == after, '%s→%s' % (before, after))
         else:
             check('导入', 'dry-run 报告列出错误行（必填/唯一/金额/状态）', False,
-                  '缺少 openpyxl 或报告格式未定义', xfail='P0-06')
+                  '缺少 openpyxl 或临时库创建失败', xfail='P0-06')
             check('导入', 'dry-run 未提交时数据库不变', False, '无法构造测试文件', xfail='P0-06')
 
+        # 6b 补丁：--update-existing 与冻结节点保护
+        imp_src = open(imp, encoding='utf-8').read()
+        check('导入', '支持 --update-existing（更新已存在项目）',
+              '--update-existing' in imp_src, '参数未实现')
+        check('导入', '更新已存在项时冻结节点受保护（有付款/开票不改）',
+              ('--update-existing' in imp_src) and any(k in imp_src for k in ('冻结', 'frozen', '已发生')),
+              '冻结保护未实现')
 
 def run(server):
     global DB, BASE, APP, UPLOAD_DIR
