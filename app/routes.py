@@ -12,7 +12,7 @@ from functools import wraps
 from flask import (Blueprint, render_template, request, redirect, url_for, session,
                    flash, jsonify, abort, current_app, send_file)
 from sqlalchemy import or_, update
-from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
 from . import NODE_TEMPLATES, FLOW_STATUS, login_guard, session_guard, timeutil
 from .audit import action_options, record as audit_record, snapshot as audit_snapshot
@@ -533,33 +533,40 @@ def project_new():
         project = Project(project_no=project_no, name=name, remark=remark,
                           status='进行中', created_by=current_user().id,
                           updated_by=current_user().id)
-        db.session.add(project)
-        db.session.flush()
+        try:
+            db.session.add(project)
+            db.session.flush()
 
-        items = []
-        for row in item_rows:
-            item = ProjectItem(project_id=project.id, item_name=row['item_name'],
-                               tax_rate=row['tax_rate'],
-                               original_amount=row['original_amount'],
-                               additional_amount=row['additional_amount'],
-                               updated_by=current_user().id)
-            db.session.add(item)
-            items.append(item)
-        db.session.flush()
+            items = []
+            for row in item_rows:
+                item = ProjectItem(project_id=project.id, item_name=row['item_name'],
+                                   tax_rate=row['tax_rate'],
+                                   original_amount=row['original_amount'],
+                                   additional_amount=row['additional_amount'],
+                                   updated_by=current_user().id)
+                db.session.add(item)
+                items.append(item)
+            db.session.flush()
 
-        # 为每个科目生成 4 个付款节点
-        for it in items:
-            for t in NODE_TEMPLATES:
-                node = PaymentNode(project_id=project.id, item_id=it.id,
-                                   node_type=t['node_type'], node_name=t['node_name'],
-                                   ratio=Decimal(str(t['ratio'])), calc_base=t['calc_base'],
-                                   status='未触发', updated_by=current_user().id)
-                node.recalc()
-                db.session.add(node)
-        sync_project_dates(project)
-        audit_record('project.create', 'project', project.id, project.id,
-                     after=_project_snapshot(project), critical=False)
-        db.session.commit()
+            # 为每个科目生成 4 个付款节点
+            for it in items:
+                for t in NODE_TEMPLATES:
+                    node = PaymentNode(project_id=project.id, item_id=it.id,
+                                       node_type=t['node_type'], node_name=t['node_name'],
+                                       ratio=Decimal(str(t['ratio'])), calc_base=t['calc_base'],
+                                       status='未触发', updated_by=current_user().id)
+                    node.recalc()
+                    db.session.add(node)
+            sync_project_dates(project)
+            audit_record('project.create', 'project', project.id, project.id,
+                         after=_project_snapshot(project), critical=False)
+            db.session.commit()
+        except IntegrityError:
+            # 并发创建同一项目编号：唯一索引兜底（flush 即触发），不能 500（P2-07）
+            db.session.rollback()
+            flash('项目编号「%s」已存在（可能刚被其他人创建），请换一个编号重试' % project_no,
+                  'danger')
+            return redirect(url_for('main.projects'))
         flash('项目创建成功，已自动生成付款节点（编号：%s）' % project_no, 'success')
         return redirect(url_for('main.project_detail', project_id=project.id))
     return render_template('project_form.html', templates=templates, project=None)
@@ -990,6 +997,33 @@ def contract_upload_dir():
     return d
 
 
+def contract_storage_path(contract):
+    """合同文件的绝对路径：不依赖进程 CWD（P2-05）。
+
+    ``stored_path`` 形如 ``uploads/<id>.<ext>``（相对 UPLOAD_DIR）；兼容历史绝对路径。
+    """
+    raw = (contract.stored_path or '').replace('\\', '/').strip()
+    if not raw:
+        return None
+    if os.path.isabs(raw):
+        return raw
+    name = raw.split('/', 1)[1] if raw.startswith('uploads/') else raw
+    return os.path.join(contract_upload_dir(), name)
+
+
+def _discard_contract_file(contract):
+    """删除合同落盘文件（上传失败/校验不过时避免残留）；DB 记录与路径保留供追溯。"""
+    path = contract_storage_path(contract)
+    if not path:
+        return
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except OSError as exc:
+        current_app.logger.warning('删除合同残留文件失败：%s（%s）', path, exc)
+    contract.file_size = 0
+
+
 def _next_contract_project_no():
     """自动生成项目编号：PJ-CT-YYYYMMDD-序号（当天不重复）"""
     today = date.today().strftime('%Y%m%d')
@@ -1068,8 +1102,18 @@ def contract_upload():
     contract.stored_path = os.path.join('uploads', safe_name)
     contract.file_size = os.path.getsize(stored) if os.path.exists(stored) else 0
 
-    text, extract_msg = extract_text(stored, file_type)
+    try:
+        text, extract_msg = extract_text(stored, file_type)
+    except Exception as exc:
+        # 处理异常也不留落盘残留文件
+        _discard_contract_file(contract)
+        contract.status = 'failed'
+        contract.error_msg = '文本提取异常：%s' % exc
+        db.session.commit()
+        flash('合同处理失败：%s' % exc, 'danger')
+        return redirect(url_for('main.contracts'))
     if text is None:
+        _discard_contract_file(contract)
         contract.status = 'failed'
         contract.error_msg = extract_msg or '文本提取失败'
         audit_record('contract.upload', 'contract', contract.id, result='failed',
@@ -1516,8 +1560,8 @@ def contract_rerun(contract_id):
     contract = db.session.get(ContractFile, contract_id)
     if not contract:
         abort(404)
-    storage = os.path.join('instance', contract.stored_path.replace('\\', '/'))
-    if not os.path.exists(storage):
+    storage = contract_storage_path(contract)
+    if not storage or not os.path.exists(storage):
         flash('合同文件已丢失，无法重新识别', 'danger')
         return redirect(url_for('main.contracts'))
     text, extract_msg = extract_text(storage, contract.file_type)

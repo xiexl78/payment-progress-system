@@ -971,6 +971,8 @@ def classify_against_db(plan, update_existing):
         touched = bool(changes)
         dates_changed = (dbp.trial_date != project['trial_date']
                          or dbp.acceptance_date != project['acceptance_date'])
+        project_frozen = False
+        financial_change = bool(dates_changed)
         if changes:
             diff['update'].append('项目 %s：%s' % (project_no, '；'.join(changes)))
         db_items = {item.item_name: item for item in dbp.items}
@@ -990,6 +992,7 @@ def classify_against_db(plan, update_existing):
                 if item_changes:
                     item['_action'] = 'update'
                     touched = True
+                    financial_change = True
                     diff['update'].append('项目 %s 科目「%s」：%s'
                                           % (project_no, item['item_name'],
                                              '；'.join(item_changes)))
@@ -1006,6 +1009,7 @@ def classify_against_db(plan, update_existing):
                     continue
                 if dbnode.has_business:
                     node['_action'] = 'frozen'
+                    project_frozen = True
                     node['_db_id'] = dbnode.id
                     diff['frozen'].append(
                         '项目 %s 科目「%s」%s：已有申请/开票/付款，金额与比例不改'
@@ -1064,12 +1068,18 @@ def classify_against_db(plan, update_existing):
                 if node_changes:
                     node['_action'] = 'update'
                     touched = True
+                    financial_change = True
                     diff['update'].append('项目 %s 科目「%s」%s：%s'
                                           % (project_no, item['item_name'],
                                              NODE_TYPE_LABELS[node['node_type']],
                                              '；'.join(node_changes)))
                 else:
                     node['_action'] = 'unchanged'
+        if project_frozen and financial_change:
+            project['_action'] = 'blocked'
+            errors.append('项目 %s：存在已发生业务（申请/开票/付款）的节点，'
+                          '禁止通过导入修改金额/比例/日期；请人工走变更或冲销' % project_no)
+            continue
         project['_action'] = 'update' if touched else 'existing'
         if not touched:
             diff['unchanged'].append('项目 %s：口径字段无变化' % project_no)

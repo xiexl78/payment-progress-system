@@ -5,8 +5,10 @@
 本模块负责：建目录、启动自检（fail-fast）、SQLite 连接参数、注册蓝图。
 """
 
+import logging
 import os
 import sqlite3
+from logging.handlers import RotatingFileHandler
 
 from flask import Flask
 from sqlalchemy import event
@@ -16,6 +18,48 @@ from .config import DEFAULT_SECRET_KEY, load_config
 from .models import db
 
 __all__ = ['create_app', 'DEFAULT_SECRET_KEY', 'NODE_TEMPLATES', 'FLOW_STATUS']
+
+#: 当前进程内由本模块挂上的文件日志 handler（多 app 实例时换目录要换 handler）
+_FILE_LOG_HANDLER = None
+
+
+def _setup_file_logging(app):
+    """文件日志 + 轮转（P2-09）：``DATA_DIR/logs/app.log``，5MB × 5 份。
+
+    测试会反复 create_app，用模块级 handler 复用/替换，避免同一 logger 上堆积句柄。
+    """
+    global _FILE_LOG_HANDLER
+    data_dir = app.config.get('DATA_DIR')
+    if not data_dir:
+        return
+    log_dir = os.path.join(data_dir, 'logs')
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except OSError as exc:
+        app.logger.warning('日志目录无法创建：%s（%s），仅控制台日志', log_dir, exc)
+        return
+    path = os.path.abspath(os.path.join(log_dir, 'app.log'))
+    previous = _FILE_LOG_HANDLER
+    if previous is not None and getattr(previous, 'baseFilename', None) == path:
+        return
+    try:
+        handler = RotatingFileHandler(path, maxBytes=5 * 1024 * 1024,
+                                      backupCount=5, encoding='utf-8')
+    except OSError as exc:
+        app.logger.warning('文件日志初始化失败：%s（%s），仅控制台日志', path, exc)
+        return
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s %(levelname)s [%(name)s] %(message)s'))
+    handler.setLevel(logging.INFO)
+    if previous is not None:
+        app.logger.removeHandler(previous)
+        try:
+            previous.close()
+        except Exception:
+            pass
+    app.logger.addHandler(handler)
+    app.logger.setLevel(logging.INFO)
+    _FILE_LOG_HANDLER = handler
 
 # 付款节点模板：node_type / 名称 / 比例 / 计算口径 / 触发条件
 NODE_TEMPLATES = [
@@ -143,6 +187,8 @@ def create_app(config=None):
         app.wsgi_app = ProxyFix(app.wsgi_app,
                                 x_for=int(app.config['TRUSTED_PROXY_COUNT']),
                                 x_proto=int(app.config['TRUSTED_PROXY_COUNT']))
+
+    _setup_file_logging(app)
 
     for message in warnings:
         app.logger.warning('[config] %s', message)

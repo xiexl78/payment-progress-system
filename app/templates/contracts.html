@@ -59,11 +59,15 @@
           <td>{{ row.creator_name or '—' }}</td>
           <td>
             <div class="flex" style="gap:6px;">
+              {% if current_user.role in ('admin', 'operator') %}
               {% if c.status == 'recognized' %}
               <a href="{{ url_for('main.contract_confirm', contract_id=c.id) }}" class="btn btn-primary btn-sm">确认生成</a>
               {% elif c.status == 'confirmed' and c.project_id %}
               <a href="{{ url_for('main.project_detail', project_id=c.project_id) }}" class="btn btn-outline btn-sm">查看项目</a>
               <a href="{{ url_for('main.contract_confirm', contract_id=c.id) }}" class="btn btn-primary btn-sm">修改</a>
+              {% endif %}
+              {% elif c.status == 'confirmed' and c.project_id %}
+              <a href="{{ url_for('main.project_detail', project_id=c.project_id) }}" class="btn btn-outline btn-sm">查看项目</a>
               {% endif %}
               {% if current_user.role in ('admin', 'operator') and c.status in ('recognized', 'confirmed') %}
               <form method="post" action="{{ url_for('main.contract_rerun', contract_id=c.id) }}" style="display:inline;">

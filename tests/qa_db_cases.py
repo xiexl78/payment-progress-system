@@ -174,7 +174,7 @@ def _case_cwd(tmp):
             text_body = r.get_data(as_text=True)
             check('目录', 'CWD≠项目根时「重新识别」也应正常',
                   ('已重新识别' in text_body) or ('已更新识别结果' in text_body),
-                  '实际报「合同文件已丢失」（相对路径依赖 CWD）', xfail='P2-05')
+                  '实际报「合同文件已丢失」（相对路径依赖 CWD）')
             os.chdir(upload_root)
             r = client.post('/contracts/%d/rerun' % ct_id, follow_redirects=True)
             text_body = r.get_data(as_text=True)

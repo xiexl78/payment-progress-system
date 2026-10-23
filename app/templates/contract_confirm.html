@@ -7,6 +7,7 @@
 {% for nd in result.nodes if nd.node_type in node_order %}
 {% set _ = node_map.update({nd.node_type: nd}) %}
 {% endfor %}
+{% set can_edit = current_user.role in ('admin', 'operator') %}
 
 <div class="card" style="max-width:1200px;">
   <div class="card-title">
@@ -38,6 +39,41 @@
     <div style="margin-top:6px;">只修改名称/税率/付款方式可以保存；涉及金额或比例的修改会被拒绝，请走「变更单」流程。</div>
   </div>
   {% endif %}
+
+  {% if not can_edit %}
+  {# ---------- 只读角色：只展示识别结果，不渲染任何可编辑表单（P2-11） ---------- #}
+  <div class="flash info" style="margin-bottom:12px;">只读角色：仅可查看合同识别结果，不能修改或生成项目。</div>
+  <div class="table-wrap">
+    <table class="table">
+      <tbody>
+        <tr><th style="width:180px;">合同名称 / 项目名称</th><td>{{ values.contract_name }}</td></tr>
+        <tr><th>原金额 / 合同金额</th><td class="num">{% if values.original_amount %}￥{{ '{:,.2f}'.format(values.original_amount|float) }}{% else %}—{% endif %}</td></tr>
+        <tr><th>增补金额</th><td class="num">{% if values.additional_amount %}￥{{ '{:,.2f}'.format(values.additional_amount|float) }}{% else %}—{% endif %}</td></tr>
+        <tr><th>税率</th><td>{{ values.tax_rate or '—' }}</td></tr>
+        <tr><th>付款方式 / 付款条件</th><td>{{ values.payment_method or '—' }}</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="mt-16">
+    <label class="field-label">付款节点比例（只读）</label>
+    <div class="table-wrap">
+      <table class="table">
+        <thead><tr><th>节点</th><th>比例（%）</th><th>计算基数</th></tr></thead>
+        <tbody>
+          {% for nt in node_order %}
+          <tr>
+            <td><b>{{ ('首付款' if nt == 'first' else '进度款' if nt == 'progress' else '验收款' if nt == 'acceptance' else '质保金') }}</b></td>
+            <td>{{ values.ratios_pct.get(nt, '') }}%</td>
+            <td class="src-text">{{ '按原金额' if nt == 'first' else '按总金额' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <div class="flex mt-16"><a href="{{ url_for('main.contracts') }}" class="btn btn-ghost">返回列表</a></div>
+  {% else %}
+  {# ---------- 可编辑角色：原确认/修改表单 ---------- #}
 
   {% if diff %}
   <div class="flash info" style="margin-bottom:12px;">
@@ -202,8 +238,10 @@
 
   <form method="post" action="{{ url_for('main.contract_rerun', contract_id=contract.id) }}" id="rerun-form" style="display:none;">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"></form>
+  {% endif %}
 </div>
 
+{% if can_edit %}
 <script>
 function recompute() {
   var original = parseFloat(document.getElementById('original_amount').value) || 0;
@@ -229,5 +267,6 @@ function recompute() {
 recompute();
 {% endif %}
 </script>
+{% endif %}
 
 {% endblock %}

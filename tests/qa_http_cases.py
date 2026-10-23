@@ -287,7 +287,7 @@ def _upload_security(s_admin):
         orphan_ok = not os.path.exists(orphan_path)
     except Exception:
         pass
-    check('上传', '上传失败后不残留孤立文件', orphan_ok, '失败记录仍保留文件', xfail='P2-06')
+    check('上传', '上传失败后不残留孤立文件', orphan_ok, '失败记录仍保留文件')
 
     # 存储型 XSS（合同原文）
     xss_text = "<script>alert('qa-xss')</script>\n合同总金额人民币壹拾陆万伍仟元整（￥165,000.00）\n税率：13%\n"
@@ -558,7 +558,7 @@ def _concurrency(s_admin):
                                              {'project_no': 'QA-DUP', 'name': '重复编号',
                                               'item_name': ['a'], 'original_amount': ['1']}))
     codes = sorted(getattr(x, 'status_code', 'EXC') for x in res)
-    check('并发', '并发创建同编号项目不应 500', 500 not in codes, 'codes=%s' % codes, xfail='P2-07')
+    check('并发', '并发创建同编号项目不应 500', 500 not in codes, 'codes=%s' % codes)
 
 
 def _audit_and_config(s_admin, pid_a, ct1):
@@ -614,12 +614,12 @@ def _audit_and_config(s_admin, pid_a, ct1):
     # 文件日志
     app_init = open(os.path.join(PROJECT_ROOT, 'app', '__init__.py'), encoding='utf-8').read()
     check('配置', '应用应配置文件日志（FileHandler/轮转）',
-          'FileHandler' in app_init or 'RotatingFileHandler' in app_init, '仅 stderr', xfail='P2-09')
+          'FileHandler' in app_init or 'RotatingFileHandler' in app_init, '仅 stderr')
     # viewer 打开确认页不应看到可编辑表单
     s_view, _ = C.login(BASE, 'viewer', '123456')
     page = s_view.get(BASE + '/contracts/%d/confirm' % ct1).text
     check('配置', '只读角色不应看到可提交的合同编辑表单',
-          'name="ratio_first"' not in page, 'viewer 可见可编辑表单', xfail='P2-11')
+          'name="ratio_first"' not in page, 'viewer 可见可编辑表单')
 
 
 def _audit_has_table():
@@ -1361,6 +1361,100 @@ def _batch6_export_import(s_admin):
         check('导入', '更新已存在项时冻结节点受保护（有付款/开票不改）',
               ('--update-existing' in imp_src) and any(k in imp_src for k in ('冻结', 'frozen', '已发生')),
               '冻结保护未实现')
+
+        # 6b 增强：实际 commit → 批次记录 → 按批次查询；冻结节点保护（行为验证）
+        clean = os.path.join(tmp, 'clean_import.xlsx')
+        try:
+            from openpyxl import Workbook
+            wb = Workbook()
+            ws = wb.active
+            ws.append(['项目编号', '项目名称', '科目', '税率', '原金额', '增补金额', '状态'])
+            ws.append(['QA-IMP-1', 'QA导入项目', '导入科目', '13%', 12345.67, 0, '进行中'])
+            wb.save(clean)
+        except ImportError:
+            clean = None
+        if clean and imp_db:
+            rep = os.path.join(tmp, 'commit_report.txt')
+            out = os.path.join(tmp, 'commit_out.txt')
+            with open(out, 'w', encoding='utf-8') as f:
+                rc = subprocess.run([sys.executable, imp, '--commit', '--input', clean,
+                                     '--db', imp_db, '--report', rep],
+                                    cwd=PROJECT_ROOT, env=env, stdout=f,
+                                    stderr=subprocess.STDOUT, timeout=180).returncode
+            txt = ''
+            for src in (rep, out):
+                try:
+                    txt += open(src, encoding='utf-8', errors='replace').read()
+                except Exception:
+                    pass
+            check('导入', '正式导入（--commit）成功写入项目',
+                  rc == 0 and q1(imp_db, "SELECT COUNT(*) FROM projects WHERE project_no='QA-IMP-1'") == 1,
+                  'rc=%s out=%s' % (rc, txt[-200:]))
+            bcols = [r[1] for r in q(imp_db, 'PRAGMA table_info(import_batches)')]
+            hash_col = next((c for c in ('sha256', 'file_sha256', 'source_sha256', 'file_hash', 'hash')
+                             if c in bcols), None)
+            sel = 'id, status' + ((', ' + hash_col) if hash_col else '')
+            batch = q(imp_db, 'SELECT %s FROM import_batches ORDER BY id DESC LIMIT 1' % sel)
+            check('导入', '导入批次记录落库（import_batches：状态/哈希）',
+                  bool(batch) and batch[0][1] == 'success'
+                  and (bool(batch[0][2]) if hash_col else True), batch)
+            if batch:
+                out2 = os.path.join(tmp, 'batch_out.txt')
+                with open(out2, 'w', encoding='utf-8') as f:
+                    rc2 = subprocess.run([sys.executable, imp, '--batch', str(batch[0][0]), '--db', imp_db],
+                                         cwd=PROJECT_ROOT, env=env, stdout=f,
+                                         stderr=subprocess.STDOUT, timeout=120).returncode
+                try:
+                    txt2 = open(out2, encoding='utf-8', errors='replace').read()
+                except Exception:
+                    txt2 = ''
+                check('导入', '按批次查询可列出导入行（--batch ID）',
+                      rc2 == 0 and ('QA-IMP-1' in txt2 or '导入科目' in txt2),
+                      'rc=%s out=%s' % (rc2, txt2[-200:]))
+
+        # 冻结节点保护：对已有付款的项目做 --update-existing 应被阻断且库不变
+        upd = os.path.join(tmp, 'update_existing.xlsx')
+        try:
+            from openpyxl import Workbook
+            wb = Workbook()
+            ws = wb.active
+            ws.append(['项目编号', '项目名称', '科目', '税率', '原金额', '增补金额', '状态'])
+            ws.append(['PJ-2025-DSJ', '新增动设备监测项目', '设备费', '13%', 999999, 0, '进行中'])
+            wb.save(upd)
+        except ImportError:
+            upd = None
+        if upd and imp_db:
+            before_amt = q1(imp_db, "SELECT original_amount FROM project_items "
+                                    "WHERE project_id=(SELECT id FROM projects WHERE project_no='PJ-2025-DSJ') "
+                                    "AND item_name='设备费'")
+            rep = os.path.join(tmp, 'frozen_report.txt')
+            out = os.path.join(tmp, 'frozen_out.txt')
+            with open(out, 'w', encoding='utf-8') as f:
+                rcf = subprocess.run([sys.executable, imp, '--commit', '--update-existing',
+                                      '--input', upd, '--db', imp_db, '--report', rep],
+                                     cwd=PROJECT_ROOT, env=env, stdout=f,
+                                     stderr=subprocess.STDOUT, timeout=180).returncode
+            after_amt = q1(imp_db, "SELECT original_amount FROM project_items "
+                                   "WHERE project_id=(SELECT id FROM projects WHERE project_no='PJ-2025-DSJ') "
+                                   "AND item_name='设备费'")
+            ftxt = ''
+            for src in (rep, out):
+                try:
+                    ftxt += open(src, encoding='utf-8', errors='replace').read()
+                except Exception:
+                    pass
+            check('导入', '冻结节点保护：有付款项目 update-existing 被阻断且金额不变',
+                  rcf != 0 and str(before_amt) == str(after_amt)
+                  and any(k in ftxt for k in ('冻结', '已发生', '不允许', '阻断')),
+                  'rc=%s amt %s→%s out=%s' % (rcf, before_amt, after_amt, ftxt[-200:]))
+
+        # 批次 7：导入回滚与「试运行/验收日期+状态」导入（未实现）
+        check('导入', '支持按批次回滚（--batch ID --rollback）',
+              '--rollback' in imp_src, '回滚仅 TODO，未实现', xfail='P0-06')
+        check('导入', '导入可写入试运行/验收日期与项目状态',
+              '试运行日期' in imp_src and 'acceptance_date' in imp_src
+              and ('project.trial_date' in imp_src or 'trial_date=' in imp_src),
+              '日期/状态导入未实现')
 
 def run(server):
     global DB, BASE, APP, UPLOAD_DIR
