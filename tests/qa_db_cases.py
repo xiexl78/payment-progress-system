@@ -200,12 +200,22 @@ def _case_initdb():
     dbp = os.path.join(dst, 'instance', 'payment_progress.db')
     log = os.path.join(tmp, 'initdb.log')
 
-    def run(args):
+    def run(args, extra_env=None):
+        run_env = dict(env)
+        if extra_env:
+            run_env.update(extra_env)
         with open(log, 'a', encoding='utf-8') as f:
             r = subprocess.run([sys.executable, 'scripts/init_db.py'] + args,
-                               cwd=dst, env=env, stdin=subprocess.DEVNULL,
+                               cwd=dst, env=run_env, stdin=subprocess.DEVNULL,
                                stdout=f, stderr=subprocess.STDOUT, timeout=180)
         return r.returncode
+
+    def count(table):
+        conn = sqlite3.connect(dbp)
+        try:
+            return conn.execute('SELECT COUNT(*) FROM %s' % table).fetchone()[0]
+        finally:
+            conn.close()
 
     def marker():
         if not os.path.exists(dbp):
@@ -254,6 +264,17 @@ def _case_initdb():
         # --no-backup 与 --yes 同用应允许，但本次不校验「无备份」细节
         check('初始化', '--force --yes --no-backup 组合可成功',
               run(['--force', '--yes', '--no-backup']) == 0)
+        # 生产初始化：--no-seed 不建演示项目，只建账号；APP_ENV=production 默认不种
+        rc = run(['--force', '--yes', '--no-seed'])
+        check('初始化', '--no-seed 生产初始化不建演示项目、只建账号',
+              rc == 0 and count('projects') == 0 and count('users') >= 3,
+              'rc=%s projects=%s users=%s' % (rc, count('projects'), count('users')))
+        rc = run(['--force', '--yes'], extra_env={'APP_ENV': 'production'})
+        check('初始化', 'APP_ENV=production 默认不建种子项目（生产默认 no-seed）',
+              rc == 0 and count('projects') == 0, 'rc=%s projects=%s' % (rc, count('projects')))
+        rc = run(['--force', '--yes', '--seed'], extra_env={'APP_ENV': 'production'})
+        check('初始化', '显式 --seed 优先于生产默认（仍可建演示项目）',
+              rc == 0 and count('projects') >= 1, 'rc=%s projects=%s' % (rc, count('projects')))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

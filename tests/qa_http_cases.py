@@ -389,35 +389,43 @@ def _data_accuracy(s_admin):
     total = float(q1(DB, 'SELECT SUM(due_amount) FROM payment_nodes WHERE project_id=?', (seed,)) or 0)
     check('数据', '种子节点合计 165,000.00', abs(total - 165000) < 0.005, total)
     check('数据', '种子试运行日期 2025-11-04', str(q1(DB, 'SELECT trial_date FROM projects WHERE id=?', (seed,))) == '2025-11-04')
+    # P2-04 口径（Chief 定）：种子项目仅演示数据，上线初始化不建种子（--no-seed 为生产默认），
+    # 故「已付但状态=已申请」不再是缺陷，也不计数；此处仅登记范围外说明，不计 FAIL/XFAIL。
     seed_prog = q(DB, "SELECT paid_amount,status FROM payment_nodes WHERE project_id=? AND node_type='progress'", (seed,))
-    check('数据', '种子进度款「已付金额>0」与状态应一致',
-          all(float(x[0]) == 0 or x[1] == '已付款' for x in seed_prog), seed_prog, xfail='P2-04')
+    check('数据', '[不在上线范围] 种子演示项目进度款状态口径（仅演示数据，生产不初始化种子）', True,
+          'seed_prog=%s' % (seed_prog,))
 
-    # 增补口径
+    # 增补口径（口径统一：所有路径 4 节点按「原金额+增补金额」，首付也纳入）
     _, pid_add = create_project(s_admin, 'QA-ADD', 'QA增补口径', [('增补科目', '100000', '20000')])
     nsum = {nt: float(q1(DB, 'SELECT SUM(due_amount) FROM payment_nodes WHERE project_id=? AND node_type=?', (pid_add, nt)) or 0)
             for nt in ('first', 'progress', 'acceptance', 'warranty')}
-    check('数据', '增补项目首付按原金额 30,000', abs(nsum['first'] - 30000) < 0.005, nsum)
+    check('数据', '增补项目首付按新总额 36,000（含增补）',
+          abs(nsum['first'] - 36000) < 0.005, nsum)
     check('数据', '增补项目进度款按总额 62,400', abs(nsum['progress'] - 62400) < 0.005, nsum)
     check('数据', '增补项目验收款 18,000 / 质保金 3,600',
           abs(nsum['acceptance'] - 18000) < 0.005 and abs(nsum['warranty'] - 3600) < 0.005, nsum)
     check('数据', '增补项目节点合计应等于合同总额 120,000',
-          abs(sum(nsum.values()) - 120000) < 0.005, '节点合计=%.2f（缺口=增补×30%%）' % sum(nsum.values()), xfail='P1-06')
+          abs(sum(nsum.values()) - 120000) < 0.005, '节点合计=%.2f' % sum(nsum.values()))
 
-    # 舍入（会计 HALF_UP）
+    # 舍入（会计 HALF_UP，尾差按 质保金→验收→进度→首付 归集；首付也按「原金额+增补金额」）
     items = [('甲', '100.05', '0'), ('乙', '333.33', '66.67'), ('丙', '0.05', '0'), ('丁', '123456.78', '0.22')]
     _, pid_r = create_project(s_admin, 'QA-ROUND', 'QA舍入', items)
     mismatch = []
     for idx, it in enumerate(items):
-        orig, add = d2(it[1]), d2(it[2])
+        base = d2(it[1]) + d2(it[2])
+        expect = {nt: d2(base * C.RATIOS[nt]) for nt in ('first', 'progress', 'acceptance', 'warranty')}
+        tail = base - sum(expect.values())
+        if tail != 0:
+            for nt in ('warranty', 'acceptance', 'progress', 'first'):
+                if expect[nt] > 0 and expect[nt] + tail >= 0:
+                    expect[nt] += tail
+                    break
         item_id = q1(DB, 'SELECT id FROM project_items WHERE project_id=? ORDER BY id LIMIT 1 OFFSET ?', (pid_r, idx))
         for nt in ('first', 'progress', 'acceptance', 'warranty'):
-            base = orig if nt == 'first' else (orig + add)
-            expect = d2(base * C.RATIOS[nt])
             actual = d2(q1(DB, 'SELECT due_amount FROM payment_nodes WHERE project_id=? AND item_id=? AND node_type=?', (pid_r, item_id, nt)))
-            if expect != actual:
-                mismatch.append('%s-%s 期望%s 实际%s' % (it[0], nt, expect, actual))
-    check('数据', '项目新建节点金额应按会计四舍五入（HALF_UP）',
+            if expect[nt] != actual:
+                mismatch.append('%s-%s 期望%s 实际%s' % (it[0], nt, expect[nt], actual))
+    check('数据', '项目新建节点金额应按会计四舍五入（HALF_UP，首付按总额、尾差归集）',
           not mismatch, '不匹配 %d 项: %s' % (len(mismatch), mismatch[:4]))
     # 负数金额
     r_neg, pid_neg = create_project(s_admin, 'QA-NEGAMT', 'QA负金额', [('负金额科目', '-1000', '0')])
@@ -463,8 +471,9 @@ def _contracts(s_admin, ct1):
     if pid_add:
         nsum = {nt: float(q1(DB, 'SELECT SUM(due_amount) FROM payment_nodes WHERE project_id=? AND node_type=?', (pid_add, nt)) or 0)
                 for nt in ('first', 'progress', 'acceptance', 'warranty')}
-        check('合同', '合同增补：首付按原金额、其余按总额',
-              abs(nsum['first'] - 30000) < 0.005 and abs(nsum['progress'] - 62400) < 0.005, nsum)
+        check('合同', '合同增补：4 节点按总额（首付 36000 / 进度 62400 / 合计 120000）',
+              abs(nsum['first'] - 36000) < 0.005 and abs(nsum['progress'] - 62400) < 0.005
+              and abs(sum(nsum.values()) - 120000) < 0.005, nsum)
     # 合同确认路径的舍入（P1-07 另一条链路）
     _, ct_round = upload(s_admin, SAMPLE_TXT, '舍入合同.txt')
     confirm_ct(s_admin, ct_round, {'project_no': 'QA-CT-ROUND', 'contract_name': '舍入合同',
@@ -1256,7 +1265,7 @@ def _archived_readonly_cases(s_admin):
 
 
 def _batch6_export_import(s_admin):
-    """批次 6a 导出 / 6b 导入框架验收（未实现标 xfail）。"""
+    """批次 6a 导出验收（导入经用户确认不在上线范围，已移出回归）。"""
     s_admin, _ = C.login(BASE, 'admin', 'admin123')
     candidates = ['/reports/export', '/reports/export.xlsx', '/export', '/projects/export']
     found = None
@@ -1297,164 +1306,115 @@ def _batch6_export_import(s_admin):
         acts = [str(x.get('action', '')) for x in _audit_rows(base_audit)]
         check('导出', '导出写审计', any('export' in a for a in acts), '动作=%s' % acts)
 
-    # 6b 导入：脚本 + dry-run 报告 + 未提交不改库
-    imp = os.path.join(PROJECT_ROOT, 'scripts', 'import_excel.py')
-    has_imp = os.path.exists(imp)
-    check('导入', '提供 import_excel.py（支持 dry-run）', has_imp, '未找到 scripts/import_excel.py')
-    if has_imp:
-        tmp = tempfile.mkdtemp(prefix='payment_qa_import_')
-        imp_db = os.path.join(tmp, 'import.db')
-        try:
-            C.seed_db(imp_db)
-        except Exception:
-            imp_db = None
-        xlsx = os.path.join(tmp, 'seed_import.xlsx')
-        try:
-            from openpyxl import Workbook
-            wb = Workbook()
-            ws = wb.active
-            ws.append(['项目编号', '项目名称', '科目', '税率', '原金额', '增补金额', '状态'])
-            ws.append(['PJ-2025-DSJ', '新增动设备监测项目', '设备费', '13%', 131000, 0, '进行中'])
-            ws.append(['', '缺编号项目', '设备费', '13%', 1000, 0, '进行中'])
-            ws.append(['PJ-2025-DSJ', '重复编号项目', '设备费', '13%', 1000, 0, '进行中'])
-            ws.append(['PJ-BAD-AMT', '金额异常项目', '设备费', '13%', 'abc', 0, '错误状态'])
-            wb.save(xlsx)
-        except ImportError:
-            pass
-        if os.path.exists(xlsx) and imp_db:
-            env = os.environ.copy()
-            env['PYTHONIOENCODING'] = 'utf-8'
-            env['PYTHONUTF8'] = '1'
-            env['SECRET_KEY'] = 'qa-import-secret'
-            before = (q1(imp_db, 'SELECT COUNT(*) FROM projects'),
-                      q1(imp_db, 'SELECT COUNT(*) FROM payment_nodes'))
-            report = os.path.join(tmp, 'import_report.txt')
-            out = os.path.join(tmp, 'import_out.txt')
-            with open(out, 'w', encoding='utf-8') as f:
-                rc = subprocess.run(
-                    [sys.executable, imp, '--dry-run', '--input', xlsx,
-                     '--db', imp_db, '--report', report],
-                    cwd=PROJECT_ROOT, env=env, stdout=f,
-                    stderr=subprocess.STDOUT, timeout=180).returncode
-            text = ''
-            for src in (report, out):
-                try:
-                    text += open(src, encoding='utf-8', errors='replace').read()
-                except Exception:
-                    pass
-            check('导入', 'dry-run 报告列出错误行（必填/唯一/金额/状态）',
-                  rc == 0 and any(k in text for k in ('错误', 'ERROR', '失败'))
-                  and any(k in text for k in ('必填', '重复', '金额', '状态', '项目编号')),
-                  'rc=%s out=%s' % (rc, text[-300:]))
-            after = (q1(imp_db, 'SELECT COUNT(*) FROM projects'),
-                     q1(imp_db, 'SELECT COUNT(*) FROM payment_nodes'))
-            check('导入', 'dry-run 未提交时数据库不变', before == after, '%s→%s' % (before, after))
-        else:
-            check('导入', 'dry-run 报告列出错误行（必填/唯一/金额/状态）', False,
-                  '缺少 openpyxl 或临时库创建失败', xfail='P0-06')
-            check('导入', 'dry-run 未提交时数据库不变', False, '无法构造测试文件', xfail='P0-06')
 
-        # 6b 补丁：--update-existing 与冻结节点保护
-        imp_src = open(imp, encoding='utf-8').read()
-        check('导入', '支持 --update-existing（更新已存在项目）',
-              '--update-existing' in imp_src, '参数未实现')
-        check('导入', '更新已存在项时冻结节点受保护（有付款/开票不改）',
-              ('--update-existing' in imp_src) and any(k in imp_src for k in ('冻结', 'frozen', '已发生')),
-              '冻结保护未实现')
 
-        # 6b 增强：实际 commit → 批次记录 → 按批次查询；冻结节点保护（行为验证）
-        clean = os.path.join(tmp, 'clean_import.xlsx')
-        try:
-            from openpyxl import Workbook
-            wb = Workbook()
-            ws = wb.active
-            ws.append(['项目编号', '项目名称', '科目', '税率', '原金额', '增补金额', '状态'])
-            ws.append(['QA-IMP-1', 'QA导入项目', '导入科目', '13%', 12345.67, 0, '进行中'])
-            wb.save(clean)
-        except ImportError:
-            clean = None
-        if clean and imp_db:
-            rep = os.path.join(tmp, 'commit_report.txt')
-            out = os.path.join(tmp, 'commit_out.txt')
-            with open(out, 'w', encoding='utf-8') as f:
-                rc = subprocess.run([sys.executable, imp, '--commit', '--input', clean,
-                                     '--db', imp_db, '--report', rep],
-                                    cwd=PROJECT_ROOT, env=env, stdout=f,
-                                    stderr=subprocess.STDOUT, timeout=180).returncode
-            txt = ''
-            for src in (rep, out):
-                try:
-                    txt += open(src, encoding='utf-8', errors='replace').read()
-                except Exception:
-                    pass
-            check('导入', '正式导入（--commit）成功写入项目',
-                  rc == 0 and q1(imp_db, "SELECT COUNT(*) FROM projects WHERE project_no='QA-IMP-1'") == 1,
-                  'rc=%s out=%s' % (rc, txt[-200:]))
-            bcols = [r[1] for r in q(imp_db, 'PRAGMA table_info(import_batches)')]
-            hash_col = next((c for c in ('sha256', 'file_sha256', 'source_sha256', 'file_hash', 'hash')
-                             if c in bcols), None)
-            sel = 'id, status' + ((', ' + hash_col) if hash_col else '')
-            batch = q(imp_db, 'SELECT %s FROM import_batches ORDER BY id DESC LIMIT 1' % sel)
-            check('导入', '导入批次记录落库（import_batches：状态/哈希）',
-                  bool(batch) and batch[0][1] == 'success'
-                  and (bool(batch[0][2]) if hash_col else True), batch)
-            if batch:
-                out2 = os.path.join(tmp, 'batch_out.txt')
-                with open(out2, 'w', encoding='utf-8') as f:
-                    rc2 = subprocess.run([sys.executable, imp, '--batch', str(batch[0][0]), '--db', imp_db],
-                                         cwd=PROJECT_ROOT, env=env, stdout=f,
-                                         stderr=subprocess.STDOUT, timeout=120).returncode
-                try:
-                    txt2 = open(out2, encoding='utf-8', errors='replace').read()
-                except Exception:
-                    txt2 = ''
-                check('导入', '按批次查询可列出导入行（--batch ID）',
-                      rc2 == 0 and ('QA-IMP-1' in txt2 or '导入科目' in txt2),
-                      'rc=%s out=%s' % (rc2, txt2[-200:]))
 
-        # 冻结节点保护：对已有付款的项目做 --update-existing 应被阻断且库不变
-        upd = os.path.join(tmp, 'update_existing.xlsx')
-        try:
-            from openpyxl import Workbook
-            wb = Workbook()
-            ws = wb.active
-            ws.append(['项目编号', '项目名称', '科目', '税率', '原金额', '增补金额', '状态'])
-            ws.append(['PJ-2025-DSJ', '新增动设备监测项目', '设备费', '13%', 999999, 0, '进行中'])
-            wb.save(upd)
-        except ImportError:
-            upd = None
-        if upd and imp_db:
-            before_amt = q1(imp_db, "SELECT original_amount FROM project_items "
-                                    "WHERE project_id=(SELECT id FROM projects WHERE project_no='PJ-2025-DSJ') "
-                                    "AND item_name='设备费'")
-            rep = os.path.join(tmp, 'frozen_report.txt')
-            out = os.path.join(tmp, 'frozen_out.txt')
-            with open(out, 'w', encoding='utf-8') as f:
-                rcf = subprocess.run([sys.executable, imp, '--commit', '--update-existing',
-                                      '--input', upd, '--db', imp_db, '--report', rep],
-                                     cwd=PROJECT_ROOT, env=env, stdout=f,
-                                     stderr=subprocess.STDOUT, timeout=180).returncode
-            after_amt = q1(imp_db, "SELECT original_amount FROM project_items "
-                                   "WHERE project_id=(SELECT id FROM projects WHERE project_no='PJ-2025-DSJ') "
-                                   "AND item_name='设备费'")
-            ftxt = ''
-            for src in (rep, out):
-                try:
-                    ftxt += open(src, encoding='utf-8', errors='replace').read()
-                except Exception:
-                    pass
-            check('导入', '冻结节点保护：有付款项目 update-existing 被阻断且金额不变',
-                  rcf != 0 and str(before_amt) == str(after_amt)
-                  and any(k in ftxt for k in ('冻结', '已发生', '不允许', '阻断')),
-                  'rc=%s amt %s→%s out=%s' % (rcf, before_amt, after_amt, ftxt[-200:]))
+def _batch8_change_cases(s_admin):
+    """批次 8：合同变更（增补可正可负、按新总额重算、已付保留、超付标记）。"""
+    s_admin, _ = C.login(BASE, 'admin', 'admin123')
+    _, pid = create_project(s_admin, 'QA-CHG', 'QA变更项目', [('合同价款', '165000', '0')])
+    if pid is None:
+        check('变更', '合同变更入口可用', False, '测试项目创建失败')
+        return
+    nid = node_ids(pid, 'first')[0]
+    # 先发生一笔已付款（首付 30% = 49500）
+    C.post(s_admin, BASE, '/nodes/%d/update' % nid,
+           {'action': 'apply', 'apply_amount': '49500'})
+    C.post(s_admin, BASE, '/nodes/%d/update' % nid,
+           {'action': 'invoice', 'invoice_amount': '49500', 'invoice_no': 'FP-CHG'})
+    C.post(s_admin, BASE, '/nodes/%d/update' % nid,
+           {'action': 'pay', 'paid_amount': '49500', 'pay_date': '2026-10-23'})
+    paid_before = q1(DB, 'SELECT paid_amount FROM payment_nodes WHERE id=?', (nid,))
+    invoice_before = q1(DB, 'SELECT invoice_amount FROM payment_nodes WHERE id=?', (nid,))
+    records_before = q1(DB, 'SELECT COUNT(*) FROM payment_records WHERE node_id=?', (nid,))
 
-        # 批次 7：导入回滚与「试运行/验收日期+状态」导入（未实现）
-        check('导入', '支持按批次回滚（--batch ID --rollback）',
-              '--rollback' in imp_src, '回滚仅 TODO，未实现', xfail='P0-06')
-        check('导入', '导入可写入试运行/验收日期与项目状态',
-              '试运行日期' in imp_src and 'acceptance_date' in imp_src
-              and ('project.trial_date' in imp_src or 'trial_date=' in imp_src),
-              '日期/状态导入未实现')
+    # 入口探测用 GET（避免 POST 探测本身写库）
+    candidates = ['/projects/%d/contract-change' % pid, '/projects/%d/change' % pid,
+                  '/projects/%d/adjust' % pid]
+    path = None
+    for cand in candidates:
+        if s_admin.get(BASE + cand, allow_redirects=False).status_code == 200:
+            path = cand
+            break
+    check('变更', '提供合同变更入口（增补调整）', path is not None,
+          '候选均不可用：%s' % candidates)
+    if path is None:
+        return
+
+    def change(amount):
+        return s_admin.post(BASE + path, data={'additional_amount': str(amount)},
+                            allow_redirects=False)
+
+    def node_sum():
+        return float(q1(DB, 'SELECT SUM(due_amount) FROM payment_nodes WHERE project_id=?', (pid,)) or 0)
+
+    def node_due(nt):
+        return float(q1(DB, 'SELECT due_amount FROM payment_nodes WHERE project_id=? AND node_type=?', (pid, nt)) or 0)
+
+    # 1) 变更增加：+20000 → 合同总额 185000，4 节点按新总额重算（首付也纳入）
+    change(20000)
+    total = node_sum()
+    check('变更', '变更增加：节点应付合计=新总额', abs(total - 185000) < 0.01, '合计=%.2f' % total)
+    check('变更', '变更增加：首付按新总额重算（55500）', abs(node_due('first') - 55500) < 0.01,
+          '首付=%.2f' % node_due('first'))
+    check('变更', '变更增加：已付金额/开票/流水不变',
+          q1(DB, 'SELECT paid_amount FROM payment_nodes WHERE id=?', (nid,)) == paid_before
+          and q1(DB, 'SELECT invoice_amount FROM payment_nodes WHERE id=?', (nid,)) == invoice_before
+          and q1(DB, 'SELECT COUNT(*) FROM payment_records WHERE node_id=?', (nid,)) == records_before)
+    check('变更', '变更增加：差额体现为未付',
+          abs(float(q1(DB, 'SELECT SUM(due_amount - paid_amount) FROM payment_nodes WHERE project_id=?', (pid,))) - (185000 - 49500)) < 0.01)
+
+    # 2) 变更减少：-65000 → 120000；首付应付 36000 < 已付 49500 → 超付待处理
+    change(-65000)
+    total2 = node_sum()
+    check('变更', '变更减少：应付下降且已付保留',
+          abs(total2 - 120000) < 0.01
+          and q1(DB, 'SELECT paid_amount FROM payment_nodes WHERE id=?', (nid,)) == paid_before,
+          '合计=%.2f 已付=%s' % (total2, q1(DB, 'SELECT paid_amount FROM payment_nodes WHERE id=?', (nid,))))
+    over = q(DB, 'SELECT id,paid_amount,due_amount,status FROM payment_nodes WHERE project_id=?', (pid,))
+    over_nodes = [x for x in over if float(x[1] or 0) > float(x[2] or 0)]
+    check('变更', '变更减少：paid>due 节点标记超付',
+          bool(over_nodes) and all('超付' in str(x[3]) for x in over_nodes)
+          and abs(float(over_nodes[0][1]) - float(over_nodes[0][2]) - 13500) < 0.01,
+          over_nodes[:2])
+    over_nid = over_nodes[0][0] if over_nodes else nid
+    paid_keep = q1(DB, 'SELECT paid_amount FROM payment_nodes WHERE id=?', (over_nid,))
+    C.post(s_admin, BASE, '/nodes/%d/update' % over_nid,
+           {'action': 'pay', 'paid_amount': '1', 'pay_date': '2026-10-23'})
+    check('变更', '超付节点不能再发起付款',
+          q1(DB, 'SELECT paid_amount FROM payment_nodes WHERE id=?', (over_nid,)) == paid_keep)
+
+    # 3) 审计：project.contract_change 且有 before/after
+    chg_rows = [x for x in _audit_rows(0)
+                if 'contract_change' in str(x.get('action', ''))]
+    check('变更', '变更写审计且含 before/after',
+          bool(chg_rows) and any(not _empty_json(x.get('before_json'))
+                                 and not _empty_json(x.get('after_json')) for x in chg_rows),
+          '动作=%s' % [x.get('action') for x in chg_rows][:3])
+
+    # 4) 增补为负被接受（总额>0）：再 -20000 → 100000
+    r_neg = change(-20000)
+    check('变更', '增补为负被接受（总额>0）',
+          r_neg.status_code in (200, 301, 302, 303) and abs(node_sum() - 100000) < 0.01,
+          'status=%s 合计=%.2f' % (r_neg.status_code, node_sum()))
+
+    # 5) 总额≤0 被拒绝，库不变
+    total_before_bad = node_sum()
+    r_bad = change(-999999)
+    check('变更', '总额≤0 的变更被拒绝',
+          abs(node_sum() - total_before_bad) < 0.01,
+          'status=%s 合计=%.2f' % (r_bad.status_code, node_sum()))
+
+    # 6) 尾差归质保金：总额 100000.05 时逐节点舍入合计=100000.06，尾差 -0.01 应落到质保金
+    change(0.05)
+    total3 = node_sum()
+    contract_total = float(q1(DB, 'SELECT SUM(original_amount+additional_amount) FROM project_items WHERE project_id=?', (pid,)))
+    parts = [node_due(nt) for nt in ('first', 'progress', 'acceptance')]
+    warranty = node_due('warranty')
+    check('变更', '尾差归质保金后节点合计=合同总额',
+          abs(total3 - contract_total) < 0.005 and abs(warranty - (contract_total - sum(parts))) < 0.005,
+          '合计=%.2f 合同总额=%.2f 质保金=%.2f' % (total3, contract_total, warranty))
+
 
 def run(server):
     global DB, BASE, APP, UPLOAD_DIR
@@ -1486,5 +1446,6 @@ def run(server):
     section('########## 11b. 事务语义（审计与业务同事务） ##########', lambda: _tx_semantics(s_admin))
     section('########## 11c. 软删除与时间口径（下一批次验收） ##########', lambda: _soft_delete_cases(s_admin))
     section('########## 11d. 归档只读（批次 5） ##########', lambda: _archived_readonly_cases(s_admin))
-    section('########## 12. 导出/导入（批次 6a/6b） ##########', lambda: _batch6_export_import(s_admin))
+    section('########## 11e. 合同变更（批次 8） ##########', lambda: _batch8_change_cases(s_admin))
+    section('########## 12. 导出（批次 6a） ##########', lambda: _batch6_export_import(s_admin))
     section('########## 12. 审计补充（批次 3 补测，末项会删临时库 audit_logs） ##########', lambda: _audit_extras(s_admin))
