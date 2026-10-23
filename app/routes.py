@@ -999,7 +999,7 @@ ALLOWED_CONTRACT_EXTS = {
     'jpg': 'img', 'jpeg': 'img', 'png': 'img', 'bmp': 'img', 'webp': 'img',
 }
 CONTRACT_NODE_ORDER = ('first', 'progress', 'acceptance', 'warranty')
-CALC_BASE_LABELS = {'first': '按原金额', 'progress': '按总金额', 'acceptance': '按总金额', 'warranty': '按总金额'}
+CALC_BASE_LABELS = {'first': '按总金额', 'progress': '按总金额', 'acceptance': '按总金额', 'warranty': '按总金额'}
 
 
 def contract_upload_dir():
@@ -1365,7 +1365,7 @@ def _apply_contract_values(project, submission, contract, *, update_amounts=True
         ratio = _ratio_fraction(submission.ratios_pct[nt])
         node.ratio = ratio
         node.node_name = _node_name(nt, ratio)
-        node.calc_base = 'original' if nt == 'first' else 'total'
+        node.calc_base = 'total'   # 统一口径：首付款也按合同总额
         node.due_amount = submission.node_amounts[nt]
         node.updated_by = operator_id
     sync_project_dates(project)
@@ -1392,7 +1392,7 @@ def _create_contract_project(submission, contract):
         ratio = _ratio_fraction(submission.ratios_pct[nt])
         node = PaymentNode(project_id=project.id, item_id=item.id, node_type=nt,
                            node_name=_node_name(nt, ratio), ratio=ratio,
-                           calc_base='original' if nt == 'first' else 'total',
+                           calc_base='total',
                            due_amount=submission.node_amounts[nt], status='未触发',
                            updated_by=operator_id)
         db.session.add(node)

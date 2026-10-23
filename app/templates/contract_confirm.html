@@ -64,7 +64,7 @@
           <tr>
             <td><b>{{ ('首付款' if nt == 'first' else '进度款' if nt == 'progress' else '验收款' if nt == 'acceptance' else '质保金') }}</b></td>
             <td>{{ values.ratios_pct.get(nt, '') }}%</td>
-            <td class="src-text">{{ '按原金额' if nt == 'first' else '按总金额' }}</td>
+            <td class="src-text">按总金额</td>
           </tr>
           {% endfor %}
         </tbody>
@@ -140,7 +140,7 @@
       <div class="form-row">
         <label class="field-label">增补金额（元）</label>
         <input type="number" name="additional_amount" id="additional_amount" value="{{ values.additional_amount }}" step="0.01" min="0" style="width:100%;" oninput="recompute()">
-        <div class="src-text">进度款 / 验收款 / 质保金按 原金额+增补金额 计算；首付款按原金额</div>
+        <div class="src-text">4 个节点统一按「原金额+增补金额」计算，尾差归质保金（合计=合同总额）</div>
       </div>
     </div>
 
@@ -192,7 +192,7 @@
                        value="{{ values.ratios_pct.get(nt, '') }}"
                        step="0.01" min="0" max="100" style="width:100px;" oninput="recompute()">
               </td>
-              <td class="src-text">{{ '按原金额' if nt == 'first' else '按总金额' }}</td>
+              <td class="src-text">按总金额</td>
               <td class="num"><span class="node-amount amount-cell">0.00</span></td>
               <td class="src-text">
                 {% if nd and nd.from_text %}
@@ -251,7 +251,7 @@ function recompute() {
   document.querySelectorAll('.node-ratio').forEach(function (inp) {
     var tr = inp.closest('tr');
     var nt = inp.dataset.nodeType;
-    var base = (nt === 'first') ? original : total;
+    var base = total;
     var ratio = parseFloat(inp.value) || 0;
     var amount = base * ratio / 100;
     tr.querySelector('.node-amount').textContent = amount.toFixed(2);

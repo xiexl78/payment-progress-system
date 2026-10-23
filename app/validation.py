@@ -42,9 +42,9 @@ NODE_LABELS = {'first': '首付款', 'progress': '进度款',
 TAX_RATES = ('13%', '9%', '6%', '3%', '0%', '')
 #: 比例合计容差：±0.01 个百分点
 RATIO_SUM_TOLERANCE = Decimal('0.01')
-#: TODO(业务确认 P1-1)：节点应付合计是否必须等于「原金额+增补金额」。
-#: 现状口径「首付款按原金额」会导致少 30%×增补，故默认只警告、不阻断。
-CONTRACT_TOTAL_STRICT = False
+#: 口径（批次 8 统一）：4 节点全部按「原金额+增补金额」计算，节点应付合计恒等于合同总额，
+#: 逐项四舍五入产生的尾差归质保金（``TAIL_ORDER``），因此不需要“只警告不阻断”的宽松开关。
+CONTRACT_TOTAL_STRICT = True
 #: TODO(业务确认)：是否允许某类节点比例为 0（如无质保金合同）。
 #: 当前按「0 < 比例 ≤ 100」执行；业务确认允许 0 后改为 True。
 ALLOW_ZERO_RATIO = False
@@ -223,8 +223,8 @@ class ContractSubmission:
 
 
 def _base_for_node(node_type, original, additional):
-    """口径：首付款按科目原金额；其余按原金额+增补金额。"""
-    return original if node_type == 'first' else (original + additional)
+    """统一口径（批次 8）：所有节点都按「原金额+增补金额」计算。"""
+    return original + additional
 
 
 def node_base_amount(node, original_amount, additional_amount):
@@ -247,13 +247,16 @@ def build_contract_numbers(original_amount, additional_amount, ratios_pct):
             '比例合计应为 100%%（容差 ±%.2f%%），当前为 %s%%'
             % (RATIO_SUM_TOLERANCE, _plain_pct(total_pct)))
 
+    contract_total = (original_amount + additional_amount).quantize(CENT)
+    if contract_total <= 0:
+        raise ValidationError('合同总额（原金额+增补金额）必须大于 0')
     base_map = {nt: _base_for_node(nt, original_amount, additional_amount)
                 for nt in NODE_TYPES}
     raw_amounts = {nt: base_map[nt] * ratios_pct[nt] / Decimal('100')
                    for nt in NODE_TYPES}
     node_amounts = {nt: _quantize(raw_amounts[nt]) for nt in NODE_TYPES}
-    expected_total = _quantize(sum(raw_amounts.values(), Decimal('0')))
-    tail = expected_total - sum(node_amounts.values(), ZERO)
+    expected_total = contract_total
+    tail = (expected_total - sum(node_amounts.values(), ZERO)).quantize(CENT)
     tail_node = ''
     if tail != 0:
         before = dict(node_amounts)
@@ -267,18 +270,12 @@ def build_contract_numbers(original_amount, additional_amount, ratios_pct):
                 tail_node = nt
                 break
 
-    contract_total = (original_amount + additional_amount).quantize(CENT)
     warnings = []
     payable = sum(node_amounts.values(), ZERO)
     if payable != contract_total:
-        msg = ('节点应付合计 %s 与合同金额 %s 相差 %s（当前口径：首付款按原金额，'
-               '其余按原金额+增补；增补的 %s%% 不产生应付）'
-               % (_money(payable), _money(contract_total),
-                  _money(contract_total - payable),
-                  _plain_pct(ratios_pct['first'])))
-        if CONTRACT_TOTAL_STRICT:
-            raise ValidationError(msg)
-        warnings.append(msg)
+        # 防御性兜底：4 节点合计必须恒等于合同总额（尾差归质保金）
+        raise ValidationError('节点应付合计 %s 与合同总额 %s 不一致'
+                              % (_money(payable), _money(contract_total)))
     return {
         'original_amount': original_amount,
         'additional_amount': additional_amount,

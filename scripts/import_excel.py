@@ -58,7 +58,8 @@ from app.audit import record as audit_record  # noqa: E402
 from app.models import (AcceptanceRecord, ImportBatch, ImportBatchRow,  # noqa: E402
                         PaymentApplication, PaymentNode, PaymentRecord,
                         Project, ProjectItem, db)
-from app.money import CENT, ZERO, mul_ratio, parse_money, sum_money  # noqa: E402
+from app.money import (CENT, ZERO, allocate_tail, mul_ratio, parse_money,  # noqa: E402
+                       sum_money)
 from app.timeutil import local_datetime_to_utc, utcnow  # noqa: E402
 from app.validation import (PROJECT_STATUSES, TAX_RATES, ValidationError,  # noqa: E402
                             parse_date)
@@ -429,7 +430,7 @@ def write_template(path):
         '1. 「项目信息」「费用科目」为必填工作表；项目编号是关联键，逐行必填。',
         '2. 日期格式：YYYY-MM-DD（如 2025-11-04）；时间格式：YYYY-MM-DD HH:MM。',
         '3. 金额只填数字（最多两位小数，不要带￥/千分位也可识别）；比例可填 30 或 30%（=0.30）。',
-        '4. 「付款节点」可整表留空：系统按首付款30%（按原金额）、进度款52%、验收款15%、质保金3%（按总额）自动生成。',
+        '4. 「付款节点」可整表留空：系统按首付款30%、进度款52%、验收款15%、质保金3%（均按 原金额+增补金额，尾差归质保金）自动生成。',
         '5. 「付款申请」「付款记录」「验收记录」可留空；填了则通过 项目编号+科目名称+节点类型 关联到节点。',
         '6. 导入前先空跑一次（不加 --commit），按校验报告修正错误后再正式导入。',
         '7. 本工具不覆盖已存在的项目编号；历史数据请先用新编号或先清理旧数据。',
@@ -615,15 +616,20 @@ def build_plan(parsed, errors, warnings):
     node_index = {}
 
     def add_auto_nodes(item):
-        base_original = Decimal(item['original_amount'])
         base_total = Decimal(item['original_amount']) + Decimal(item['additional_amount'])
+        raw_dues = {template['node_type']: mul_ratio(base_total,
+                                                     Decimal(str(template['ratio'])))
+                    for template in NODE_TEMPLATES}
+        try:
+            dues = allocate_tail(raw_dues, base_total)
+        except ValueError:
+            dues = raw_dues
         for template in NODE_TEMPLATES:
             node_type = template['node_type']
             ratio = Decimal(str(template['ratio']))
-            base = base_original if template['calc_base'] == 'original' else base_total
             node = {'project_no': item['project_no'], 'item_name': item['item_name'],
                     'node_type': node_type, 'ratio': ratio,
-                    'due_amount': mul_ratio(base, ratio),
+                    'due_amount': dues[node_type],
                     'invoice_amount': ZERO, 'paid_amount': ZERO,
                     'status': '未触发', 'due_date': None, 'trigger_date': None,
                     'source': 'auto'}
@@ -638,7 +644,6 @@ def build_plan(parsed, errors, warnings):
         if not records:
             add_auto_nodes(item)
             continue
-        base_original = Decimal(item['original_amount'])
         base_total = Decimal(item['original_amount']) + Decimal(item['additional_amount'])
         seen = set()
         for record in records:
@@ -653,7 +658,7 @@ def build_plan(parsed, errors, warnings):
             ratio = _cell_ratio(record.get('ratio'), ctx, errors, required=True)
             if ratio is None:
                 continue
-            base = base_original if node_type == 'first' else base_total
+            base = base_total   # 统一口径：首付款也按原金额+增补金额
             computed = mul_ratio(base, ratio)
             due = _cell_money(record.get('due_amount'), ctx, errors)
             if due is None:
@@ -700,7 +705,7 @@ def build_plan(parsed, errors, warnings):
             due_sum = sum_money(node['due_amount'] for node in item['nodes'])
             if abs(due_sum - total) > CENT:
                 warnings.append('科目「%s / %s」节点应付合计 %s 与科目总额 %s 不一致'
-                                '（首付款按原金额口径属正常，请人工确认）'
+                                '（请人工核对 Excel 节点应付金额）'
                                 % (item['project_no'], item['item_name'], due_sum, total))
 
     application_map = {}
@@ -1305,7 +1310,7 @@ def write_plan(plan, batch_meta):
                 node_type=data['node_type'],
                 node_name=_node_name(data['node_type'], data['ratio']),
                 ratio=data['ratio'],
-                calc_base='original' if data['node_type'] == 'first' else 'total',
+                calc_base='total',
                 due_amount=data['due_amount'],
                 due_date=data['due_date'], trigger_date=data['trigger_date'],
                 invoice_amount=ZERO, paid_amount=ZERO, status='未触发')
@@ -1446,8 +1451,7 @@ def write_plan(plan, batch_meta):
                         node_name=_node_name(node_data['node_type'],
                                              node_data['ratio']),
                         ratio=node_data['ratio'],
-                        calc_base=('original' if node_data['node_type'] == 'first'
-                                   else 'total'),
+                        calc_base='total',
                         due_amount=node_data['due_amount'],
                         due_date=node_data['due_date'],
                         trigger_date=node_data['trigger_date'],

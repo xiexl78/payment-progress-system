@@ -140,7 +140,7 @@
 
 {# ---------- 付款节点分组 ---------- #}
 <div class="card">
-  <div class="card-title">付款节点管理 <span class="sub">每个科目自动生成 4 个节点：首付款30%（按原金额）、进度款52% / 验收款15% / 质保金3%（按科目总额）</span></div>
+  <div class="card-title">付款节点管理 <span class="sub">每个科目自动生成 4 个节点：首付款30%、进度款52%、验收款15%、质保金3%（均按「原金额+增补金额」，科目内尾差归质保金）</span></div>
 
   {% for node_type, g in node_groups.items() %}
   <div class="node-section">
@@ -160,7 +160,7 @@
           <thead>
             <tr>
               <th>科目</th>
-              {% if node_type == 'first' %}<th class="num">应付（原金额×{{ (g.meta.ratio * 100)|int }}%）</th>{% else %}<th class="num">应付（科目总额×{{ (g.meta.ratio * 100)|int }}%）</th>{% endif %}
+              <th class="num">应付（科目总额×{{ (g.meta.ratio * 100)|int }}%）</th>
               <th class="num">已开票金额</th>
               <th class="num">已支付金额</th>
               <th>状态</th>

@@ -67,7 +67,7 @@ NODE_TEMPLATES = [
         'node_type': 'first',
         'node_name': '首付款30%',
         'ratio': 0.30,
-        'calc_base': 'original',   # 按原金额
+        'calc_base': 'total',      # 统一口径：所有节点按原金额+增补金额（尾差归质保金）
         'trigger': '合同签订即触发',
     },
     {

@@ -164,7 +164,7 @@ NODE_PATTERNS = {
 
 DEFAULT_RATIOS = {'first': 0.30, 'progress': 0.52, 'acceptance': 0.15, 'warranty': 0.03}
 NODE_NAMES = {'first': '首付款', 'progress': '进度款', 'acceptance': '验收款', 'warranty': '质保金'}
-CALC_BASES = {'first': 'original', 'progress': 'total', 'acceptance': 'total', 'warranty': 'total'}
+CALC_BASES = {'first': 'total', 'progress': 'total', 'acceptance': 'total', 'warranty': 'total'}
 
 
 def extract_ratios(text):
