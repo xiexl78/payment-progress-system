@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """付款进度管理系统 - 路由与业务逻辑"""
 import hashlib
+import io
 import json
 import os
 import re
@@ -9,7 +10,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from functools import wraps
 
 from flask import (Blueprint, render_template, request, redirect, url_for, session,
-                   flash, jsonify, abort, current_app)
+                   flash, jsonify, abort, current_app, send_file)
 from sqlalchemy import or_, update
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
@@ -17,6 +18,9 @@ from . import NODE_TEMPLATES, FLOW_STATUS, login_guard, session_guard, timeutil
 from .audit import action_options, record as audit_record, snapshot as audit_snapshot
 from .contract_engine import extract_text, recognize_contract
 from .dbhealth import database_status
+from .exporter import (audit_csv_bytes, build_project_workbook,
+                       build_reports_workbook, export_filename,
+                       workbook_bytes)
 from .models import (db, User, Project, ProjectItem, PaymentNode, PaymentApplication,
                      PaymentRecord, AcceptanceRecord, ContractFile, AuditLog)
 from .money import CENT, MAX_MONEY, ZERO, fmt_money as money_fmt, mul_ratio, sum_money
@@ -1559,9 +1563,8 @@ def contract_raw(contract_id):
 
 # ---------- 报表与提醒 ----------
 
-@bp.route('/reports')
-@login_required
-def reports():
+def _reports_data():
+    """报表数据（页面与 Excel 导出同源，避免两套口径）。"""
     projects = (Project.query.filter(Project.deleted_at.is_(None))
                 .order_by(Project.created_at.desc()).all())
     rows = []
@@ -1576,10 +1579,13 @@ def reports():
             'project': p, 'due': due, 'invoice': invoice, 'paid': paid,
             'unpaid': unpaid, 'progress': progress,
         })
-    total_due = sum_money(r['due'] for r in rows)
-    total_paid = sum_money(r['paid'] for r in rows)
-    total_unpaid = sum_money(r['unpaid'] for r in rows)
-    # 待办提醒：质保到期、已申请待付款、已付款节点
+    totals = {
+        'due': sum_money(r['due'] for r in rows),
+        'invoice': sum_money(r['invoice'] for r in rows),
+        'paid': sum_money(r['paid'] for r in rows),
+        'unpaid': sum_money(r['unpaid'] for r in rows),
+    }
+    # 待办提醒：质保到期、已申请待付款
     today = timeutil.local_today()
     reminders = []
     for p in projects:
@@ -1590,9 +1596,91 @@ def reports():
         for n in p.nodes:
             if n.status in ('未开票已申请', '已申请'):
                 reminders.append(('pending_pay', n, None))
+    return projects, rows, totals, reminders
+
+
+@bp.route('/reports')
+@login_required
+def reports():
+    _projects, rows, totals, reminders = _reports_data()
     return render_template('reports.html', rows=rows,
-                           total_due=total_due, total_paid=total_paid, total_unpaid=total_unpaid,
-                           reminders=reminders)
+                           total_due=totals['due'], total_paid=totals['paid'],
+                           total_unpaid=totals['unpaid'], reminders=reminders)
+
+
+# ---------- 导出（批次 6a） ----------
+
+XLSX_MIMETYPE = ('application/vnd.openxmlformats-officedocument'
+                 '.spreadsheetml.sheet')
+
+
+def _record_export(action, object_type, object_id, project_id, after):
+    """导出操作写审计；失败不阻断下载（只回滚审计，不影响只读导出）。"""
+    try:
+        audit_record(action, object_type, object_id, project_id,
+                     after=after, critical=False)
+        db.session.commit()
+        return True
+    except Exception:
+        db.session.rollback()
+        return False
+
+
+@bp.route('/projects/<int:project_id>/export.xlsx')
+@login_required
+def project_export(project_id):
+    """导出单个项目明细（项目信息/科目/节点/申请/付款/验收）。"""
+    project = _get_project(project_id, include_deleted=True)
+    workbook = build_project_workbook(project)
+    filename = export_filename(
+        '项目明细', [project.project_no] + (['回收站'] if project.deleted_at else []),
+        'xlsx')
+    payload = workbook_bytes(workbook)
+    _record_export('export.project', 'project', project.id, project.id, {
+        'format': 'xlsx', 'file_name': filename,
+        'sheets': ['项目信息', '费用科目', '付款节点', '付款申请', '付款记录', '验收记录'],
+    })
+    return send_file(io.BytesIO(payload), as_attachment=True,
+                     download_name=filename, mimetype=XLSX_MIMETYPE)
+
+
+@bp.route('/reports/export.xlsx')
+@login_required
+def reports_export():
+    """导出付款台账报表汇总 + 待办提醒。"""
+    _projects, rows, totals, reminders = _reports_data()
+    workbook = build_reports_workbook(rows, totals, reminders)
+    filename = export_filename('报表汇总', ['全部项目'], 'xlsx')
+    payload = workbook_bytes(workbook)
+    _record_export('export.reports', 'report', None, None, {
+        'format': 'xlsx', 'file_name': filename, 'projects': len(rows),
+        'sheets': ['付款台账总览', '待办提醒'],
+    })
+    return send_file(io.BytesIO(payload), as_attachment=True,
+                     download_name=filename, mimetype=XLSX_MIMETYPE)
+
+
+@bp.route('/admin/audit/export.csv')
+@login_required
+@role_required('admin')
+def audit_export():
+    """按当前筛选条件导出审计日志 CSV（不分页、只读）。"""
+    project_id, actor, action, date_from, date_to, filters, errors = _audit_filters()
+    if errors:
+        for message in errors:
+            flash(message, 'danger')
+        return redirect(url_for('main.audit_logs', **filters))
+    query = _audit_query(project_id, actor, action, date_from, date_to)
+    logs = (query.order_by(AuditLog.ts.desc(), AuditLog.id.desc())
+            .limit(AUDIT_EXPORT_LIMIT).all())
+    payload = audit_csv_bytes(logs)
+    filename = export_filename('审计日志', _audit_filename_parts(filters), 'csv')
+    _record_export('export.audit', 'audit', None, project_id, {
+        'format': 'csv', 'file_name': filename, 'rows': len(logs),
+        'filters': filters,
+    })
+    return send_file(io.BytesIO(payload), as_attachment=True,
+                     download_name=filename, mimetype='text/csv')
 
 
 # ---------- 系统管理 ----------
@@ -1725,12 +1813,12 @@ def user_delete(user_id):
 # ---------- 操作审计（只读） ----------
 
 AUDIT_PAGE_SIZE = 50
+#: 单次 CSV 导出上限（防止误导出百万行拖垮内存/浏览器）
+AUDIT_EXPORT_LIMIT = 50000
 
 
-@bp.route('/admin/audit')
-@login_required
-@role_required('admin')
-def audit_logs():
+def _audit_filters():
+    """解析审计筛选参数（页面与 CSV 导出共用，保证同条件同结果）。"""
     project_id = request.args.get('project_id', type=int)
     actor = (request.args.get('actor') or '').strip()
     action = (request.args.get('action') or '').strip()
@@ -1746,7 +1834,21 @@ def audit_logs():
         date_to = parse_date(date_to_raw, field='结束日期')
     except ValidationError as exc:
         errors.extend(exc.errors)
+    filters = {}
+    if project_id:
+        filters['project_id'] = project_id
+    if actor:
+        filters['actor'] = actor
+    if action:
+        filters['action'] = action
+    if date_from_raw:
+        filters['date_from'] = date_from_raw
+    if date_to_raw:
+        filters['date_to'] = date_to_raw
+    return project_id, actor, action, date_from, date_to, filters, errors
 
+
+def _audit_query(project_id, actor, action, date_from, date_to):
     query = AuditLog.query
     if project_id:
         query = query.filter(AuditLog.project_id == project_id)
@@ -1762,6 +1864,30 @@ def audit_logs():
         query = query.filter(AuditLog.ts >= timeutil.local_date_start_utc(date_from))
     if date_to:
         query = query.filter(AuditLog.ts < timeutil.local_date_end_utc(date_to))
+    return query
+
+
+def _audit_filename_parts(filters):
+    """把审计筛选条件转成文件名片段（如 项目3_张三_node.pay_20251001-20251023）。"""
+    parts = []
+    if filters.get('project_id'):
+        parts.append('项目%s' % filters['project_id'])
+    if filters.get('actor'):
+        parts.append(filters['actor'])
+    if filters.get('action'):
+        parts.append(filters['action'])
+    if filters.get('date_from') or filters.get('date_to'):
+        parts.append('%s-%s' % (filters.get('date_from', '起始'),
+                                filters.get('date_to', '至今')))
+    return parts or ['全量']
+
+
+@bp.route('/admin/audit')
+@login_required
+@role_required('admin')
+def audit_logs():
+    project_id, actor, action, date_from, date_to, filters, errors = _audit_filters()
+    query = _audit_query(project_id, actor, action, date_from, date_to)
 
     total = query.count()
     page = max(1, request.args.get('page', 1, type=int) or 1)
@@ -1770,17 +1896,6 @@ def audit_logs():
     rows = (query.order_by(AuditLog.ts.desc(), AuditLog.id.desc())
             .offset((page - 1) * AUDIT_PAGE_SIZE)
             .limit(AUDIT_PAGE_SIZE).all())
-    filters = {}
-    if project_id:
-        filters['project_id'] = project_id
-    if actor:
-        filters['actor'] = actor
-    if action:
-        filters['action'] = action
-    if date_from_raw:
-        filters['date_from'] = date_from_raw
-    if date_to_raw:
-        filters['date_to'] = date_to_raw
     projects = Project.query.order_by(Project.created_at.desc()).limit(200).all()
     return render_template('audit.html', rows=rows, page=page, pages=pages,
                            total=total, filters=filters, projects=projects,

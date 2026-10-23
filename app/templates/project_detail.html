@@ -24,6 +24,7 @@
       {% if not project.deleted_at and current_user.role in ('admin', 'operator') %}
       <a href="{{ url_for('main.project_edit', project_id=project.id) }}" class="btn btn-outline btn-sm">编辑项目</a>
       {% endif %}
+      <a href="{{ url_for('main.project_export', project_id=project.id) }}" class="btn btn-outline btn-sm">导出 Excel</a>
       {% if not project.deleted_at and current_user.role == 'admin' and project.status != '已归档' %}
       <form method="post" action="{{ url_for('main.project_status', project_id=project.id) }}" class="op-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

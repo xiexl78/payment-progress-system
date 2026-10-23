@@ -28,6 +28,7 @@
 <div class="card">
   <div class="card-title">付款台账总览
     <span class="sub">合计：应付 ￥{{ '{:,.2f}'.format(total_due) }} · 已付 ￥{{ '{:,.2f}'.format(total_paid) }} · 未付 ￥{{ '{:,.2f}'.format(total_unpaid) }}</span>
+    <a href="{{ url_for('main.reports_export') }}" class="btn btn-outline btn-sm">导出 Excel</a>
   </div>
   <div class="table-wrap">
     <table class="table">
