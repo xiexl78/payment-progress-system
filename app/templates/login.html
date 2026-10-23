@@ -22,6 +22,16 @@
       {% endif %}
     {% endwith %}
 
+    {% if db_error %}
+    <div class="flash danger" style="text-align:left;line-height:1.6;">
+      <b>数据库不可用，暂时无法登录。</b><br>
+      {{ db_error.error or '数据库未初始化或文件损坏' }}<br>
+      请管理员使用备份恢复（见 docs/backup-restore.md），或先运行
+      <code>python scripts/init_db.py</code> 初始化；可访问
+      <a href="{{ url_for('main.healthz') }}">/healthz</a> 查看数据库状态。
+    </div>
+    {% endif %}
+
     <form method="post" action="{{ url_for('main.login') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <div class="form-row">

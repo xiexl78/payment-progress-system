@@ -11,10 +11,12 @@ from functools import wraps
 from flask import (Blueprint, render_template, request, redirect, url_for, session,
                    flash, jsonify, abort, current_app)
 from sqlalchemy import or_, update
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from . import NODE_TEMPLATES, FLOW_STATUS, login_guard, session_guard, timeutil
 from .audit import action_options, record as audit_record, snapshot as audit_snapshot
 from .contract_engine import extract_text, recognize_contract
+from .dbhealth import database_status
 from .models import (db, User, Project, ProjectItem, PaymentNode, PaymentApplication,
                      PaymentRecord, AcceptanceRecord, ContractFile, AuditLog)
 from .money import CENT, MAX_MONEY, ZERO, fmt_money as money_fmt, mul_ratio, sum_money
@@ -112,6 +114,15 @@ def error_internal(error):
                            message='系统处理请求时发生错误，请稍后重试；如持续出现请联系管理员。'), 500
 
 
+@bp.app_errorhandler(OperationalError)
+def error_database(error):
+    """数据库不可用（未初始化/损坏/被锁）：中文降级页，而不是 500 英文错误页。"""
+    return render_template('error.html', code=503, title='数据库不可用',
+                           message='数据库当前不可用（可能未初始化、文件损坏或被占用）。'
+                                   '请联系管理员使用备份恢复（见 docs/backup-restore.md）；'
+                                   '恢复后可访问 /healthz 查看数据库状态。'), 503
+
+
 def role_required(*roles):
     def deco(f):
         @wraps(f)
@@ -177,6 +188,17 @@ def _guard_active_project(project):
     """已删除项目禁止业务变更；返回重定向响应或 None。"""
     if project is not None and project.deleted_at is not None:
         flash('该项目已删除（在回收站中），请先恢复后再操作', 'danger')
+        return redirect(url_for('main.project_detail', project_id=project.id))
+    return None
+
+
+def _guard_writable_project(project):
+    """已删除/已归档项目禁止业务变更（批次 4c 软删除 + P1-03 归档只读）。"""
+    guard = _guard_active_project(project)
+    if guard:
+        return guard
+    if project is not None and project.status == '已归档':
+        flash('项目已归档（只读），如需变更请先由管理员按流程解除归档', 'danger')
         return redirect(url_for('main.project_detail', project_id=project.id))
     return None
 
@@ -316,6 +338,9 @@ def login():
     if current_user():
         return redirect(url_for('main.projects'))
     if request.method == 'POST':
+        db_state = database_status()
+        if not db_state['ok']:
+            return render_template('login.html', db_error=db_state)
         username = (request.form.get('username') or '').strip()
         password = request.form.get('password') or ''
         ip = request.remote_addr
@@ -379,7 +404,21 @@ def login():
                   % max(1, throttle['lock_seconds'] // 60), 'danger')
         else:
             flash('用户名或密码错误', 'danger')
-    return render_template('login.html')
+    db_state = database_status()
+    return render_template('login.html', db_error=None if db_state['ok'] else db_state)
+
+
+@bp.route('/healthz')
+def healthz():
+    """健康检查：数据库可用返回 200，不可用返回 503（无需登录）。"""
+    db_state = database_status()
+    payload = {
+        'status': 'ok' if db_state['ok'] else 'degraded',
+        'db': db_state,
+        'env': current_app.config.get('APP_ENV'),
+        'time': timeutil.utcnow().isoformat() + 'Z',
+    }
+    return jsonify(payload), (200 if db_state['ok'] else 503)
 
 
 @bp.route('/logout', methods=['POST'])
@@ -553,6 +592,9 @@ def project_edit(project_id):
     project = _get_project(project_id)
     if not project:
         abort(404)
+    guard = _guard_writable_project(project)
+    if guard:
+        return guard
     if request.method == 'POST':
         try:
             name = validate_text(request.form.get('name') or project.name,
@@ -593,6 +635,9 @@ def item_add(project_id):
     project = _get_project(project_id)
     if not project:
         abort(404)
+    guard = _guard_writable_project(project)
+    if guard:
+        return guard
     item_name = (request.form.get('item_name') or '').strip()
     if not item_name:
         flash('科目名称必填', 'danger')
@@ -686,7 +731,7 @@ def node_update(node_id):
     node = db.session.get(PaymentNode, node_id)
     if not node:
         abort(404)
-    guard = _guard_active_project(node.project)
+    guard = _guard_writable_project(node.project)
     if guard:
         return guard
     detail_url = url_for('main.project_detail', project_id=node.project_id)
@@ -835,6 +880,9 @@ def acceptance_add(project_id):
     project = _get_project(project_id)
     if not project:
         abort(404)
+    guard = _guard_writable_project(project)
+    if guard:
+        return guard
     try:
         acc_date = parse_date(request.form.get('acceptance_date'),
                               field='验收日期', required=True)
@@ -874,6 +922,9 @@ def trial_set(project_id):
     project = _get_project(project_id)
     if not project:
         abort(404)
+    guard = _guard_writable_project(project)
+    if guard:
+        return guard
     try:
         trial_date = parse_date(request.form.get('trial_date'),
                                 field='试运行日期', required=True)
@@ -901,6 +952,9 @@ def project_status(project_id):
     if not project:
         abort(404)
     status = request.form.get('status')
+    if project.status == '已归档' and status != '已归档':
+        flash('已归档项目不可回退（只读）；如确需修改请联系管理员按流程处理', 'danger')
+        return redirect(url_for('main.project_detail', project_id=project.id))
     if status in ('进行中', '已完成', '已归档'):
         before = {'status': project.status}
         project.status = status
@@ -923,8 +977,11 @@ CALC_BASE_LABELS = {'first': '按原金额', 'progress': '按总金额', 'accept
 
 
 def contract_upload_dir():
-    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-    d = os.path.join(base_dir, 'instance', 'uploads')
+    """上传目录：优先取配置的 UPLOAD_DIR（DATA_DIR/uploads），测试可 monkeypatch。"""
+    d = current_app.config.get('UPLOAD_DIR')
+    if not d:
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        d = os.path.join(base_dir, 'instance', 'uploads')
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -1308,6 +1365,9 @@ def contract_confirm(contract_id):
     if guard:
         flash('关联项目已删除，请先在回收站恢复后再修改合同', 'danger')
         return redirect(url_for('main.contracts'))
+    if project is not None and project.status == '已归档':
+        flash('关联项目已归档（只读），不能修改合同；请先解除归档', 'danger')
+        return redirect(url_for('main.contracts'))
     if is_update:
         values = _project_contract_values(project)
         blockers = _contract_blockers(project)
@@ -1352,6 +1412,9 @@ def contract_confirm_submit(contract_id):
             return redirect(url_for('main.contracts'))
         if project.deleted_at is not None:
             flash('关联项目已删除，请先在回收站恢复后再修改合同', 'danger')
+            return redirect(url_for('main.contracts'))
+        if project.status == '已归档':
+            flash('关联项目已归档（只读），不能修改合同；请先解除归档', 'danger')
             return redirect(url_for('main.contracts'))
         current = _project_contract_values(project)
         diff = _diff_contract_values(current, submission)

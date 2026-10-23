@@ -1,14 +1,21 @@
 # -*- coding: utf-8 -*-
-"""付款进度管理系统 - Flask 应用工厂与配置"""
+"""付款进度管理系统 - Flask 应用工厂与配置
+
+配置加载见 ``app/config.py``（优先级：显式 config > 环境变量 > 配置文件 > 默认）。
+本模块负责：建目录、启动自检（fail-fast）、SQLite 连接参数、注册蓝图。
+"""
+
 import os
-from datetime import timedelta
+import sqlite3
 
 from flask import Flask
 from sqlalchemy import event
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+from .config import DEFAULT_SECRET_KEY, load_config
 from .models import db
 
-#: 历史默认密钥：生产启动时明确拒绝，仅显式 config 注入（测试/本地）可用
-DEFAULT_SECRET_KEY = 'payment-progress-secret-key-change-in-prod'
+__all__ = ['create_app', 'DEFAULT_SECRET_KEY', 'NODE_TEMPLATES', 'FLOW_STATUS']
 
 # 付款节点模板：node_type / 名称 / 比例 / 计算口径 / 触发条件
 NODE_TEMPLATES = [
@@ -46,79 +53,116 @@ NODE_TEMPLATES = [
 FLOW_STATUS = ['未触发', '未开票已申请', '已申请', '已付款']
 
 
+def _ensure_writable_dir(path, *, label, errors):
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, '.write_probe')
+        with open(probe, 'w', encoding='utf-8') as handle:
+            handle.write('ok')
+        os.remove(probe)
+        return True
+    except Exception as exc:
+        errors.append('%s 无法创建或不可写：%s（%s）' % (label, path, exc))
+        return False
+
+
+def _check_database_file(app, errors, warnings):
+    """非测试启动路径的数据库自检：缺库/损坏按环境决定 fail 或 warn。"""
+    uri = app.config.get('SQLALCHEMY_DATABASE_URI') or ''
+    if not uri.startswith('sqlite:///'):
+        return
+    db_path = uri[len('sqlite:///'):]
+    exists = os.path.isfile(db_path)
+    if not exists:
+        if app.config.get('APP_ENV') == 'production':
+            errors.append('数据库不存在：%s；请先运行 python scripts/init_db.py' % db_path)
+        else:
+            warnings.append('数据库不存在（开发环境）：%s，登录前请先运行 '
+                            'python scripts/init_db.py' % db_path)
+        return
+    try:
+        conn = sqlite3.connect('file:%s?mode=ro' % db_path, uri=True, timeout=5)
+        try:
+            conn.execute('PRAGMA schema_version').fetchone()
+            conn.execute('SELECT name FROM sqlite_master LIMIT 1').fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        errors.append('数据库文件损坏或不可读：%s（%s）；请使用备份恢复' % (db_path, exc))
+
+
 def create_app(config=None):
     """应用工厂。
 
-    - ``config`` 为 None（run.py 生产/开发启动路径）：``SECRET_KEY`` 必须来自
-      环境变量且不能等于历史默认值，否则拒绝启动；CSRF 强制开启；
-    - ``config`` 显式注入（测试/本地/自定义部署）：以注入值为准；未提供
-      SECRET_KEY 时回退默认值，默认关闭 CSRF（可用 ``CSRF_ENABLED=True`` 强开）。
+    - 显式 ``config`` 注入（测试/嵌入）：优先级最高；未提供 SECRET_KEY 时使用
+      历史默认值并关闭 CSRF/登录限速/默认口令强制改密（测试模式）；
+    - 无显式 config（run.py 生产/开发启动）：读取环境变量与
+      ``PAYMENT_CONFIG_FILE``，缺密钥/目录不可写/库损坏等直接拒绝启动。
     """
     explicit_config = config is not None
     app = Flask(__name__, instance_relative_config=True)
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-    app.config.from_mapping(
-        SQLALCHEMY_DATABASE_URI='sqlite:///' + os.path.join(base_dir, 'instance', 'payment_progress.db'),
-        SQLALCHEMY_TRACK_MODIFICATIONS=False,
-        MAX_CONTENT_LENGTH=int(os.environ.get('MAX_UPLOAD_MB', '20')) * 1024 * 1024,
-        SESSION_COOKIE_HTTPONLY=True,
-        SESSION_COOKIE_SAMESITE='Lax',
-        SESSION_COOKIE_SECURE=os.environ.get('SESSION_COOKIE_SECURE', '0').strip() == '1',
-        PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
-        APP_TIMEZONE=os.environ.get('APP_TIMEZONE', 'Asia/Shanghai'),
-        CSRF_ENABLED=True,
-        DEBUG=False,
-        TESTING=False,
-        # 批次 4b：密码与登录限速
-        PASSWORD_MIN_LENGTH=8,
-        LOGIN_MAX_FAILURES=5,
-        LOGIN_FAILURE_WINDOW_MINUTES=5,
-        LOGIN_LOCK_MINUTES=15,
-        LOGIN_THROTTLE_ENABLED=True,
-        FORCE_DEFAULT_PASSWORD_CHANGE=True,
-    )
+
+    cfg, errors, warnings = load_config(
+        base_dir, config_file=os.environ.get('PAYMENT_CONFIG_FILE'),
+        explicit=explicit_config)
+    app.config.from_mapping(cfg)
+
     if explicit_config:
         app.config.update(config)
         if not app.config.get('SECRET_KEY'):
             app.config['SECRET_KEY'] = DEFAULT_SECRET_KEY
         if 'CSRF_ENABLED' not in config:
-            # 使用默认密钥的显式配置视为测试/本地模式，默认不强制 CSRF
-            app.config['CSRF_ENABLED'] = app.config['SECRET_KEY'] != DEFAULT_SECRET_KEY
+            app.config['CSRF_ENABLED'] = (
+                app.config['SECRET_KEY'] != DEFAULT_SECRET_KEY)
         if app.config['SECRET_KEY'] == DEFAULT_SECRET_KEY:
-            app.logger.warning('使用历史默认 SECRET_KEY（仅限测试/本地），CSRF_ENABLED=%s',
-                               app.config['CSRF_ENABLED'])
-            # 测试/本地模式默认关闭「默认口令强制改密」与「登录限速」，避免打挂基线
-            if 'FORCE_DEFAULT_PASSWORD_CHANGE' not in config:
-                app.config['FORCE_DEFAULT_PASSWORD_CHANGE'] = False
-            if 'LOGIN_THROTTLE_ENABLED' not in config:
-                app.config['LOGIN_THROTTLE_ENABLED'] = False
-    else:
-        secret = (os.environ.get('SECRET_KEY') or '').strip()
-        if not secret or secret == DEFAULT_SECRET_KEY:
-            raise RuntimeError(
-                'SECRET_KEY 未配置或仍为历史默认值，拒绝启动。'
-                '请设置环境变量 SECRET_KEY 为随机密钥（如 '
-                'python -c "import secrets;print(secrets.token_urlsafe(48))" 生成）。')
-        app.config['SECRET_KEY'] = secret
+            app.config['FORCE_DEFAULT_PASSWORD_CHANGE'] = False
+            app.config['LOGIN_THROTTLE_ENABLED'] = False
+            warnings.append('测试模式：使用历史默认 SECRET_KEY，CSRF=%s、登录限速=%s'
+                            % (app.config['CSRF_ENABLED'],
+                               app.config['LOGIN_THROTTLE_ENABLED']))
+            for key in ('FORCE_DEFAULT_PASSWORD_CHANGE', 'LOGIN_THROTTLE_ENABLED'):
+                if key in config:
+                    app.config[key] = config[key]
 
-    os.makedirs(os.path.join(base_dir, 'instance'), exist_ok=True)
+    if errors:
+        raise RuntimeError('配置校验失败: ' + '；'.join(errors))
+
+    # 目录：数据目录 / 上传目录（不可写 → 拒绝启动）
+    dir_errors = []
+    data_dir = app.config['DATA_DIR']
+    upload_dir = app.config['UPLOAD_DIR']
+    _ensure_writable_dir(data_dir, label='DATA_DIR', errors=dir_errors)
+    _ensure_writable_dir(upload_dir, label='UPLOAD_DIR', errors=dir_errors)
+    if not explicit_config:
+        _check_database_file(app, dir_errors, warnings)
+    if dir_errors:
+        raise RuntimeError('启动自检失败: ' + '；'.join(dir_errors))
+
+    if app.config.get('TRUSTED_PROXY_COUNT'):
+        app.wsgi_app = ProxyFix(app.wsgi_app,
+                                x_for=int(app.config['TRUSTED_PROXY_COUNT']),
+                                x_proto=int(app.config['TRUSTED_PROXY_COUNT']))
+
+    for message in warnings:
+        app.logger.warning('[config] %s', message)
+
     db.init_app(app)
 
-    # SQLite 并发写入稳健性：WAL 模式 + 等待锁超时，避免多请求下 database is locked
-    # 注意：必须在任何连接建立之前注册（schema 自动升级会先连库）
+    # SQLite 并发写入稳健性：WAL 模式 + 等待锁超时（仅 sqlite）
     with app.app_context():
         engine = db.engine
-
-        @event.listens_for(engine, 'connect')
-        def set_sqlite_pragma(dbapi_connection, connection_record):
-            try:
-                cursor = dbapi_connection.cursor()
-                cursor.execute('PRAGMA journal_mode=WAL')
-                cursor.execute('PRAGMA busy_timeout=5000')
-                cursor.execute('PRAGMA foreign_keys=ON')
-                cursor.close()
-            except Exception:
-                pass
+        if engine.dialect.name == 'sqlite':
+            @event.listens_for(engine, 'connect')
+            def set_sqlite_pragma(dbapi_connection, connection_record):
+                try:
+                    cursor = dbapi_connection.cursor()
+                    cursor.execute('PRAGMA journal_mode=WAL')
+                    cursor.execute('PRAGMA busy_timeout=5000')
+                    cursor.execute('PRAGMA foreign_keys=ON')
+                    cursor.close()
+                except Exception:
+                    pass
 
     from .schema import upgrade_schema
     upgrade_schema(app)
