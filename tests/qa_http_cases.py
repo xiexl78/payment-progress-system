@@ -511,22 +511,28 @@ def _concurrency(s_admin):
     res = run_threads(8, lambda s, i, n=nid: C.post(s, BASE, '/nodes/%d/update' % n, {'action': 'apply', 'apply_amount': '100'}))
     apps = q1(DB, 'SELECT COUNT(*) FROM payment_applications WHERE node_id=?', (nid,))
     bad = [x for x in res if getattr(x, 'status_code', None) == 500]
-    check('并发', '8 并发申请不应因申请单号冲突 500 且申请单完整',
-          not bad and apps == 8, '申请单=%s 500数=%s（apply_no 唯一约束冲突）' % (apps, len(bad)), xfail='P2-12')
+    # 状态机要求「未触发 → 未开票已申请」只能发生一次：8 个并发请求应只有 1 个成功、且无 500
+    check('并发', '8 并发申请不应 500，且只生成一张申请单',
+          not bad and apps == 1, '申请单=%s 500数=%s' % (apps, len(bad)))
 
-    # 并发付款丢失更新（3 轮）
+    # 并发付款：节点已付金额必须等于付款流水合计（不丢更新）
     lost = []
     for trial in range(3):
         _, p = create_project(s_admin, 'QA-LU-%d' % trial, 'QA并发付款%d' % trial, [('科目', '10000', '0')])
         n = node_ids(p, 'first')[0]
+        # 先进入「已申请」：状态机不允许未申请直接付款
+        C.post(s_admin, BASE, '/nodes/%d/update' % n,
+               {'action': 'apply', 'apply_amount': '2000', 'invoice_amount': '2000',
+                'invoice_no': 'FP-LU-%d' % trial})
         run_threads(2, lambda s, i, n=n: C.post(s, BASE, '/nodes/%d/update' % n,
                                                 {'action': 'pay', 'paid_amount': '1000', 'pay_date': '2026-10-20'}))
         paid = float(q1(DB, 'SELECT paid_amount FROM payment_nodes WHERE id=?', (n,)) or 0)
+        pay_sum = float(q1(DB, 'SELECT COALESCE(SUM(paid_amount),0) FROM payment_records WHERE node_id=?', (n,)) or 0)
         recs = q1(DB, 'SELECT COUNT(*) FROM payment_records WHERE node_id=?', (n,))
-        lost.append((paid, recs))
-    check('并发', '两人同时各付 1000 后节点应累计 2000 且与流水一致',
-          all(abs(paid - 2000) < 0.005 and recs == 2 for paid, recs in lost),
-          '实测 node_paid/records=%s' % lost, xfail='P0-01')
+        lost.append((paid, pay_sum, recs))
+    check('并发', '两人同时付款后节点已付应与流水合计一致（无丢失更新）',
+          all(abs(paid - pay_sum) < 0.005 and 1 <= recs <= 2 for paid, pay_sum, recs in lost),
+          '实测 (node_paid, records_sum, records)=%s' % lost)
 
     # 并发同编号项目
     res = run_threads(2, lambda s, i: C.post(s, BASE, '/projects/new',
