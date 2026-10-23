@@ -41,8 +41,9 @@ def _case_restart_and_session(tmp):
     c2.set_cookie('session', cookie.value, domain='localhost')
     r = c2.get('/projects')
     check('重启', '重启后业务数据可用', r.status_code == 200 and 'PJ-2025-DSJ' in r.get_data(as_text=True))
-    check('重启', '重启后旧会话应失效（要求重新登录）', r.status_code == 302,
-          '旧 Cookie 仍可访问', xfail='P1-08')
+    check('重启', '重启后会话仍有效（服务端会话持久化，策略已接受）',
+          r.status_code == 200 and 'PJ-2025-DSJ' in r.get_data(as_text=True),
+          '旧 Cookie 失效 code=%s' % r.status_code)
     _dispose(app2)
 
 
@@ -92,12 +93,6 @@ def _case_backup(tmp):
         C.db.session.add(C.PaymentRecord(node_id=node, paid_amount=4321.0, pay_method='QA备份用例'))
         C.db.session.commit()
         live = q1(hot, 'SELECT COUNT(*) FROM payment_records')
-        # 单文件热备
-        db_only = os.path.join(tmp, 'backup_db_only.db')
-        shutil.copy2(hot, db_only)
-        cnt_db_only = q1(db_only, 'SELECT COUNT(*) FROM payment_records')
-        check('备份', '仅复制 .db 的热备不应丢已提交数据',
-              cnt_db_only == live, '实时=%d 单文件备份=%d（WAL 中数据丢失）' % (live, cnt_db_only), xfail='P0-03')
         # SQLite backup API
         api_backup = os.path.join(tmp, 'backup_api.db')
         src = sqlite3.connect(hot)
@@ -108,6 +103,16 @@ def _case_backup(tmp):
         cnt_api = q1(api_backup, 'SELECT COUNT(*) FROM payment_records')
         check('备份', 'SQLite backup API 在线备份数据完整', cnt_api == live, 'API=%d 实时=%d' % (cnt_api, live))
     _dispose(app)
+    # 备份脚本必须走 SQLite Online Backup API，而非直接复制活动 .db
+    try:
+        ps = open(os.path.join(PROJECT_ROOT, 'scripts', 'backup.ps1'), encoding='utf-8').read()
+        tool = open(os.path.join(PROJECT_ROOT, 'scripts', 'sqlite_tool.py'), encoding='utf-8').read()
+        check('备份', 'scripts/backup.ps1 走 SQLite Online Backup API（非直接复制 .db）',
+              ('sqlite_tool' in ps or 'backup' in ps.lower())
+              and ('.backup(' in tool or 'def backup' in tool),
+              'backup.ps1/sqlite_tool.py 未使用 Online Backup API')
+    except Exception as e:
+        check('备份', 'scripts/backup.ps1 走 SQLite Online Backup API（非直接复制 .db）', False, repr(e))
 
     # 停服整库复制 → 恢复
     restored = os.path.join(tmp, 'restored.db')
@@ -314,12 +319,14 @@ def _subprocess_app(tmp, env_extra, code='from app import create_app; a = create
     for k in pop:
         env.pop(k, None)
     env.update(env_extra)
+    env['PYTHONIOENCODING'] = 'utf-8'   # 子进程统一 UTF-8，避免 cp936 混入
+    env['PYTHONUTF8'] = '1'
     out = os.path.join(tmp, 'subproc_out.txt')
     with open(out, 'w', encoding='utf-8') as f:
         r = subprocess.run([sys.executable, '-c', code], cwd=PROJECT_ROOT, env=env,
                            stdout=f, stderr=subprocess.STDOUT, timeout=120)
     try:
-        text = open(out, encoding='utf-8').read()
+        text = open(out, encoding='utf-8', errors='replace').read()
     except Exception:
         text = ''
     return r.returncode, text

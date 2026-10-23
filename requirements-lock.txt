@@ -1,8 +1,13 @@
-# 付款进度管理系统 · 运行依赖完整闭包（含传递依赖，用于复现环境）
-# 生成日期：2026-10-23；生成环境：Windows 10.0.17763 + Python 3.12.2
-# 生成方法：按 requirements.txt 直接依赖递归解析 importlib.metadata 的 Requires-Dist，取本机已装版本。
-# 用途：目标机 `pip install -r requirements-lock.txt` 得到与开发机一致的依赖树（waitress 除外，见文末）。
-# 注意：升级任何一行前，先跑 `python tests/run_qa.py` 与 `python scripts/e2e_test.py`（需先起服务）。
+# Full runtime dependency closure (includes transitive deps) - reproducible install.
+# Generated: 2026-10-23 on Windows 10.0.17763 + Python 3.12.2.
+# Method: recursively resolved Requires-Dist of the direct deps in requirements.txt
+#         against the versions installed on the dev machine.
+# Install on target host: python -m pip install -r requirements-lock.txt
+# Before upgrading any line, run: python tests/run_qa.py and scripts/e2e_test.py.
+# NOTE: keep this file ASCII-only. pip on a Chinese Windows locale fails to decode
+#       UTF-8-without-BOM comments (UnicodeDecodeError: 'gbk' codec ...).
+# waitress is intentionally not locked here (not installed on dev machine);
+# deploy hosts should install waitress==3.0.2 and archive their pip freeze.
 
 blinker==1.9.0
 certifi==2026.10.19
@@ -42,7 +47,3 @@ tabulate==0.10.0
 typing_extensions==4.16.0
 urllib3==2.8.0
 Werkzeug==3.1.8
-
-# 生产 WSGI 服务器：本机沙箱无法安装，未纳入本次锁定；目标机安装 waitress==3.0.2 后
-# 用 pip freeze 生成目标机专属 lock 并归档（部署验收项之一）。
-# waitress==3.0.2

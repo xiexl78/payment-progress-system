@@ -1,6 +1,7 @@
-# 付款进度管理系统 · 开发/测试依赖
-# 锁定日期：2026-10-23。版本取自 PyPI 当前稳定版（本机沙箱未安装，首次安装后请以 pip freeze 校准）。
-# 安装：python -m pip install -r requirements-dev.txt
+# Dev/test dependencies for payment-progress-system (pinned, 2026-10-23)
+# Versions checked against PyPI; calibrate with pip freeze after first install.
+# Install: python -m pip install -r requirements-dev.txt
+# NOTE: keep this file ASCII-only (pip + Chinese Windows locale decoding issue).
 
 pytest==9.1.1
 pytest-cov==7.1.0

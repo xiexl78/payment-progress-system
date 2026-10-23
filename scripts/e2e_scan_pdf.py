@@ -5,14 +5,33 @@ import sys
 import requests
 
 BASE = 'http://127.0.0.1:5001'
+PASSED = 0
+FAILED = 0
+
+
+def finish():
+    """输出 PASS/FAIL 汇总并返回非零退出码（失败时）。"""
+    print('\n总计 %d 通过, %d 失败' % (PASSED, FAILED))
+    if FAILED:
+        print('扫描件端到端验证未通过')
+        sys.exit(1)
+    print('扫描件端到端验证全部通过')
+    sys.exit(0)
+
 
 def login(session, username, password):
     r = session.get(BASE + '/login')
     r = session.post(BASE + '/login', data={'username': username, 'password': password}, allow_redirects=False)
     return r.status_code in (302, 303)
 
+
 def check(label, cond, detail=''):
+    global PASSED, FAILED
     status = 'PASS' if cond else 'FAIL'
+    if cond:
+        PASSED += 1
+    else:
+        FAILED += 1
     print('  [%s] %s%s' % (status, label, (' - ' + detail) if detail else ''))
     return cond
 
@@ -76,12 +95,14 @@ def main():
     print('  Location:', r.headers.get('Location', ''))
     if r.status_code not in (302, 303):
         print('  响应:', r.text[:500])
-        return
-    
+        check('扫描件 PDF 上传被接收', False, 'status=%s' % r.status_code)
+        finish()
+
     loc = r.headers.get('Location', '')
     if '/contracts/' not in loc or '/confirm' not in loc:
         print('  未重定向到确认页，停止测试')
-        return
+        check('扫描件 PDF 识别进入确认页', False, 'loc=%s' % loc)
+        finish()
     ct_id = int(loc.rstrip('/').split('/')[-2])
     print('  合同ID:', ct_id)
     
@@ -101,7 +122,7 @@ def main():
         'tax_rate': '13%',
         'payment_method': '分期支付',
         'ratio_first': '25',
-        'ratio_progress': '52',
+        'ratio_progress': '57',
         'ratio_acceptance': '15',
         'ratio_warranty': '3',
     }, allow_redirects=False)
@@ -128,6 +149,7 @@ def main():
         except Exception:
             pass
     print('清理临时文件')
+    finish()
 
 if __name__ == '__main__':
     main()

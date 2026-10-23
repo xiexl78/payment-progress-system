@@ -9,6 +9,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 
 import requests
@@ -102,11 +103,18 @@ def _sessions():
     check('会话', '错误密码不建立会话', rw.status_code == 200 and rw2.status_code == 302,
           'code=%s 后续=%s' % (rw.status_code, rw2.status_code))
 
-    for _ in range(6):
-        requests.post(BASE + '/login', data={'username': 'admin', 'password': 'bad'})
-    _, ra = C.login(BASE, 'admin', 'admin123')
-    check('会话', '连续失败后应锁定/延迟', ra.status_code != 302,
-          '6 次错密后仍直接登录成功 → 无锁定', xfail='P1-10')
+    # 登录限速（4b）：显式开启限速的客户端 + 专用账号验证
+    C.post(s_admin, BASE, '/admin/users/new',
+           {'username': 'qa_lock1', 'display_name': 'QA限速', 'password': 'Qa#123456', 'role': 'viewer'})
+    tc_lock = _cfg_client(LOGIN_THROTTLE_ENABLED=True)
+    for _ in range(5):
+        tc_lock.post('/login', data={'username': 'qa_lock1', 'password': 'wrong'}, follow_redirects=False)
+    r_lock = tc_lock.post('/login', data={'username': 'qa_lock1', 'password': 'Qa#123456'},
+                          follow_redirects=False)
+    _lock_body = r_lock.get_data(as_text=True)
+    check('会话', '连续失败后应锁定/延迟',
+          r_lock.status_code == 200 and any(k in _lock_body for k in ('锁定', '稍后', '尝试')),
+          'code=%s' % r_lock.status_code)
 
     bad = []
     for path in ['/projects', '/reports', '/contracts', '/projects/1', '/admin/users',
@@ -602,7 +610,7 @@ def _audit_and_config(s_admin, pid_a, ct1):
     has_counter = ('FAIL' in scan_src and 'PASS' in scan_src)
     has_exit = ('sys.exit(1)' in scan_src or 'exit(1)' in scan_src or 'raise SystemExit' in scan_src)
     check('配置', 'e2e_scan_pdf.py 失败时应有 PASS/FAIL 汇总且退出码非 0',
-          has_counter and has_exit, '失败仅 print 后 return，退出码仍为 0', xfail='P2-08')
+          has_counter and has_exit, '失败仅 print 后 return，退出码仍为 0')
     # 文件日志
     app_init = open(os.path.join(PROJECT_ROOT, 'app', '__init__.py'), encoding='utf-8').read()
     check('配置', '应用应配置文件日志（FileHandler/轮转）',
@@ -1058,6 +1066,8 @@ def _batch4b_security(s_admin):
 
     # 6) 上传上限配置化（MAX_UPLOAD_MB，默认 20MB 与 README 对齐）
     env = os.environ.copy()
+    env['PYTHONIOENCODING'] = 'utf-8'
+    env['PYTHONUTF8'] = '1'
     env['SECRET_KEY'] = 'qa-upload-cfg-secret'
     env['MAX_UPLOAD_MB'] = '20'
     out_file = os.path.join(os.path.dirname(DB), 'upload_cfg.txt')
@@ -1068,7 +1078,7 @@ def _batch4b_security(s_admin):
                            env=env, stdout=f, stderr=subprocess.STDOUT, timeout=120)
     val = ''
     try:
-        val = open(out_file, encoding='utf-8').read().strip()
+        val = open(out_file, encoding='utf-8', errors='replace').read().strip()
     except Exception:
         pass
     nums = [ln.strip() for ln in val.splitlines() if ln.strip().isdigit()]
@@ -1244,6 +1254,96 @@ def _archived_readonly_cases(s_admin):
                   due_before == due_after, 'due %s→%s' % (due_before, due_after))
 
 
+
+def _batch6_export_import(s_admin):
+    """批次 6a 导出 / 6b 导入框架验收（未实现标 xfail）。"""
+    s_admin, _ = C.login(BASE, 'admin', 'admin123')
+    candidates = ['/reports/export', '/reports/export.xlsx', '/export', '/projects/export']
+    found = None
+    for path in candidates:
+        r = s_admin.get(BASE + path, allow_redirects=False)
+        if r.status_code == 200 and (
+                'spreadsheet' in r.headers.get('Content-Type', '') or r.content[:2] == b'PK'):
+            found = (path, r)
+            break
+    check('导出', '存在 Excel 导出接口（admin 可下载 xlsx）', found is not None,
+          '候选路径均不可用：%s' % candidates, xfail='P0-05')
+    if found:
+        path, resp = found
+        rows = []
+        try:
+            from openpyxl import load_workbook
+            import io as _io
+            wb = load_workbook(_io.BytesIO(resp.content))
+            rows = list(wb.active.iter_rows(values_only=True))
+        except Exception as e:
+            check('导出', '导出文件可被 openpyxl 解析', False, repr(e), xfail='P0-05')
+        flat = ' '.join(str(c) for row in rows[:3] for c in row if c is not None)
+        check('导出', '导出字段与页面一致（项目编号/项目名称/金额）',
+              all(k in flat for k in ('项目编号', '项目名称')), flat[:120], xfail='P0-05')
+        check('导出', '导出金额为两位小数（Decimal 口径）',
+              any(isinstance(c, (int, float)) and abs(round(float(c), 2) - float(c)) < 1e-9
+                  for row in rows for c in row), '未发现两位小数金额', xfail='P0-05')
+        cnt_all = q1(DB, 'SELECT COUNT(*) FROM projects')
+        page_all = s_admin.get(BASE + path).text
+        check('导出', '导出筛选条件生效（不限条件导出全部项目）',
+              len(rows) >= min(cnt_all, 2), 'rows=%d projects=%d' % (len(rows), cnt_all), xfail='P0-05')
+        sv, _ = C.login(BASE, 'viewer', '123456')
+        check('导出', 'viewer 可导出', sv.get(BASE + path, allow_redirects=False).status_code == 200,
+              xfail='P0-05')
+        check('导出', '未登录用户导出被拒',
+              requests.get(BASE + path, allow_redirects=False).status_code in (301, 302, 401, 403))
+        base_audit = _audit_max_id()
+        s_admin.get(BASE + path)
+        acts = [str(x.get('action', '')) for x in _audit_rows(base_audit)]
+        check('导出', '导出写审计', any('export' in a for a in acts), '动作=%s' % acts, xfail='P0-05')
+
+    # 6b 导入：脚本 + dry-run 报告 + 未提交不改库
+    imp = os.path.join(PROJECT_ROOT, 'scripts', 'import_excel.py')
+    has_imp = os.path.exists(imp)
+    check('导入', '提供 import_excel.py（支持 dry-run）', has_imp,
+          '未找到 scripts/import_excel.py', xfail='P0-06')
+    if has_imp:
+        tmp = tempfile.mkdtemp(prefix='payment_qa_import_')
+        xlsx = os.path.join(tmp, 'seed_import.xlsx')
+        try:
+            from openpyxl import Workbook
+            wb = Workbook()
+            ws = wb.active
+            ws.append(['项目编号', '项目名称', '科目', '税率', '原金额', '增补金额', '状态'])
+            ws.append(['PJ-2025-DSJ', '新增动设备监测项目', '设备费', '13%', 131000, 0, '进行中'])
+            ws.append(['', '缺编号项目', '设备费', '13%', 1000, 0, '进行中'])
+            ws.append(['PJ-2025-DSJ', '重复编号项目', '设备费', '13%', 1000, 0, '进行中'])
+            ws.append(['PJ-BAD-AMT', '金额异常项目', '设备费', '13%', 'abc', 0, '错误状态'])
+            wb.save(xlsx)
+        except ImportError:
+            pass
+        if os.path.exists(xlsx):
+            env = os.environ.copy()
+            env['SECRET_KEY'] = 'qa-import-secret'
+            before = (q1(DB, 'SELECT COUNT(*) FROM projects'), q1(DB, 'SELECT COUNT(*) FROM payment_nodes'))
+            out = os.path.join(tmp, 'import_out.txt')
+            with open(out, 'w', encoding='utf-8') as f:
+                rc = subprocess.run([sys.executable, imp, '--dry-run', '--input', xlsx],
+                                    cwd=PROJECT_ROOT, env=env, stdout=f,
+                                    stderr=subprocess.STDOUT, timeout=180).returncode
+            try:
+                text = open(out, encoding='utf-8').read()
+            except Exception:
+                text = ''
+            check('导入', 'dry-run 报告列出错误行（必填/唯一/金额/状态）',
+                  rc == 0 and any(k in text for k in ('错误', 'ERROR', '失败'))
+                  and any(k in text for k in ('必填', '重复', '金额', '状态')),
+                  'rc=%s out=%s' % (rc, text[-200:]), xfail='P0-06')
+            after = (q1(DB, 'SELECT COUNT(*) FROM projects'), q1(DB, 'SELECT COUNT(*) FROM payment_nodes'))
+            check('导入', 'dry-run 未提交时数据库不变', before == after, '%s→%s' % (before, after),
+                  xfail='P0-06')
+        else:
+            check('导入', 'dry-run 报告列出错误行（必填/唯一/金额/状态）', False,
+                  '缺少 openpyxl 或报告格式未定义', xfail='P0-06')
+            check('导入', 'dry-run 未提交时数据库不变', False, '无法构造测试文件', xfail='P0-06')
+
+
 def run(server):
     global DB, BASE, APP, UPLOAD_DIR
     DB, BASE, APP, UPLOAD_DIR = server.db_path, server.base, server.app, server.upload_dir
@@ -1274,4 +1374,5 @@ def run(server):
     section('########## 11b. 事务语义（审计与业务同事务） ##########', lambda: _tx_semantics(s_admin))
     section('########## 11c. 软删除与时间口径（下一批次验收） ##########', lambda: _soft_delete_cases(s_admin))
     section('########## 11d. 归档只读（批次 5） ##########', lambda: _archived_readonly_cases(s_admin))
+    section('########## 12. 导出/导入（批次 6a/6b） ##########', lambda: _batch6_export_import(s_admin))
     section('########## 12. 审计补充（批次 3 补测，末项会删临时库 audit_logs） ##########', lambda: _audit_extras(s_admin))
