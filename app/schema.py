@@ -42,6 +42,14 @@ _COLUMN_PATCHES = {
         'confirmed_by': 'INTEGER',
         'confirmed_at': 'DATETIME',
     },
+    # 批次 6b 更新模式新增的计数列（旧库已有 import_batches 表时补列）
+    'import_batches': {
+        'projects_updated': 'INTEGER NOT NULL DEFAULT 0',
+        'items_updated': 'INTEGER NOT NULL DEFAULT 0',
+        'nodes_updated': 'INTEGER NOT NULL DEFAULT 0',
+        'frozen_count': 'INTEGER NOT NULL DEFAULT 0',
+        'skipped_count': 'INTEGER NOT NULL DEFAULT 0',
+    },
 }
 
 #: audit_logs 后续版本补充的列

@@ -292,9 +292,11 @@ class AcceptanceRecord(db.Model):
 class ImportBatch(db.Model):
     """Excel 导入批次记录（批次 6b）
 
-    - 每次成功写库一条；``dry_run=True`` 的试运行也留一条（status='dry-run'）；
+    - 每次写库一条；``dry_run=True`` 的试运行也留一条（status='dry-run'）；
     - ``file_hash`` = 源文件 SHA-256，用于追溯"同一份表是否重复导入"；
-    - 计数为本次实际写入的行数，便于对账。
+    - 计数为本次实际写入的行数，便于对账；
+    - 回滚：当前只做到「按批次查出导入了哪些行」（``ImportBatchRow``），
+      回滚脚本留 TODO（见 docs/roadmap.md 阶段 2）。
     """
     __tablename__ = 'import_batches'
     id = db.Column(db.Integer, primary_key=True)
@@ -309,9 +311,18 @@ class ImportBatch(db.Model):
     applications_created = db.Column(db.Integer, nullable=False, default=0)
     records_created = db.Column(db.Integer, nullable=False, default=0)
     acceptances_created = db.Column(db.Integer, nullable=False, default=0)
+    # 更新模式（--update-existing）计数
+    projects_updated = db.Column(db.Integer, nullable=False, default=0)
+    items_updated = db.Column(db.Integer, nullable=False, default=0)
+    nodes_updated = db.Column(db.Integer, nullable=False, default=0)
+    frozen_count = db.Column(db.Integer, nullable=False, default=0)    # 有业务、禁止改金额的节点
+    skipped_count = db.Column(db.Integer, nullable=False, default=0)   # 已存在项目/记录跳过
     operator = db.Column(db.String(64), nullable=True)     # 命令行导出/系统
     report_path = db.Column(db.String(512), nullable=True)
     error_msg = db.Column(db.Text, nullable=True)
+
+    rows = db.relationship('ImportBatchRow', backref='batch',
+                           cascade='all, delete-orphan', lazy='selectin')
 
     def to_dict(self):
         return {
@@ -325,8 +336,40 @@ class ImportBatch(db.Model):
             'applications_created': self.applications_created,
             'records_created': self.records_created,
             'acceptances_created': self.acceptances_created,
+            'projects_updated': self.projects_updated,
+            'items_updated': self.items_updated,
+            'nodes_updated': self.nodes_updated,
+            'frozen_count': self.frozen_count,
+            'skipped_count': self.skipped_count,
             'operator': self.operator, 'report_path': self.report_path,
             'error_msg': self.error_msg,
+        }
+
+
+class ImportBatchRow(db.Model):
+    """导入批次明细（批次 6b）：记录本次导入涉及的每一行，供按批次追溯。
+
+    ``action``：create / update / skip / frozen。
+    回滚脚本待做（TODO）：按 batch_id 逆序删除 create 行、恢复 update 的 before 值。
+    """
+    __tablename__ = 'import_batch_rows'
+    id = db.Column(db.Integer, primary_key=True)
+    batch_id = db.Column(db.Integer, db.ForeignKey('import_batches.id'),
+                         nullable=False, index=True)
+    action = db.Column(db.String(16), nullable=False, index=True)
+    object_type = db.Column(db.String(16), nullable=False)   # project/item/node/application/record/acceptance
+    object_id = db.Column(db.Integer, nullable=True)
+    project_no = db.Column(db.String(64), nullable=True)
+    item_name = db.Column(db.String(128), nullable=True)
+    node_type = db.Column(db.String(16), nullable=True)
+    detail = db.Column(db.Text, nullable=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'batch_id': self.batch_id, 'action': self.action,
+            'object_type': self.object_type, 'object_id': self.object_id,
+            'project_no': self.project_no, 'item_name': self.item_name,
+            'node_type': self.node_type, 'detail': self.detail,
         }
 
 

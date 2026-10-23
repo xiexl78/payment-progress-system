@@ -26,8 +26,12 @@
 安全约定：
 - 默认只读 dry-run（有错误也正常退出并给出报告，rc=0），必须显式 ``--commit`` 才写库；
 - 写入在**单个事务**内完成，任一条失败全部回滚；
-- 项目编号 / 申请单号与现有库重复 → 阻断（本工具不做覆盖导入）；
-- 批次记录写 ``import_batches``（SHA-256、计数、状态、报告路径），导入失败也尽力留痕；
+- **默认不覆盖**：``project_no`` 已存在 → 跳过，报告「已存在-跳过」；
+  ``--update-existing`` 才更新，且只改口径字段（项目名/备注/科目金额/节点比例与应付），
+  已发生的申请/付款/开票记录一律不动；有业务发生的节点冻结、报告「冻结-需人工处理」；
+- 正式导入前 dry-run 必须给出差异清单（新增/更新/跳过/冻结/错误）；
+- 批次记录写 ``import_batches`` + 明细 ``import_batch_rows``（SHA-256、操作人、计数、状态、
+  报告路径），支持 ``--batch ID`` 按批次查出导入了哪些行；按批次回滚脚本留 TODO；
 - 真实 Excel 列结构未知：列名映射集中在 ``*_ALIASES`` / ``FLAT_ALIASES``，拿到用户真表后
   **只加别名**即可适配，不要改主流程。
 
@@ -50,8 +54,9 @@ from openpyxl.utils import get_column_letter  # noqa: E402
 
 from app import NODE_TEMPLATES, create_app  # noqa: E402
 from app.audit import record as audit_record  # noqa: E402
-from app.models import (AcceptanceRecord, ImportBatch, PaymentApplication,  # noqa: E402
-                        PaymentNode, PaymentRecord, Project, ProjectItem, db)
+from app.models import (AcceptanceRecord, ImportBatch, ImportBatchRow,  # noqa: E402
+                        PaymentApplication, PaymentNode, PaymentRecord,
+                        Project, ProjectItem, db)
 from app.money import CENT, ZERO, mul_ratio, parse_money, sum_money  # noqa: E402
 from app.timeutil import local_datetime_to_utc, utcnow  # noqa: E402
 from app.validation import (PROJECT_STATUSES, TAX_RATES, ValidationError,  # noqa: E402
@@ -825,57 +830,257 @@ def build_plan(parsed, errors, warnings):
         key = (node['project_no'], node['item_name'], node['node_type'])
         record_paid = paid_by_node.get(key, ZERO)
         record_invoice = invoice_by_node.get(key, ZERO)
+        node['_recon'] = (record_paid, record_invoice)
         if node['source'] == 'excel':
-            if record_paid != node['paid_amount']:
-                errors.append('节点对账失败（%s / %s / %s）：节点已付款 %s，付款记录合计 %s'
-                              % (node['project_no'], node['item_name'],
-                                 NODE_TYPE_LABELS[node['node_type']],
-                                 node['paid_amount'], record_paid))
-            if node['invoice_amount'] and record_invoice and record_invoice != node['invoice_amount']:
-                warnings.append('节点对账提示（%s / %s / %s）：节点已开票 %s，申请单发票合计 %s'
-                                % (node['project_no'], node['item_name'],
-                                   NODE_TYPE_LABELS[node['node_type']],
-                                   node['invoice_amount'], record_invoice))
+            # 其余对账留到分类后只对「新增项目」做强校验（更新模式下记录会被跳过）
+            continue
+        if record_paid > node['due_amount']:
+            errors.append('付款记录合计 %s 超过节点应付 %s（%s / %s / %s）'
+                          % (record_paid, node['due_amount'],
+                             node['project_no'], node['item_name'],
+                             NODE_TYPE_LABELS[node['node_type']]))
+        node['paid_amount'] = record_paid
+        node['invoice_amount'] = record_invoice
+        if record_paid > 0:
+            node['status'] = '已付款'
+        elif record_invoice > 0 or app_count_by_node.get(key):
+            node['status'] = '已申请' if record_invoice > 0 else '未开票已申请'
         else:
-            if record_paid > node['due_amount']:
-                errors.append('付款记录合计 %s 超过节点应付 %s（%s / %s / %s）'
-                              % (record_paid, node['due_amount'],
-                                 node['project_no'], node['item_name'],
-                                 NODE_TYPE_LABELS[node['node_type']]))
-            node['paid_amount'] = record_paid
-            node['invoice_amount'] = record_invoice
-            if record_paid > 0:
-                node['status'] = '已付款'
-            elif record_invoice > 0 or app_count_by_node.get(key):
-                node['status'] = '已申请' if record_invoice > 0 else '未开票已申请'
-            else:
-                node['status'] = '未触发'
+            node['status'] = '未触发'
     return plan
 
 
-def check_against_db(plan, errors):
-    """只读检查与现有库的冲突：项目编号/申请单号重复（不支持覆盖导入）。"""
+def verify_new_projects(plan, errors, warnings):
+    """只对「新增项目」做节点与申请/付款记录对账（更新模式记录不动，不校验）。"""
+    for node in plan['nodes']:
+        if node['source'] != 'excel':
+            continue
+        project = next((row for row in plan['projects']
+                        if row['project_no'] == node['project_no']), None)
+        if project is None or project.get('_action') != 'create':
+            continue
+        record_paid, record_invoice = node.get('_recon') or (ZERO, ZERO)
+        if record_paid != node['paid_amount']:
+            errors.append('节点对账失败（%s / %s / %s）：节点已付款 %s，付款记录合计 %s'
+                          % (node['project_no'], node['item_name'],
+                             NODE_TYPE_LABELS[node['node_type']],
+                             node['paid_amount'], record_paid))
+        if (node['invoice_amount'] and record_invoice
+                and record_invoice != node['invoice_amount']):
+            warnings.append('节点对账提示（%s / %s / %s）：节点已开票 %s，申请单发票合计 %s'
+                            % (node['project_no'], node['item_name'],
+                               NODE_TYPE_LABELS[node['node_type']],
+                               node['invoice_amount'], record_invoice))
+
+
+# ---------- 阶段 2：与现有库比对 / 差异分类 ----------
+
+def _project_change_list(dbp, data):
+    changes = []
+    if dbp.name != data['name']:
+        changes.append('项目名称「%s」→「%s」' % (dbp.name, data['name']))
+    if (dbp.remark or '') != (data['remark'] or ''):
+        changes.append('备注「%s」→「%s」' % (dbp.remark or '', data['remark'] or ''))
+    return changes
+
+
+def _item_change_list(dbi, data):
+    changes = []
+    old_original = Decimal(dbi.original_amount or 0)
+    old_additional = Decimal(dbi.additional_amount or 0)
+    if old_original != Decimal(data['original_amount']):
+        changes.append('原金额 %s→%s' % (old_original, data['original_amount']))
+    if old_additional != Decimal(data['additional_amount']):
+        changes.append('增补金额 %s→%s' % (old_additional, data['additional_amount']))
+    if (dbi.tax_rate or '') != (data['tax_rate'] or ''):
+        changes.append('税率 %r→%r' % (dbi.tax_rate or '', data['tax_rate'] or ''))
+    return changes
+
+
+def _node_change_list(dbnode, new_ratio, new_due):
+    changes = []
+    old_ratio = Decimal(dbnode.ratio or 0)
+    old_due = Decimal(dbnode.due_amount or 0)
+    if old_ratio != new_ratio:
+        changes.append('比例 %s→%s' % (_pct_text(old_ratio), _pct_text(new_ratio)))
+    if old_due != new_due:
+        changes.append('应付 %s→%s' % (old_due, new_due))
+    return changes
+
+
+def classify_against_db(plan, update_existing):
+    """把导入计划与现有库比对，产出差异清单（新增/更新/跳过/冻结）。
+
+    规则（Chief 口径）：
+    - 默认不覆盖：``project_no`` 已存在 → 跳过，报告单列「已存在-跳过」；
+    - ``--update-existing`` 才更新，且只改口径字段（项目名/备注/科目金额/节点比例与应付）；
+    - 已发生的申请/付款/开票记录一律不动；有业务发生的节点冻结、只报告不改。
+    """
+    diff = {'create': [], 'update': [], 'skip': [], 'frozen': [],
+            'unchanged': [], 'records_skipped': 0}
+    errors = []
+    plan['diff'] = diff
     project_nos = [project['project_no'] for project in plan['projects']]
+    existing = {}
     if project_nos:
-        existing = {row[0] for row in
-                    db.session.query(Project.project_no)
-                    .filter(Project.project_no.in_(project_nos)).all()}
-        for project_no in sorted(existing):
-            errors.append('项目编号已存在于系统：%s（本工具不支持覆盖导入，请先清理）'
-                          % project_no)
-    apply_nos = [application['apply_no'] for application in plan['applications']]
+        for row in Project.query.filter(Project.project_no.in_(project_nos)).all():
+            existing[row.project_no] = row
+    nodes_by_item = {}
+    for node in plan['nodes']:
+        nodes_by_item.setdefault((node['project_no'], node['item_name']), []).append(node)
+
+    create_project_nos = set()
+    for project in plan['projects']:
+        project_no = project['project_no']
+        dbp = existing.get(project_no)
+        if dbp is None:
+            project['_action'] = 'create'
+            create_project_nos.add(project_no)
+            diff['create'].append('项目 %s（%s）' % (project_no, project['name']))
+            continue
+        if dbp.deleted_at is not None:
+            project['_action'] = 'skip'
+            project['_skip_reason'] = '已删除（回收站），需先恢复后再导入'
+            diff['skip'].append('项目 %s（%s）：%s'
+                                % (project_no, project['name'], project['_skip_reason']))
+            continue
+        if not update_existing:
+            project['_action'] = 'skip'
+            project['_skip_reason'] = '已存在，未加 --update-existing'
+            diff['skip'].append('项目 %s（%s）：%s'
+                                % (project_no, project['name'], project['_skip_reason']))
+            continue
+
+        project['_db_id'] = dbp.id
+        changes = _project_change_list(dbp, project)
+        project['_changes'] = changes
+        touched = bool(changes)
+        if changes:
+            diff['update'].append('项目 %s：%s' % (project_no, '；'.join(changes)))
+        db_items = {item.item_name: item for item in dbp.items}
+        for item in plan['items']:
+            if item['project_no'] != project_no:
+                continue
+            dbi = db_items.get(item['item_name'])
+            if dbi is None:
+                item['_action'] = 'create'
+                touched = True
+                diff['update'].append('项目 %s：新增科目「%s」'
+                                      % (project_no, item['item_name']))
+            else:
+                item['_db_id'] = dbi.id
+                item_changes = _item_change_list(dbi, item)
+                item['_changes'] = item_changes
+                if item_changes:
+                    item['_action'] = 'update'
+                    touched = True
+                    diff['update'].append('项目 %s 科目「%s」：%s'
+                                          % (project_no, item['item_name'],
+                                             '；'.join(item_changes)))
+                else:
+                    item['_action'] = 'unchanged'
+            for node in nodes_by_item.get((project_no, item['item_name']), []):
+                dbnode = None
+                if dbi is not None:
+                    dbnode = next((row for row in dbi.nodes
+                                   if row.node_type == node['node_type']), None)
+                if dbnode is None:
+                    node['_action'] = 'create'
+                    touched = True
+                    continue
+                if dbnode.has_business:
+                    node['_action'] = 'frozen'
+                    node['_db_id'] = dbnode.id
+                    diff['frozen'].append(
+                        '项目 %s 科目「%s」%s：已有申请/开票/付款，金额与比例不改'
+                        '（系统 %s / %s；Excel %s / %s）'
+                        % (project_no, item['item_name'],
+                           NODE_TYPE_LABELS[node['node_type']],
+                           _pct_text(dbnode.ratio), dbnode.due_amount,
+                           _pct_text(node['ratio']), node['due_amount']))
+                    continue
+                node['_db_id'] = dbnode.id
+                if node['source'] == 'excel':
+                    new_ratio = node['ratio']
+                    new_due = node['due_amount']
+                else:
+                    # 自动生成节点：沿用系统现有比例，只按新科目金额重算应付
+                    new_ratio = Decimal(dbnode.ratio or 0)
+                    base = (Decimal(item['original_amount'])
+                            if node['node_type'] == 'first'
+                            else Decimal(item['original_amount'])
+                            + Decimal(item['additional_amount']))
+                    new_due = mul_ratio(base, new_ratio)
+                node['_new_ratio'] = new_ratio
+                node['_new_due'] = new_due
+                node_changes = _node_change_list(dbnode, new_ratio, new_due)
+                node['_changes'] = node_changes
+                if node_changes:
+                    node['_action'] = 'update'
+                    touched = True
+                    diff['update'].append('项目 %s 科目「%s」%s：%s'
+                                          % (project_no, item['item_name'],
+                                             NODE_TYPE_LABELS[node['node_type']],
+                                             '；'.join(node_changes)))
+                else:
+                    node['_action'] = 'unchanged'
+        project['_action'] = 'update' if touched else 'existing'
+        if not touched:
+            diff['unchanged'].append('项目 %s：口径字段无变化' % project_no)
+
+        # 更新模式：已有项目的申请/付款/验收记录一律不动
+        skipped_records = 0
+        for collection in ('applications', 'records', 'acceptances'):
+            for record in plan[collection]:
+                if record['project_no'] == project_no:
+                    record['_action'] = 'skip'
+                    skipped_records += 1
+        diff['records_skipped'] += skipped_records
+
+    for collection in ('applications', 'records', 'acceptances'):
+        for record in plan[collection]:
+            if record.get('_action') is None:
+                record['_action'] = ('create' if record['project_no'] in create_project_nos
+                                     else 'skip')
+
+    apply_nos = [application['apply_no'] for application in plan['applications']
+                 if application.get('_action') == 'create']
     if apply_nos:
-        existing = {row[0] for row in
-                    db.session.query(PaymentApplication.apply_no)
-                    .filter(PaymentApplication.apply_no.in_(apply_nos)).all()}
-        for apply_no in sorted(existing):
+        existing_apply = {row[0] for row in
+                          db.session.query(PaymentApplication.apply_no)
+                          .filter(PaymentApplication.apply_no.in_(apply_nos)).all()}
+        for apply_no in sorted(existing_apply):
             errors.append('申请单号已存在于系统：%s' % apply_no)
+    return errors
 
 
 # ---------- 阶段 2：报告 ----------
 
+def _render_diff(lines, plan):
+    diff = plan.get('diff') or {}
+    lines.append('二、差异清单（新增 / 更新 / 跳过 / 冻结）')
+    lines.append('  新增项目：%d' % len(diff.get('create', [])))
+    for item in diff.get('create', []):
+        lines.append('    [新增] %s' % item)
+    lines.append('  更新项目：%d' % len(diff.get('update', [])))
+    for item in diff.get('update', []):
+        lines.append('    [更新] %s' % item)
+    lines.append('  已存在-跳过：%d' % len(diff.get('skip', [])))
+    for item in diff.get('skip', []):
+        lines.append('    [跳过] %s' % item)
+    lines.append('  冻结-需人工处理：%d' % len(diff.get('frozen', [])))
+    for item in diff.get('frozen', []):
+        lines.append('    [冻结] %s' % item)
+    lines.append('  记录-跳过：%d（更新模式下不改已发生的申请/付款/验收记录）'
+                 % diff.get('records_skipped', 0))
+    if diff.get('unchanged'):
+        lines.append('  更新模式下无变化：%d' % len(diff.get('unchanged', [])))
+        for item in diff.get('unchanged', [])[:20]:
+            lines.append('    [无变化] %s' % item)
+
+
 def render_report(plan, parsed, errors, warnings, file_path, file_hash,
-                  mode='dry-run', report_time=None):
+                  mode='dry-run', report_time=None, update_existing=False):
     moment = report_time or datetime.now()
     lines = []
     lines.append('Excel 导入校验报告')
@@ -883,7 +1088,9 @@ def render_report(plan, parsed, errors, warnings, file_path, file_hash,
     lines.append('生成时间：%s' % moment.strftime('%Y-%m-%d %H:%M:%S'))
     lines.append('源文件：%s' % os.path.abspath(file_path))
     lines.append('文件指纹：sha256:%s' % file_hash)
-    lines.append('模式：%s' % ('正式导入' if mode == 'import' else '试运行（不写库）'))
+    lines.append('模式：%s%s'
+                 % ('正式导入' if mode == 'import' else '试运行（不写库）',
+                    '（--update-existing：更新已有项目）' if update_existing else ''))
     lines.append('')
     lines.append('一、解析结果')
     for name, kind, _aliases, _required, required_sheet, _extra in SHEETS:
@@ -896,27 +1103,34 @@ def render_report(plan, parsed, errors, warnings, file_path, file_hash,
                     len(plan['applications']), len(plan['records']),
                     len(plan['acceptances'])))
     lines.append('')
-    lines.append('二、校验错误（%d）—— 有错误不能导入' % len(errors))
+    _render_diff(lines, plan)
+    lines.append('')
+    lines.append('三、校验错误（%d）—— 有错误不能导入' % len(errors))
     if errors:
         for index, message in enumerate(errors, start=1):
             lines.append('  %d. %s' % (index, message))
     else:
         lines.append('  无')
     lines.append('')
-    lines.append('三、警告（%d）—— 可继续，但建议核对' % len(warnings))
+    lines.append('四、警告（%d）—— 可继续，但建议核对' % len(warnings))
     if warnings:
         for index, message in enumerate(warnings, start=1):
             lines.append('  %d. %s' % (index, message))
     else:
         lines.append('  无')
     lines.append('')
-    lines.append('四、结论')
+    lines.append('五、结论')
     if errors:
         lines.append('  不能导入：请先修正上述 %d 条错误后重新运行。' % len(errors))
     else:
-        lines.append('  校验通过：%s'
+        skipped = len((plan.get('diff') or {}).get('skip', []))
+        frozen = len((plan.get('diff') or {}).get('frozen', []))
+        note = ''
+        if skipped or frozen:
+            note = '（跳过 %d 个项目、冻结 %d 个节点，详见差异清单）' % (skipped, frozen)
+        lines.append('  校验通过：%s%s'
                      % ('开始写入（--commit），失败会整体回滚。' if mode == 'import'
-                        else '未写库；确认无误后加 --commit 正式导入。'))
+                        else '未写库；确认无误后加 --commit 正式导入。', note))
     return '\n'.join(lines)
 
 
@@ -941,11 +1155,7 @@ WARRANTY_DAYS = 365 * 3
 
 
 def _fill_dates(project, nodes):
-    """导入后补齐节点派生日期：只填空值，不覆盖 Excel 里显式给出的日期。
-
-    （不走 ``sync_project_dates``：后者会冻结“有业务”节点，而导入期业务字段
-    稍后才回填，会导致触发日期丢失。）
-    """
+    """导入后补齐节点派生日期：只填空值，不覆盖 Excel 里显式给出的日期。"""
     trial = project.trial_date
     acceptance = project.acceptance_date
     warranty_due = (acceptance + timedelta(days=WARRANTY_DAYS)) if acceptance else None
@@ -960,14 +1170,33 @@ def _fill_dates(project, nodes):
     return nodes
 
 
+def _batch_row(action, object_type, obj=None, project_no=None, item_name=None,
+               node_type=None, detail=None):
+    return {'action': action, 'object_type': object_type,
+            'object_id': getattr(obj, 'id', None) if obj is not None else None,
+            'project_no': project_no, 'item_name': item_name,
+            'node_type': node_type, 'detail': detail}
+
+
 def write_plan(plan, batch_meta):
-    """单事务写入；任一条失败全部回滚，并尽力写一条失败批次记录。"""
-    counters = {'projects_created': 0, 'items_created': 0, 'nodes_created': 0,
-                'applications_created': 0, 'records_created': 0,
-                'acceptances_created': 0}
+    """单事务写入（新增 + 更新），并写批次记录与批次明细；失败整体回滚。"""
+    counters = {key: 0 for key in (
+        'projects_created', 'items_created', 'nodes_created',
+        'applications_created', 'records_created', 'acceptances_created',
+        'projects_updated', 'items_updated', 'nodes_updated',
+        'frozen_count', 'skipped_count')}
+    batch_rows = []
     try:
-        project_objs = {}
+        diff = plan.get('diff') or {}
+        counters['frozen_count'] = len(diff.get('frozen', []))
+        counters['skipped_count'] = (len(diff.get('skip', []))
+                                     + int(diff.get('records_skipped', 0)))
+
+        # ---- 新增项目：项目 + 科目 + 节点 ----
+        created_projects = {}
         for data in plan['projects']:
+            if data.get('_action') != 'create':
+                continue
             project = Project(project_no=data['project_no'], name=data['name'],
                               status=data['status'], trial_date=data['trial_date'],
                               acceptance_date=data['acceptance_date'],
@@ -975,12 +1204,16 @@ def write_plan(plan, batch_meta):
                               updated_by=None)
             db.session.add(project)
             db.session.flush()
-            project_objs[data['project_no']] = project
+            created_projects[data['project_no']] = project
             counters['projects_created'] += 1
+            batch_rows.append(_batch_row('create', 'project', project,
+                                         data['project_no'], detail='新建项目'))
 
         item_objs = {}
         for data in plan['items']:
-            item = ProjectItem(project_id=project_objs[data['project_no']].id,
+            if data['project_no'] not in created_projects:
+                continue
+            item = ProjectItem(project_id=created_projects[data['project_no']].id,
                                item_name=data['item_name'],
                                tax_rate=data['tax_rate'],
                                original_amount=data['original_amount'],
@@ -989,11 +1222,15 @@ def write_plan(plan, batch_meta):
             db.session.flush()
             item_objs[(data['project_no'], data['item_name'])] = item
             counters['items_created'] += 1
+            batch_rows.append(_batch_row('create', 'item', item, data['project_no'],
+                                         data['item_name'], detail='新增科目'))
 
         node_objs = {}
         for data in plan['nodes']:
+            if data['project_no'] not in created_projects:
+                continue
             node = PaymentNode(
-                project_id=project_objs[data['project_no']].id,
+                project_id=created_projects[data['project_no']].id,
                 item_id=item_objs[(data['project_no'], data['item_name'])].id,
                 node_type=data['node_type'],
                 node_name=_node_name(data['node_type'], data['ratio']),
@@ -1001,20 +1238,23 @@ def write_plan(plan, batch_meta):
                 calc_base='original' if data['node_type'] == 'first' else 'total',
                 due_amount=data['due_amount'],
                 due_date=data['due_date'], trigger_date=data['trigger_date'],
-                invoice_amount=ZERO,
-                paid_amount=ZERO, status='未触发')
+                invoice_amount=ZERO, paid_amount=ZERO, status='未触发')
             db.session.add(node)
             db.session.flush()
             node_objs[(data['project_no'], data['item_name'],
                        data['node_type'])] = node
             counters['nodes_created'] += 1
+            batch_rows.append(_batch_row('create', 'node', node, data['project_no'],
+                                         data['item_name'], data['node_type'],
+                                         detail='新增付款节点'))
 
-        # 先补齐派生日期（此时业务字段还是占位），再回填由申请/付款反推的业务数据
+        # 新增项目：先补齐派生日期，再回填由申请/付款反推的业务数据
         business = {(data['project_no'], data['item_name'], data['node_type']):
                     (data['invoice_amount'], data['paid_amount'], data['status'])
-                    for data in plan['nodes']}
+                    for data in plan['nodes']
+                    if data['project_no'] in created_projects}
         db.session.flush()
-        for project_no, project in project_objs.items():
+        for project_no, project in created_projects.items():
             project_nodes = [node for key, node in node_objs.items()
                              if key[0] == project_no]
             _fill_dates(project, project_nodes)
@@ -1024,8 +1264,101 @@ def write_plan(plan, batch_meta):
             node.paid_amount = paid_amount
             node.status = status
 
+        # ---- 更新已有项目：只改口径字段 ----
+        for data in plan['projects']:
+            action = data.get('_action')
+            if action not in ('update', 'existing'):
+                continue
+            project_no = data['project_no']
+            project = db.session.get(Project, data['_db_id'])
+            if action == 'update':
+                project.name = data['name']
+                project.remark = data['remark']
+                project.updated_by = None
+                counters['projects_updated'] += 1
+                batch_rows.append(_batch_row(
+                    'update', 'project', project, project_no,
+                    detail='；'.join(data.get('_changes') or [])))
+            for item_data in plan['items']:
+                if item_data['project_no'] != project_no:
+                    continue
+                key = (project_no, item_data['item_name'])
+                action = item_data.get('_action')
+                if action == 'update':
+                    item = db.session.get(ProjectItem, item_data['_db_id'])
+                    item.original_amount = item_data['original_amount']
+                    item.additional_amount = item_data['additional_amount']
+                    item.tax_rate = item_data['tax_rate']
+                    item.updated_by = None
+                    item_objs[key] = item
+                    counters['items_updated'] += 1
+                    batch_rows.append(_batch_row(
+                        'update', 'item', item, project_no, item_data['item_name'],
+                        detail='；'.join(item_data.get('_changes') or [])))
+                elif action == 'create':
+                    item = ProjectItem(project_id=project.id,
+                                       item_name=item_data['item_name'],
+                                       tax_rate=item_data['tax_rate'],
+                                       original_amount=item_data['original_amount'],
+                                       additional_amount=item_data['additional_amount'])
+                    db.session.add(item)
+                    db.session.flush()
+                    item_objs[key] = item
+                    counters['items_created'] += 1
+                    batch_rows.append(_batch_row('create', 'item', item, project_no,
+                                                 item_data['item_name'],
+                                                 detail='更新模式下新增科目'))
+            for node_data in plan['nodes']:
+                if node_data['project_no'] != project_no:
+                    continue
+                key = (project_no, node_data['item_name'], node_data['node_type'])
+                action = node_data.get('_action')
+                if action == 'update':
+                    node = db.session.get(PaymentNode, node_data['_db_id'])
+                    node.ratio = node_data['_new_ratio']
+                    node.due_amount = node_data['_new_due']
+                    node.updated_by = None
+                    node_objs[key] = node
+                    counters['nodes_updated'] += 1
+                    batch_rows.append(_batch_row(
+                        'update', 'node', node, project_no, node_data['item_name'],
+                        node_data['node_type'],
+                        detail='；'.join(node_data.get('_changes') or [])))
+                elif action == 'frozen':
+                    node = db.session.get(PaymentNode, node_data['_db_id'])
+                    node_objs[key] = node
+                    batch_rows.append(_batch_row(
+                        'frozen', 'node', node, project_no, node_data['item_name'],
+                        node_data['node_type'],
+                        detail='有业务发生，金额/比例未改（需人工处理）'))
+                elif action == 'create':
+                    item = item_objs[(project_no, node_data['item_name'])]
+                    node = PaymentNode(
+                        project_id=project.id, item_id=item.id,
+                        node_type=node_data['node_type'],
+                        node_name=_node_name(node_data['node_type'],
+                                             node_data['ratio']),
+                        ratio=node_data['ratio'],
+                        calc_base=('original' if node_data['node_type'] == 'first'
+                                   else 'total'),
+                        due_amount=node_data['due_amount'],
+                        due_date=node_data['due_date'],
+                        trigger_date=node_data['trigger_date'],
+                        invoice_amount=ZERO, paid_amount=ZERO, status='未触发')
+                    db.session.add(node)
+                    db.session.flush()
+                    node_objs[key] = node
+                    counters['nodes_created'] += 1
+                    batch_rows.append(_batch_row('create', 'node', node, project_no,
+                                                 node_data['item_name'],
+                                                 node_data['node_type'],
+                                                 detail='新增付款节点'))
+
+        # ---- 新增项目的申请 / 付款 / 验收记录 ----
         application_objs = {}
         for data in plan['applications']:
+            if data.get('_action') != 'create':
+                continue
             node = node_objs[(data['project_no'], data['item_name'],
                               data['node_type'])]
             application = PaymentApplication(
@@ -1040,8 +1373,14 @@ def write_plan(plan, batch_meta):
             db.session.flush()
             application_objs[data['apply_no']] = application
             counters['applications_created'] += 1
+            batch_rows.append(_batch_row('create', 'application', application,
+                                         data['project_no'], data['item_name'],
+                                         data['node_type'],
+                                         detail='申请单号 %s' % data['apply_no']))
 
         for data in plan['records']:
+            if data.get('_action') != 'create':
+                continue
             node = node_objs[(data['project_no'], data['item_name'],
                               data['node_type'])]
             application = application_objs.get(data['apply_no'])
@@ -1054,15 +1393,32 @@ def write_plan(plan, batch_meta):
                 created_at=local_datetime_to_utc(data['pay_date']))
             db.session.add(record)
             counters['records_created'] += 1
+            batch_rows.append(_batch_row('create', 'record', record,
+                                         data['project_no'], data['item_name'],
+                                         data['node_type'],
+                                         detail='付款 %s 元' % data['paid_amount']))
 
         for data in plan['acceptances']:
+            if data.get('_action') != 'create':
+                continue
             acceptance = AcceptanceRecord(
-                project_id=project_objs[data['project_no']].id,
+                project_id=created_projects[data['project_no']].id,
                 acceptance_date=data['acceptance_date'],
                 acceptor=data['acceptor'], conclusion=data['conclusion'],
                 remark=data['remark'])
             db.session.add(acceptance)
             counters['acceptances_created'] += 1
+            batch_rows.append(_batch_row('create', 'acceptance', acceptance,
+                                         data['project_no'],
+                                         detail='验收日期 %s'
+                                         % data['acceptance_date']))
+
+        # 跳过的项目也留一行明细（便于按批次追溯“为什么没导入”）
+        for data in plan['projects']:
+            if data.get('_action') == 'skip':
+                batch_rows.append(_batch_row('skip', 'project', None,
+                                             data['project_no'],
+                                             detail=data.get('_skip_reason')))
 
         db.session.flush()
         batch = ImportBatch(
@@ -1072,8 +1428,12 @@ def write_plan(plan, batch_meta):
             **counters)
         db.session.add(batch)
         db.session.flush()
-        audit_record('import.excel', 'import_batch', batch.id, None,
-                     after={'file_name': batch_meta['file_name'],
+        for row in batch_rows:
+            row['batch_id'] = batch.id
+            db.session.add(ImportBatchRow(**row))
+        audit_record('import.commit', 'import_batch', batch.id, None,
+                     after={'batch_id': batch.id,
+                            'file_name': batch_meta['file_name'],
                             'file_hash': batch_meta['file_hash'],
                             'counts': dict(counters),
                             'report_path': batch_meta.get('report_path')},
@@ -1096,11 +1456,45 @@ def write_plan(plan, batch_meta):
         raise
 
 
+def show_batch(batch_id, db_path):
+    """按批次查出导入了哪些行（回滚追溯用；回滚脚本 TODO）。"""
+    app = build_app(db_path, os.path.dirname(db_path) or PROJECT_ROOT,
+                    upgrade_schema=True)
+    with app.app_context():
+        batch = db.session.get(ImportBatch, batch_id)
+        if batch is None:
+            _err('批次不存在：#%s' % batch_id)
+            return 1
+        info = batch.to_dict()
+        _print('批次 #%d · %s · %s' % (info['id'], info['ts'], info['status']))
+        _print('文件：%s（sha256:%s）' % (info['file_name'], info['file_hash']))
+        _print('计数：新增项目 %d / 更新项目 %d / 更新科目 %d / 更新节点 %d / 冻结 %d / 跳过 %d'
+               % (info['projects_created'], info['projects_updated'],
+                  info['items_updated'], info['nodes_updated'],
+                  info['frozen_count'], info['skipped_count']))
+        rows = (ImportBatchRow.query.filter_by(batch_id=batch_id)
+                .order_by(ImportBatchRow.id).all())
+        _print('明细行：%d' % len(rows))
+        for row in rows:
+            target = row.object_type
+            if row.project_no:
+                target += ' %s' % row.project_no
+            if row.item_name:
+                target += ' / %s' % row.item_name
+            if row.node_type:
+                target += ' / %s' % row.node_type
+            _print('  [%s] %s%s%s'
+                   % (row.action, target,
+                      ' #%d' % row.object_id if row.object_id else '',
+                      '（%s）' % row.detail if row.detail else ''))
+        return 0
+
+
 # ---------- CLI ----------
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description='Excel 导入：解析 → 校验报告（dry-run） → 单事务写入 + 批次记录')
+        description='Excel 导入：解析 → 差异/校验报告（dry-run） → 单事务写入 + 批次记录')
     parser.add_argument('--file', '--input', dest='file',
                         help='待导入的 .xlsx 文件')
     parser.add_argument('--db', default=DEFAULT_DB, help='SQLite 数据库路径')
@@ -1108,9 +1502,13 @@ def parse_args(argv=None):
                         help='正式写库（默认只做 dry-run 校验）')
     parser.add_argument('--dry-run', action='store_true',
                         help='只校验不写库（默认行为，保留兼容写法）')
+    parser.add_argument('--update-existing', action='store_true',
+                        help='显式开启更新已有项目（默认已存在则跳过）')
     parser.add_argument('--report', help='校验报告输出路径（默认与源文件同目录）')
     parser.add_argument('--write-template', metavar='PATH',
                         help='生成空白导入模板后退出')
+    parser.add_argument('--batch', type=int, metavar='ID',
+                        help='列出某导入批次写入/更新的行（回滚追溯）')
     return parser.parse_args(argv)
 
 
@@ -1122,6 +1520,12 @@ def main(argv=None):
         path = write_template(args.write_template)
         _print('[OK] 模板已生成：%s' % os.path.abspath(path))
         return 0
+    db_path = os.path.abspath(args.db)
+    if not os.path.isfile(db_path):
+        _err('数据库不存在：%s（请先 python scripts/init_db.py）' % db_path)
+        return 1
+    if args.batch:
+        return show_batch(args.batch, db_path)
     if not args.file:
         _err('缺少 --file（或使用 --write-template 生成模板）')
         return 2
@@ -1131,10 +1535,6 @@ def main(argv=None):
         return 1
     if not file_path.lower().endswith(('.xlsx', '.xlsm')):
         _err('只支持 .xlsx / .xlsm 文件（旧 .xls 请先另存为 .xlsx）')
-        return 1
-    db_path = os.path.abspath(args.db)
-    if not os.path.isfile(db_path):
-        _err('数据库不存在：%s（请先 python scripts/init_db.py）' % db_path)
         return 1
 
     with open(file_path, 'rb') as handle:
@@ -1152,10 +1552,11 @@ def main(argv=None):
     with app.app_context():
         parsed, errors, warnings = read_workbook(file_path)
         plan = build_plan(parsed, errors, warnings)
-        if not errors:
-            check_against_db(plan, errors)
+        errors.extend(classify_against_db(plan, args.update_existing))
+        verify_new_projects(plan, errors, warnings)
         report = render_report(plan, parsed, errors, warnings, file_path,
-                               file_hash, mode='import' if commit else 'dry-run')
+                               file_hash, mode='import' if commit else 'dry-run',
+                               update_existing=args.update_existing)
         try:
             os.makedirs(os.path.dirname(report_path) or '.', exist_ok=True)
             with open(report_path, 'w', encoding='utf-8') as handle:
@@ -1182,10 +1583,16 @@ def main(argv=None):
         except Exception as exc:
             _err('导入失败，已整体回滚：%s' % exc)
             return 1
-        _print('\n[OK] 导入成功（批次 #%d）：项目 %d / 科目 %d / 节点 %d / 申请 %d / 付款 %d / 验收 %d'
-               % (batch_id, counters['projects_created'], counters['items_created'],
-                  counters['nodes_created'], counters['applications_created'],
-                  counters['records_created'], counters['acceptances_created']))
+        _print('\n[OK] 导入成功（批次 #%d）：新增项目 %d / 更新项目 %d / 新增科目 %d / 更新科目 %d /'
+               ' 新增节点 %d / 更新节点 %d / 冻结 %d / 跳过 %d'
+               % (batch_id, counters['projects_created'], counters['projects_updated'],
+                  counters['items_created'], counters['items_updated'],
+                  counters['nodes_created'], counters['nodes_updated'],
+                  counters['frozen_count'], counters['skipped_count']))
+        _print('    申请 %d / 付款 %d / 验收 %d；按批次查明细：'
+               'python scripts/import_excel.py --batch %d'
+               % (counters['applications_created'], counters['records_created'],
+                  counters['acceptances_created'], batch_id))
         return 0
 
 
