@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}报表与提醒 - 付款进度管理系统{% endblock %}
+{% block page_title %}报表与提醒{% endblock %}
+{% block content %}
+
+{# ---------- 待办提醒 ---------- #}
+{% if reminders %}
+<div class="card">
+  <div class="card-title">待办提醒 <span class="sub">质保到期 60 天内、待付款申请</span></div>
+  {% for kind, obj, days in reminders %}
+    {% if kind == 'warranty' %}
+    <div class="flash {{ 'danger' if days is not none and days <= 0 else 'warning' }}" style="background:var(--warning-bg);color:var(--warning);border-color:#fde68a;margin-bottom:8px;">
+      项目「{{ obj.name }}」质保将于 {{ obj.warranty_due_date.strftime('%Y-%m-%d') }} 到期
+      {% if days is not none and days <= 0 %}（已到期 {{ -days }} 天）{% else %}（剩余 {{ days }} 天）{% endif %}
+      <a href="{{ url_for('main.project_detail', project_id=obj.id) }}" class="btn btn-ghost btn-sm" style="margin-left:8px;">查看</a>
+    </div>
+    {% else %}
+    <div class="flash info">
+      节点「{{ obj.node_name }}」（{{ obj.item_name }}）处于{{ obj.status }}状态，应付 ￥{{ '{:,.2f}'.format(obj.due_amount) }}，待跟进付款。
+      <a href="{{ url_for('main.project_detail', project_id=obj.project_id) }}" class="btn btn-ghost btn-sm" style="margin-left:8px;">去处理</a>
+    </div>
+    {% endif %}
+  {% endfor %}
+</div>
+{% endif %}
+
+{# ---------- 台账汇总 ---------- #}
+<div class="card">
+  <div class="card-title">付款台账总览
+    <span class="sub">合计：应付 ￥{{ '{:,.2f}'.format(total_due) }} · 已付 ￥{{ '{:,.2f}'.format(total_paid) }} · 未付 ￥{{ '{:,.2f}'.format(total_unpaid) }}</span>
+  </div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>项目</th><th>编号</th><th>状态</th>
+          <th class="num">应付金额</th><th class="num">已开票</th><th class="num">已付金额</th><th class="num">未付金额</th>
+          <th>付款进度</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+        <tr>
+          <td><a href="{{ url_for('main.project_detail', project_id=r.project.id) }}">{{ r.project.name }}</a></td>
+          <td>{{ r.project.project_no }}</td>
+          <td><span class="badge {{ 'badge-green' if r.project.status == '已完成' else 'badge-blue' if r.project.status == '进行中' else 'badge-gray' }}">{{ r.project.status }}</span></td>
+          <td class="num">￥{{ '{:,.2f}'.format(r.due) }}</td>
+          <td class="num">￥{{ '{:,.2f}'.format(r.invoice) }}</td>
+          <td class="num text-success">￥{{ '{:,.2f}'.format(r.paid) }}</td>
+          <td class="num {{ 'text-danger' if r.unpaid > 0 else 'text-success' }}">￥{{ '{:,.2f}'.format(r.unpaid) }}</td>
+          <td>
+            <div class="flex" style="gap:6px;">
+              <div class="progress-bar" style="width:90px;"><div class="fill" style="width:{{ r.progress }}%;"></div></div>
+              <span style="font-size:12px;">{{ '%.1f'|format(r.progress) }}%</span>
+            </div>
+          </td>
+          <td><a href="{{ url_for('main.project_detail', project_id=r.project.id) }}" class="btn btn-ghost btn-sm">详情</a></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="9" class="empty">暂无数据</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}

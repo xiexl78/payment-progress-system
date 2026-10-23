@@ -1,0 +1,19 @@
+# 运行期数据与生成物（不入库）
+instance/
+*.db
+*.db-shm
+*.db-wal
+
+# Python 缓存
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 备份与快照
+backups/
+*.log
+
+# 测试临时产物
+qa_*.json
+qa_cookie.txt
+scripts/samples/scan_e2e.*

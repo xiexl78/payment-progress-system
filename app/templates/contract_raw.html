@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}合同原文 - 付款进度管理系统{% endblock %}
+{% block page_title %}合同原文{% endblock %}
+{% block content %}
+
+<div class="card" style="max-width:1100px;">
+  <div class="card-title">{{ contract.file_name }}
+    <div class="flex" style="gap:8px;">
+      <a href="{{ url_for('main.contracts') }}" class="btn btn-ghost btn-sm">返回列表</a>
+      {% if contract.status == 'recognized' %}
+      <a href="{{ url_for('main.contract_confirm', contract_id=contract.id) }}" class="btn btn-primary btn-sm">去确认</a>
+      {% endif %}
+    </div>
+  </div>
+  <div class="src-text mb-8">
+    识别引擎：{{ '大模型' if contract.engine == 'llm' else '本地规则' }} · 上传时间：{{ contract.created_at.strftime('%Y-%m-%d %H:%M') if contract.created_at else '—' }} ·
+    状态：
+    {% if contract.status == 'recognized' %}<span class="badge badge-orange">待确认</span>
+    {% elif contract.status == 'confirmed' %}<span class="badge badge-green">已生成项目</span>
+    {% elif contract.status == 'failed' %}<span class="badge badge-red">识别失败</span>
+    {% else %}<span class="badge badge-gray">待处理</span>{% endif %}
+  </div>
+  {% if contract.raw_text %}
+  <pre style="background:#f8fafc;border:1px solid var(--border);border-radius:8px;padding:14px 16px;font-size:13px;line-height:1.7;white-space:pre-wrap;word-break:break-word;max-height:70vh;overflow:auto;">{{ contract.raw_text }}</pre>
+  {% else %}
+  <div class="empty">该合同未提取到文本</div>
+  {% endif %}
+</div>
+
+{% endblock %}

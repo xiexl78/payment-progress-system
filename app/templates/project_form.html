@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}{{ '编辑项目' if project else '新建项目' }} - 付款进度管理系统{% endblock %}
+{% block page_title %}{{ '编辑项目' if project else '新建项目' }}{% endblock %}
+{% block content %}
+
+<div class="card" style="max-width:1100px;">
+  <div class="card-title">{{ '编辑项目信息' if project else '新建项目' }}
+    <a href="{{ url_for('main.project_detail', project_id=project.id) if project else url_for('main.projects') }}" class="btn btn-ghost btn-sm">返回</a>
+  </div>
+
+  <form method="post" action="{{ url_for('main.project_edit', project_id=project.id) if project else url_for('main.project_new') }}">
+    <div class="form-grid">
+      <div class="form-row">
+        <label class="field-label">项目编号 *</label>
+        <input type="text" name="project_no" value="{{ project.project_no if project else '' }}" style="width:100%;" {{ 'readonly' if project }} required
+               placeholder="如：PJ-2026-001">
+      </div>
+      <div class="form-row">
+        <label class="field-label">项目名称 *</label>
+        <input type="text" name="name" value="{{ project.name if project else '' }}" style="width:100%;" required
+               placeholder="如：新增动设备监测项目">
+      </div>
+    </div>
+
+    {% if project %}
+    <div class="form-grid">
+      <div class="form-row">
+        <label class="field-label">项目状态</label>
+        <select name="status" style="width:100%;">
+          <option value="进行中" {{ 'selected' if project.status == '进行中' else '' }}>进行中</option>
+          <option value="已完成" {{ 'selected' if project.status == '已完成' else '' }}>已完成</option>
+          <option value="已归档" {{ 'selected' if project.status == '已归档' else '' }}>已归档</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label class="field-label">试运行日期</label>
+        <input type="date" name="trial_date" value="{{ project.trial_date.strftime('%Y-%m-%d') if project.trial_date else '' }}" style="width:100%;">
+      </div>
+      <div class="form-row">
+        <label class="field-label">验收日期</label>
+        <input type="date" name="acceptance_date" value="{{ project.acceptance_date.strftime('%Y-%m-%d') if project.acceptance_date else '' }}" style="width:100%;">
+      </div>
+    </div>
+    {% endif %}
+
+    <div class="form-row">
+      <label class="field-label">备注</label>
+      <textarea name="remark" placeholder="项目说明、合同信息等">{{ project.remark if project else '' }}</textarea>
+    </div>
+
+    {% if not project %}
+    <div class="form-row">
+      <label class="field-label mt-8">费用科目（每个科目将自动生成 首付款30% / 进度款52% / 验收款15% / 质保金3% 四个付款节点）</label>
+      <div id="items-container">
+        <div class="item-row form-panel">
+          <div class="row">
+            <div><label class="field-label">科目名称 *</label><input type="text" name="item_name" class="mid" placeholder="如：设备费"></div>
+            <div><label class="field-label">税率</label><select name="tax_rate"><option value="">—</option><option>13%</option><option>9%</option><option>6%</option><option>3%</option><option>0%</option></select></div>
+            <div><label class="field-label">原金额（元）</label><input type="number" name="original_amount" class="mid" step="0.01" min="0" value="0"></div>
+            <div><label class="field-label">增补金额（元）</label><input type="number" name="additional_amount" class="mid" step="0.01" min="0" value="0"></div>
+            <button type="button" class="btn btn-danger btn-sm remove-item">删除</button>
+          </div>
+        </div>
+      </div>
+      <button type="button" class="btn btn-ghost btn-sm mt-8" id="add-item">+ 添加科目</button>
+    </div>
+    {% else %}
+    <div class="info-item mt-8"><span class="l">科目与付款节点请在项目详情页中维护（新增科目将自动生成节点）</span></div>
+    {% endif %}
+
+    <div class="flex mt-16" style="gap:12px;">
+      <button type="submit" class="btn btn-primary btn-lg">保存</button>
+      <a href="{{ url_for('main.project_detail', project_id=project.id) if project else url_for('main.projects') }}" class="btn btn-ghost">取消</a>
+    </div>
+  </form>
+</div>
+
+<script>
+  document.getElementById('add-item').addEventListener('click', function () {
+    var container = document.getElementById('items-container');
+    var first = container.querySelector('.item-row');
+    var clone = first.cloneNode(true);
+    clone.querySelectorAll('input').forEach(function (i) { i.value = ''; });
+    clone.querySelectorAll('select').forEach(function (s) { s.value = s.querySelector('option') ? s.querySelector('option').value : ''; });
+    container.appendChild(clone);
+  });
+  document.getElementById('items-container').addEventListener('click', function (e) {
+    if (e.target.classList.contains('remove-item')) {
+      var rows = document.querySelectorAll('#items-container .item-row');
+      if (rows.length > 1) { e.target.closest('.item-row').remove(); }
+      else { alert('至少保留一个科目'); }
+    }
+  });
+</script>
+
+{% endblock %}

@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}合同识别 - 付款进度管理系统{% endblock %}
+{% block page_title %}合同识别{% endblock %}
+{% block content %}
+
+{% if current_user.role in ('admin', 'operator') %}
+<div class="card">
+  <div class="card-title">上传合同<span class="sub">系统自动提取合同金额、税率、付款条件与节点比例，识别结果需人工确认后生成付款节点</span></div>
+  <form method="post" action="{{ url_for('main.contract_upload') }}" enctype="multipart/form-data" class="flex" style="gap:12px;">
+    <input type="file" name="file" accept=".pdf,.docx,.txt,.md,.jpg,.jpeg,.png,.bmp,.webp" style="flex:1;" required>
+    <button type="submit" class="btn btn-primary">上传并识别</button>
+  </form>
+  <div class="src-text" style="margin-top:8px;">支持格式：PDF（文字版）、Word（.docx）、TXT / Markdown、图片（JPG/PNG/BMP/WEBP，使用本机 OCR）。文本提取与规则识别全程在本机完成；如需大模型识别，可配置环境变量后自动启用（见 README）。</div>
+</div>
+{% endif %}
+
+<div class="card">
+  <div class="card-title">识别记录</div>
+  {% if rows %}
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>文件名</th>
+          <th>类型</th>
+          <th>状态</th>
+          <th>识别引擎</th>
+          <th class="num">合同金额</th>
+          <th>创建时间</th>
+          <th>创建人</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        {% set c = row.contract %}
+        <tr>
+          <td>
+            {{ c.file_name }}
+            {% if c.error_msg %}<div class="src-text text-danger">{{ c.error_msg }}</div>{% endif %}
+          </td>
+          <td>
+            {% if c.file_type == 'pdf' %}PDF
+            {% elif c.file_type == 'docx' %}Word
+            {% elif c.file_type == 'img' %}图片
+            {% elif c.file_type == 'md' %}Markdown
+            {% else %}TXT{% endif %}
+          </td>
+          <td>
+            {% if c.status == 'recognized' %}<span class="badge badge-orange">待确认</span>
+            {% elif c.status == 'confirmed' %}<span class="badge badge-green">已生成项目</span>
+            {% elif c.status == 'failed' %}<span class="badge badge-red">识别失败</span>
+            {% else %}<span class="badge badge-gray">待处理</span>{% endif %}
+          </td>
+          <td>{% if c.engine == 'llm' %}大模型{% else %}本地规则{% endif %}</td>
+          <td class="num">{% if row.amount %}￥{{ '{:,.2f}'.format(row.amount) }}{% else %}—{% endif %}</td>
+          <td>{{ c.created_at.strftime('%Y-%m-%d %H:%M') if c.created_at else '—' }}</td>
+          <td>{{ row.creator_name or '—' }}</td>
+          <td>
+            <div class="flex" style="gap:6px;">
+              {% if c.status == 'recognized' %}
+              <a href="{{ url_for('main.contract_confirm', contract_id=c.id) }}" class="btn btn-primary btn-sm">确认生成</a>
+              {% elif c.status == 'confirmed' and c.project_id %}
+              <a href="{{ url_for('main.project_detail', project_id=c.project_id) }}" class="btn btn-outline btn-sm">查看项目</a>
+              <a href="{{ url_for('main.contract_confirm', contract_id=c.id) }}" class="btn btn-primary btn-sm">修改</a>
+              {% endif %}
+              {% if current_user.role in ('admin', 'operator') and c.status in ('recognized', 'confirmed') %}
+              <form method="post" action="{{ url_for('main.contract_rerun', contract_id=c.id) }}" style="display:inline;">
+                <button type="submit" class="btn btn-ghost btn-sm">重新识别</button>
+              </form>
+              {% endif %}
+              <a href="{{ url_for('main.contract_raw', contract_id=c.id) }}" class="btn btn-ghost btn-sm">原文</a>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty">暂无合同识别记录，请先上传合同文件</div>
+  {% endif %}
+</div>
+
+{% endblock %}

@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>登录 - 付款进度管理系统</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="login-body">
+  <div class="login-card">
+    <div class="login-logo">付</div>
+    <h1>付款进度管理系统</h1>
+    <div class="subtitle">按项目 · 按节点 · 全流程管理</div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+      <div class="flashes">
+        {% for category, message in messages %}
+        <div class="flash {{ category }}">{{ message }}</div>
+        {% endfor %}
+      </div>
+      {% endif %}
+    {% endwith %}
+
+    <form method="post" action="{{ url_for('main.login') }}">
+      <div class="form-row">
+        <label class="field-label">用户名</label>
+        <input type="text" name="username" placeholder="请输入用户名" style="width:100%;" autofocus required>
+      </div>
+      <div class="form-row">
+        <label class="field-label">密码</label>
+        <input type="password" name="password" placeholder="请输入密码" style="width:100%;" required>
+      </div>
+      <button type="submit" class="btn btn-primary btn-lg">登 录</button>
+      <div class="tip">默认账号：admin / admin123（管理员）</div>
+    </form>
+  </div>
+</body>
+</html>

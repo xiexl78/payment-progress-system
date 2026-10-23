@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}系统管理 - 付款进度管理系统{% endblock %}
+{% block page_title %}系统管理 · 用户{% endblock %}
+{% block content %}
+
+<div class="card">
+  <div class="card-title">
+    用户列表
+    <div class="flex">
+      <button type="button" class="btn btn-outline btn-sm" onclick="document.getElementById('user-add-panel').style.display = document.getElementById('user-add-panel').style.display === 'none' ? 'block' : 'none';">+ 新建用户</button>
+    </div>
+  </div>
+
+  <div id="user-add-panel" class="form-panel" style="display:none;">
+    <form method="post" action="{{ url_for('main.user_new') }}" class="row">
+      <div><label class="field-label">用户名 *</label><input type="text" name="username" class="mid" required></div>
+      <div><label class="field-label">姓名 *</label><input type="text" name="display_name" class="mid" required></div>
+      <div><label class="field-label">初始密码 *</label><input type="password" name="password" class="mid" required></div>
+      <div><label class="field-label">角色</label>
+        <select name="role">
+          <option value="viewer">查看人员</option>
+          <option value="operator">经办人</option>
+          <option value="admin">管理员</option>
+        </select>
+      </div>
+      <button type="submit" class="btn btn-primary btn-sm">创建</button>
+    </form>
+  </div>
+
+  <div class="table-wrap mt-8">
+    <table class="table">
+      <thead><tr><th>ID</th><th>用户名</th><th>姓名</th><th>角色</th><th>创建时间</th><th>操作</th></tr></thead>
+      <tbody>
+        {% for u in users %}
+        <tr>
+          <td>{{ u.id }}</td>
+          <td>{{ u.username }}</td>
+          <td>{{ u.display_name }}</td>
+          <td>
+            {% if u.role == 'admin' %}<span class="badge badge-purple">管理员</span>
+            {% elif u.role == 'operator' %}<span class="badge badge-blue">经办人</span>
+            {% else %}<span class="badge badge-gray">查看人员</span>{% endif %}
+          </td>
+          <td>{{ u.created_at.strftime('%Y-%m-%d %H:%M') if u.created_at else '—' }}</td>
+          <td>
+            {% if u.id != current_user.id %}
+            <form method="post" action="{{ url_for('main.user_delete', user_id=u.id) }}" class="op-form" onsubmit="return confirm('确定删除用户「{{ u.display_name }}」？');">
+              <button type="submit" class="btn btn-danger btn-sm">删除</button>
+            </form>
+            {% else %}
+            <span class="text-muted" style="font-size:12px;">当前账号</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">角色权限说明</div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>角色</th><th>权限</th></tr></thead>
+      <tbody>
+        <tr><td><span class="badge badge-purple">管理员</span></td><td>全部功能：项目维护、节点操作、验收登记、用户管理、报表查看</td></tr>
+        <tr><td><span class="badge badge-blue">经办人</span></td><td>项目管理、节点申请 / 登记发票 / 登记付款、验收登记</td></tr>
+        <tr><td><span class="badge badge-gray">查看人员</span></td><td>只读：项目列表、详情、报表</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}

@@ -1,0 +1,207 @@
+{% extends "base.html" %}
+{% block title %}{{ project.name }} - 付款进度管理系统{% endblock %}
+{% block page_title %}{{ project.name }}{% endblock %}
+{% block content %}
+
+<div class="card">
+  <div class="card-title">
+    项目信息
+    <div class="flex">
+      <span class="badge {{ 'badge-green' if project.status == '已完成' else 'badge-blue' if project.status == '进行中' else 'badge-gray' }}">{{ project.status }}</span>
+      {% if current_user.role in ('admin', 'operator') %}
+      <a href="{{ url_for('main.project_edit', project_id=project.id) }}" class="btn btn-outline btn-sm">编辑项目</a>
+      {% endif %}
+      {% if current_user.role == 'admin' and project.status != '已归档' %}
+      <form method="post" action="{{ url_for('main.project_status', project_id=project.id) }}" class="op-form">
+        <select name="status">
+          <option value="进行中" {{ 'selected' if project.status == '进行中' else '' }}>进行中</option>
+          <option value="已完成" {{ 'selected' if project.status == '已完成' else '' }}>已完成</option>
+          <option value="已归档" {{ 'selected' if project.status == '已归档' else '' }}>已归档</option>
+        </select>
+        <button type="submit" class="btn btn-ghost btn-sm">更新状态</button>
+      </form>
+      {% endif %}
+      {% if current_user.role in ('admin', 'operator') %}
+      <form method="post" action="{{ url_for('main.project_delete', project_id=project.id) }}" class="op-form" onsubmit="return confirm('确定删除该项目？关联的付款节点、申请、发票、付款记录将全部清除，不可恢复。');">
+        <button type="submit" class="btn btn-ghost btn-sm text-danger">删除项目</button>
+      </form>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="info-grid">
+    <div class="info-item"><div class="l">项目编号</div><div class="v">{{ project.project_no }}</div></div>
+    <div class="info-item"><div class="l">合同总额</div><div class="v">￥{{ '{:,.2f}'.format(project.total_amount()) }}</div></div>
+    <div class="info-item"><div class="l">原金额</div><div class="v">￥{{ '{:,.2f}'.format(project.total_original()) }}</div></div>
+    <div class="info-item"><div class="l">增补金额</div><div class="v">￥{{ '{:,.2f}'.format(project.total_additional()) }}</div></div>
+    <div class="info-item"><div class="l">试运行日期</div><div class="v">{{ project.trial_date.strftime('%Y-%m-%d') if project.trial_date else '—' }}</div></div>
+    <div class="info-item"><div class="l">验收日期</div><div class="v">{{ project.acceptance_date.strftime('%Y-%m-%d') if project.acceptance_date else '—' }}</div></div>
+    <div class="info-item"><div class="l">质保到期</div><div class="v text-warning">{{ project.warranty_due_date.strftime('%Y-%m-%d') if project.warranty_due_date else '—' }}</div></div>
+  </div>
+  {% if project.remark %}<div class="mt-16 text-muted" style="font-size:13px;">备注：{{ project.remark }}</div>{% endif %}
+</div>
+
+{# ---------- 试运行 / 验收登记 ---------- #}
+{% if current_user.role in ('admin', 'operator') %}
+<div class="card">
+  <div class="card-title">工程节点登记</div>
+  <div class="form-panel">
+    <div class="row">
+      <form method="post" action="{{ url_for('main.trial_set', project_id=project.id) }}" class="op-form">
+        <label class="field-label mb-8" style="margin:0;">进度款触发（试运行日期）</label>
+        <input type="date" name="trial_date" value="{{ project.trial_date.strftime('%Y-%m-%d') if project.trial_date else '' }}">
+        <button type="submit" class="btn btn-outline btn-sm">保存试运行日期</button>
+      </form>
+    </div>
+    <div class="row">
+      <form method="post" action="{{ url_for('main.acceptance_add', project_id=project.id) }}" class="op-form">
+        <label class="field-label mb-8" style="margin:0;">验收登记（自动推算质保到期）</label>
+        <input type="date" name="acceptance_date" value="{{ project.acceptance_date.strftime('%Y-%m-%d') if project.acceptance_date else '' }}">
+        <input type="text" name="acceptor" placeholder="验收人" class="small">
+        <input type="text" name="conclusion" placeholder="验收结论（如：验收合格）" class="mid">
+        <button type="submit" class="btn btn-primary btn-sm">登记验收</button>
+      </form>
+    </div>
+  </div>
+  {% if acceptances %}
+  <div class="mt-16">
+    <table class="table">
+      <thead><tr><th>验收日期</th><th>验收人</th><th>结论</th><th>备注</th></tr></thead>
+      <tbody>
+        {% for a in acceptances %}
+        <tr><td>{{ a.acceptance_date.strftime('%Y-%m-%d') }}</td><td>{{ a.acceptor or '—' }}</td><td>{{ a.conclusion or '—' }}</td><td>{{ a.remark or '—' }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+
+{# ---------- 科目明细 ---------- #}
+<div class="card">
+  <div class="card-title">
+    费用科目
+    <div class="flex">
+      {% if current_user.role in ('admin', 'operator') %}
+      <button type="button" class="btn btn-outline btn-sm" onclick="document.getElementById('item-add-panel').style.display = document.getElementById('item-add-panel').style.display === 'none' ? 'block' : 'none';">+ 添加科目</button>
+      {% endif %}
+    </div>
+  </div>
+  <div id="item-add-panel" class="form-panel" style="display:none;">
+    <form method="post" action="{{ url_for('main.item_add', project_id=project.id) }}" class="row">
+      <div><label class="field-label">科目名称 *</label><input type="text" name="item_name" class="mid" required></div>
+      <div><label class="field-label">税率</label><select name="tax_rate"><option value="">—</option><option>13%</option><option>9%</option><option>6%</option><option>3%</option></select></div>
+      <div><label class="field-label">原金额</label><input type="number" name="original_amount" class="mid" step="0.01" min="0" value="0"></div>
+      <div><label class="field-label">增补金额</label><input type="number" name="additional_amount" class="mid" step="0.01" min="0" value="0"></div>
+      <button type="submit" class="btn btn-primary btn-sm">添加并生成节点</button>
+    </form>
+  </div>
+  <div class="table-wrap mt-8">
+    <table class="table">
+      <thead><tr><th>科目名称</th><th>税率</th><th class="num">原金额</th><th class="num">增补金额</th><th class="num">科目总额</th></tr></thead>
+      <tbody>
+        {% for it in project.items %}
+        <tr>
+          <td>{{ it.item_name }}</td>
+          <td>{{ it.tax_rate or '—' }}</td>
+          <td class="num">￥{{ '{:,.2f}'.format(it.original_amount) }}</td>
+          <td class="num">￥{{ '{:,.2f}'.format(it.additional_amount) }}</td>
+          <td class="num text-primary">￥{{ '{:,.2f}'.format(it.total_amount) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{# ---------- 付款节点分组 ---------- #}
+<div class="card">
+  <div class="card-title">付款节点管理 <span class="sub">每个科目自动生成 4 个节点：首付款30%（按原金额）、进度款52% / 验收款15% / 质保金3%（按科目总额）</span></div>
+
+  {% for node_type, g in node_groups.items() %}
+  <div class="node-section">
+    <div class="node-block">
+      <div class="node-head">
+        <div class="flex">
+          <span class="t">{{ g.meta.node_name }}</span>
+          <span class="badge {{ 'badge-green' if g.sum_paid >= g.sum_due and g.sum_due > 0 else 'badge-orange' if g.sum_invoice > 0 else 'badge-gray' }}">
+            {{ '已全部支付' if g.sum_paid >= g.sum_due and g.sum_due > 0 else '部分/待支付' if g.sum_paid > 0 or g.sum_invoice > 0 else '未发生' }}
+          </span>
+        </div>
+        <span class="hint">{{ g.meta.trigger }}</span>
+        <span class="sum">合计应付 <b>￥{{ '{:,.2f}'.format(g.sum_due) }}</b> · 已开票 <b>￥{{ '{:,.2f}'.format(g.sum_invoice) }}</b> · 已支付 <b>￥{{ '{:,.2f}'.format(g.sum_paid) }}</b></span>
+      </div>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>科目</th>
+              {% if node_type == 'first' %}<th class="num">应付（原金额×{{ (g.meta.ratio * 100)|int }}%）</th>{% else %}<th class="num">应付（科目总额×{{ (g.meta.ratio * 100)|int }}%）</th>{% endif %}
+              <th class="num">已开票金额</th>
+              <th class="num">已支付金额</th>
+              <th>状态</th>
+              <th style="min-width:280px;">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for n in g.nodes %}
+            <tr>
+              <td>{{ n.item_name }}</td>
+              <td class="num">￥{{ '{:,.2f}'.format(n.due_amount) }}</td>
+              <td class="num">{% if n.invoice_amount > 0 %}￥{{ '{:,.2f}'.format(n.invoice_amount) }}{% else %}—{% endif %}</td>
+              <td class="num">{% if n.paid_amount > 0 %}￥{{ '{:,.2f}'.format(n.paid_amount) }}{% else %}—{% endif %}</td>
+              <td>
+                {% if n.status == '已付款' %}<span class="badge badge-green">已付款</span>
+                {% elif n.status == '已申请' %}<span class="badge badge-blue">已申请</span>
+                {% elif n.status == '未开票已申请' %}<span class="badge badge-orange">未开票已申请</span>
+                {% else %}<span class="badge badge-gray">未触发</span>{% endif %}
+              </td>
+              <td>
+                {% if current_user.role in ('admin', 'operator') %}
+                  {% if n.status == '未触发' %}
+                    <form method="post" action="{{ url_for('main.node_update', node_id=n.id) }}" class="op-form">
+                      <input type="hidden" name="action" value="apply">
+                      <input type="number" name="apply_amount" class="small" step="0.01" min="0.01" value="{{ '%.2f'|format(n.due_amount) if n.due_amount else '' }}" placeholder="申请额">
+                      <input type="text" name="invoice_no" class="small" placeholder="发票号（可选）">
+                      <button type="submit" class="btn btn-outline btn-sm">发起申请</button>
+                    </form>
+                  {% elif n.status == '未开票已申请' %}
+                    <span class="text-muted" style="font-size:12px;margin-right:6px;">已申请，待补发票</span>
+                    <form method="post" action="{{ url_for('main.node_update', node_id=n.id) }}" class="op-form">
+                      <input type="hidden" name="action" value="invoice">
+                      <input type="number" name="invoice_amount" class="small" step="0.01" min="0.01" value="{{ '%.2f'|format(n.due_amount) if n.due_amount else '' }}">
+                      <input type="text" name="invoice_no" class="small" placeholder="发票号">
+                      <button type="submit" class="btn btn-outline btn-sm">登记发票</button>
+                    </form>
+                  {% elif n.status == '已申请' %}
+                    <form method="post" action="{{ url_for('main.node_update', node_id=n.id) }}" class="op-form">
+                      <input type="hidden" name="action" value="pay">
+                      <input type="number" name="paid_amount" class="small" step="0.01" min="0.01" value="{{ '%.2f'|format(n.due_amount - n.paid_amount) if (n.due_amount - n.paid_amount) > 0 else '' }}" placeholder="实付额">
+                      <input type="date" name="pay_date" class="small">
+                      <input type="text" name="pay_method" class="small" placeholder="付款方式">
+                      <input type="text" name="voucher_no" class="small" placeholder="凭证号">
+                      <button type="submit" class="btn btn-success btn-sm">登记付款</button>
+                    </form>
+                  {% else %}
+                    <span class="text-muted" style="font-size:12px;">已完成</span>
+                  {% endif %}
+                {% else %}
+                  <span class="text-muted" style="font-size:12px;">—</span>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+<div class="flex mt-16">
+  <a href="{{ url_for('main.projects') }}" class="btn btn-ghost">返回项目列表</a>
+</div>
+
+{% endblock %}

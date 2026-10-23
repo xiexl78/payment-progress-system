@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}付款进度管理系统{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  <style>
+    /* 系统小图标（内联 SVG 风格，无需外部资源） */
+    .icon { width: 17px; height: 17px; flex-shrink: 0; vertical-align: -3px; }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="logo">付</span>
+      <span>付款进度管理系统</span>
+    </div>
+    <nav>
+      <a href="{{ url_for('main.projects') }}" class="{{ 'active' if request.endpoint in ('main.projects','main.project_detail','main.project_new','main.project_edit') else '' }}">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        项目管理
+      </a>
+      <a href="{{ url_for('main.contracts') }}" class="{{ 'active' if request.endpoint in ('main.contracts','main.contract_confirm','main.contract_raw') else '' }}">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 13h6"/><path d="M9 17h6"/></svg>
+        合同识别
+      </a>
+      <a href="{{ url_for('main.reports') }}" class="{{ 'active' if request.endpoint in ('main.reports',) else '' }}">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 20h16"/><path d="M6 20V10"/><path d="M10 20V4"/><path d="M14 20v-7"/><path d="M18 20v-4"/></svg>
+        报表与提醒
+      </a>
+      {% if current_user and current_user.role == 'admin' %}
+      <a href="{{ url_for('main.users') }}" class="{{ 'active' if request.endpoint in ('main.users',) else '' }}">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a7 7 0 0 1 14 0v1"/><path d="M20 8v4"/><path d="M18 10h4"/></svg>
+        系统管理
+      </a>
+      {% endif %}
+    </nav>
+    <div class="side-user">
+      <b>{{ current_user.display_name if current_user else '' }}</b>
+      {{ current_user.role if current_user else '' }} · <a href="{{ url_for('main.logout') }}" style="color:#fca5a5;">退出登录</a>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="page-title">{% block page_title %}付款进度管理系统{% endblock %}</div>
+      <div class="top-actions">
+        {% if current_user %}
+        <span class="role-tag">
+          {% if current_user.role == 'admin' %}管理员{% elif current_user.role == 'operator' %}经办人{% else %}查看人员{% endif %}
+        </span>
+        <span>{{ current_user.display_name }}</span>
+        {% endif %}
+      </div>
+    </header>
+    <main class="content">
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+        <div class="flashes">
+          {% for category, message in messages %}
+          <div class="flash {{ category }}">{{ message }}</div>
+          {% endfor %}
+        </div>
+        {% endif %}
+      {% endwith %}
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</div>
+</body>
+</html>

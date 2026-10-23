@@ -1,0 +1,231 @@
+{% extends "base.html" %}
+{% block title %}{% if is_update %}修改合同确认{% else %}确认合同识别{% endif %} - 付款进度管理系统{% endblock %}
+{% block page_title %}{% if is_update %}修改合同确认{% else %}确认合同识别{% endif %}{% endblock %}
+{% block content %}
+
+{% set node_map = {} %}
+{% for nd in result.nodes if nd.node_type in node_order %}
+{% set _ = node_map.update({nd.node_type: nd}) %}
+{% endfor %}
+
+<div class="card" style="max-width:1200px;">
+  <div class="card-title">
+    {% if diff %}确认变更（二次确认）{% elif is_update %}修改合同确认{% else %}确认合同识别{% endif %}
+    <a href="{{ url_for('main.contracts') }}" class="btn btn-ghost btn-sm">返回列表</a>
+  </div>
+  <div class="src-text mb-8" style="margin-bottom:12px;">
+    文件：<b>{{ contract.file_name }}</b> · 识别引擎：{{ '大模型' if contract.engine == 'llm' else '本地规则' }}
+    {% if is_update %}
+    · <span class="badge badge-green">该合同已生成项目（当前显示项目现值）</span>
+    {% endif %}
+  </div>
+
+  {% if errors %}
+  <div class="flash danger" style="background:var(--danger-bg,#fee2e2);color:var(--danger,#b91c1c);border-color:#fecaca;margin-bottom:12px;">
+    <b>提交未通过校验：</b>
+    <ul style="margin:6px 0 0 18px;">
+      {% for err in errors %}<li>{{ err }}</li>{% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+  {% if blockers %}
+  <div class="flash warning" style="background:var(--warning-bg,#fef3c7);color:var(--warning,#92400e);border-color:#fde68a;margin-bottom:12px;">
+    <b>注意：该项目已发生业务，金额口径不可直接改：</b>
+    <ul style="margin:6px 0 0 18px;">
+      {% for b in blockers %}<li>{{ b }}</li>{% endfor %}
+    </ul>
+    <div style="margin-top:6px;">只修改名称/税率/付款方式可以保存；涉及金额或比例的修改会被拒绝，请走「变更单」流程。</div>
+  </div>
+  {% endif %}
+
+  {% if diff %}
+  <div class="flash info" style="margin-bottom:12px;">
+    <b>请核对以下变更（页面上的值为本次提交值，不会立即写入）：</b>
+    <div class="table-wrap mt-8">
+      <table class="table">
+        <thead><tr><th>字段</th><th>现值</th><th>提交值</th><th>差额</th></tr></thead>
+        <tbody>
+          {% for d in diff %}
+          <tr>
+            <td>{{ d.label }}</td>
+            <td class="num">{{ d.old }}</td>
+            <td class="num"><b>{{ d.new }}</b></td>
+            <td class="num {{ 'text-danger' if d.delta and d.delta[0] == '-' else 'text-success' }}">{{ d.delta or '—' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+
+  {% if result.warnings %}
+  <div class="flash warning" style="background:var(--warning-bg);color:var(--warning);border-color:#fde68a;">
+    <b>识别提示：</b>{{ result.warnings | join('；') }}
+  </div>
+  {% endif %}
+
+  <form method="post" action="{{ url_for('main.contract_confirm_submit', contract_id=contract.id) }}" id="confirm-form">
+    {% if confirm_token %}
+    <input type="hidden" name="confirm_token" value="{{ confirm_token }}">
+    {% endif %}
+
+    <!-- 顶部：项目信息 -->
+    <div class="form-grid">
+      <div class="form-row">
+        <label class="field-label">项目编号
+          {% if is_update %}<span class="src-text">（已生成项目，编号不可修改）</span>
+          {% else %}<span class="src-text">（留空自动生成 PJ-CT-日期-序号）</span>{% endif %}
+        </label>
+        {% if is_update %}
+        <input type="text" value="{{ values.project_no }}" readonly style="width:100%;background:#f3f4f6;">
+        {% else %}
+        <input type="text" name="project_no" value="{{ values.project_no }}" placeholder="如：PJ-CT-20261021-001" style="width:100%;">
+        {% endif %}
+      </div>
+      <div class="form-row">
+        <label class="field-label">合同名称 / 项目名称 *</label>
+        <input type="text" name="contract_name" id="contract_name" value="{{ values.contract_name }}" style="width:100%;" required>
+      </div>
+    </div>
+
+    <div class="form-grid">
+      <div class="form-row">
+        <label class="field-label">原金额 / 合同金额（元）*</label>
+        <input type="number" name="original_amount" id="original_amount" value="{{ values.original_amount }}" step="0.01" min="0" style="width:100%;" oninput="recompute()" required>
+        {% if result.sources and result.sources.contract_amount %}
+        <div class="src-text">识别值：{{ result.sources.contract_amount }}</div>
+        {% elif not is_update %}
+        <div class="src-text text-warning">未定位到原文出处，请核对金额</div>
+        {% endif %}
+      </div>
+      <div class="form-row">
+        <label class="field-label">增补金额（元）</label>
+        <input type="number" name="additional_amount" id="additional_amount" value="{{ values.additional_amount }}" step="0.01" min="0" style="width:100%;" oninput="recompute()">
+        <div class="src-text">进度款 / 验收款 / 质保金按 原金额+增补金额 计算；首付款按原金额</div>
+      </div>
+    </div>
+
+    <div class="form-grid">
+      <div class="form-row">
+        <label class="field-label">税率</label>
+        <select name="tax_rate" style="width:100%;">
+          <option value="">—</option>
+          {% for rt in ['13%','9%','6%','3%','0%'] %}
+          <option value="{{ rt }}" {{ 'selected' if values.tax_rate == rt else '' }}>{{ rt }}</option>
+          {% endfor %}
+        </select>
+        {% if result.sources and result.sources.tax_rate %}
+        <div class="src-text">识别值：{{ result.sources.tax_rate }}</div>
+        {% endif %}
+      </div>
+      <div class="form-row">
+        <label class="field-label">付款方式 / 付款条件</label>
+        <textarea name="payment_method" style="min-height:50px;">{{ values.payment_method }}</textarea>
+        {% if result.sources and result.sources.payment_method %}
+        <div class="src-text">识别值：{{ result.sources.payment_method }}</div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- 中部：付款节点金额自动换算表 -->
+    <div class="form-row mt-16">
+      <label class="field-label">付款节点与金额（比例可修改，金额以提交后服务端校验为准）</label>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>节点</th>
+              <th style="width:110px;">比例（%）</th>
+              <th>计算基数</th>
+              <th class="num">应付金额（元）</th>
+              <th>识别出处 / 提示</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for nt in node_order %}
+            {% set nd = node_map.get(nt) %}
+            <tr>
+              <td>
+                <b>{{ ('首付款' if nt == 'first' else '进度款' if nt == 'progress' else '验收款' if nt == 'acceptance' else '质保金') }}</b>
+              </td>
+              <td>
+                <input type="number" name="ratio_{{ nt }}" class="node-ratio" data-node-type="{{ nt }}"
+                       value="{{ values.ratios_pct.get(nt, '') }}"
+                       step="0.01" min="0" max="100" style="width:100px;" oninput="recompute()">
+              </td>
+              <td class="src-text">{{ '按原金额' if nt == 'first' else '按总金额' }}</td>
+              <td class="num"><span class="node-amount amount-cell">0.00</span></td>
+              <td class="src-text">
+                {% if nd and nd.from_text %}
+                <span class="badge badge-green">来自原文</span>
+                {{ nd.source_text or '' }}
+                {% elif nd and nd.source_text %}
+                {{ nd.source_text }}
+                {% elif not is_update %}
+                <span class="warn-tag">模板默认比例，请核对合同</span>
+                {% else %}
+                <span class="src-text">当前项目口径</span>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+            <tr>
+              <td><b>合计</b></td>
+              <td><b id="sum_ratio" class="amount-cell">0%</b></td>
+              <td class="src-text">比例合计应为 100%（容差 ±0.01%）</td>
+              <td class="num"><b id="sum_amount" class="amount-cell">0.00</b></td>
+              <td><span id="ratio_total_msg" class="text-danger" style="display:none;">比例合计 ≠ 100%，请核对</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- 底部操作 -->
+    <div class="flex mt-16" style="gap:12px;">
+      {% if diff %}
+      <button type="submit" class="btn btn-primary btn-lg">确认提交变更</button>
+      <a href="{{ url_for('main.contract_confirm', contract_id=contract.id) }}" class="btn btn-ghost">返回修改</a>
+      {% elif is_update %}
+      <button type="submit" class="btn btn-primary btn-lg">保存修改（下一步确认差异）</button>
+      <button type="button" class="btn btn-ghost" onclick="document.getElementById('rerun-form').submit();">重新识别</button>
+      {% else %}
+      <button type="submit" class="btn btn-primary btn-lg">确认并生成项目</button>
+      <button type="button" class="btn btn-ghost" onclick="document.getElementById('rerun-form').submit();">重新识别</button>
+      {% endif %}
+      <a href="{{ url_for('main.contracts') }}" class="btn btn-ghost">取消</a>
+    </div>
+  </form>
+
+  <form method="post" action="{{ url_for('main.contract_rerun', contract_id=contract.id) }}" id="rerun-form" style="display:none;"></form>
+</div>
+
+<script>
+function recompute() {
+  var original = parseFloat(document.getElementById('original_amount').value) || 0;
+  var additional = parseFloat(document.getElementById('additional_amount').value) || 0;
+  var total = original + additional;
+  var sumRatio = 0, sumAmount = 0;
+  document.querySelectorAll('.node-ratio').forEach(function (inp) {
+    var tr = inp.closest('tr');
+    var nt = inp.dataset.nodeType;
+    var base = (nt === 'first') ? original : total;
+    var ratio = parseFloat(inp.value) || 0;
+    var amount = base * ratio / 100;
+    tr.querySelector('.node-amount').textContent = amount.toFixed(2);
+    sumRatio += ratio;
+    sumAmount += amount;
+  });
+  document.getElementById('sum_ratio').textContent = sumRatio.toFixed(2) + '%';
+  document.getElementById('sum_amount').textContent = sumAmount.toFixed(2);
+  var msg = document.getElementById('ratio_total_msg');
+  if (msg) msg.style.display = (Math.abs(sumRatio - 100) > 0.01) ? '' : 'none';
+}
+{% if not diff %}
+recompute();
+{% endif %}
+</script>
+
+{% endblock %}

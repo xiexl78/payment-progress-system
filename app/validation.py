@@ -1,0 +1,384 @@
+# -*- coding: utf-8 -*-
+"""服务端强校验（P0-3 落地）
+
+把「金额 / 比例 / 日期 / 节点操作」的校验收敛到本模块一处，
+路由层只负责取表单、调用校验、把 ``ValidationError.errors`` 回显给用户。
+
+口径常量（含待业务确认项）集中在这里，改口径只改一处。
+"""
+
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from decimal import Decimal, ROUND_HALF_UP
+
+from .money import CENT, MAX_MONEY, ZERO, allocate_tail, mul_ratio, parse_money, sum_money
+
+__all__ = [
+    'ValidationError',
+    'PROJECT_STATUSES',
+    'NODE_TYPES',
+    'TAX_RATES',
+    'RATIO_SUM_TOLERANCE',
+    'CONTRACT_TOTAL_STRICT',
+    'ALLOW_ZERO_RATIO',
+    'ContractSubmission',
+    'parse_amount',
+    'parse_ratio_pct',
+    'parse_date',
+    'validate_project_dates',
+    'validate_project_item_rows',
+    'validate_contract_submission',
+    'validate_node_action',
+    'node_base_amount',
+]
+
+#: 项目状态白名单（P2-12：禁止任意字符串写入）
+PROJECT_STATUSES = ('进行中', '已完成', '已归档')
+#: 付款节点类型（与 NODE_TEMPLATES 对齐）
+NODE_TYPES = ('first', 'progress', 'acceptance', 'warranty')
+NODE_LABELS = {'first': '首付款', 'progress': '进度款',
+               'acceptance': '验收款', 'warranty': '质保金'}
+#: 税率白名单（与页面下拉一致）
+TAX_RATES = ('13%', '9%', '6%', '3%', '0%', '')
+#: 比例合计容差：±0.01 个百分点
+RATIO_SUM_TOLERANCE = Decimal('0.01')
+#: TODO(业务确认 P1-1)：节点应付合计是否必须等于「原金额+增补金额」。
+#: 现状口径「首付款按原金额」会导致少 30%×增补，故默认只警告、不阻断。
+CONTRACT_TOTAL_STRICT = False
+#: TODO(业务确认)：是否允许某类节点比例为 0（如无质保金合同）。
+#: 当前按「0 < 比例 ≤ 100」执行；业务确认允许 0 后改为 True。
+ALLOW_ZERO_RATIO = False
+#: 尾差归集顺序：质保金优先
+TAIL_ORDER = ('warranty', 'acceptance', 'progress', 'first')
+#: 日期合法范围
+MIN_DATE = date(1900, 1, 1)
+MAX_DATE = date(2100, 12, 31)
+#: 文本长度上限（与模型列定义对齐）
+MAX_TEXT = {'contract_name': 256, 'project_no': 64, 'tax_rate': 32,
+            'payment_method': 256, 'item_name': 128}
+
+
+class ValidationError(ValueError):
+    """校验失败：``errors`` 为可直接展示给用户的中文消息列表。"""
+
+    def __init__(self, errors):
+        if isinstance(errors, str):
+            errors = [errors]
+        self.errors = list(errors)
+        super().__init__('；'.join(self.errors))
+
+
+def _is_blank(raw):
+    return raw is None or (isinstance(raw, str) and not raw.strip())
+
+
+def _err(field, message):
+    return ValidationError('%s：%s' % (field, message))
+
+
+def parse_amount(raw, *, field, required=True, allow_zero=True):
+    """解析页面提交的金额字符串，返回两位小数 ``Decimal``。
+
+    拒绝：空（required 时）、nan/inf/科学计数、非法字符、多于 2 位小数、
+    负数、超过 NUMERIC(14,2) 上限。
+    """
+    if _is_blank(raw):
+        if required:
+            raise _err(field, '必填')
+        return ZERO
+    if isinstance(raw, str) and raw.strip().endswith('%'):
+        raise _err(field, '不能带百分号')
+    try:
+        value = parse_money(raw, allow_negative=False)
+    except TypeError:
+        raise _err(field, '格式错误（禁止使用浮点数）')
+    if value is None:
+        raise _err(field, '请输入有效金额（仅数字，最多两位小数；不接受 nan/inf/科学计数/负数）')
+    if not allow_zero and value == 0:
+        raise _err(field, '必须大于 0')
+    if value > MAX_MONEY:
+        raise _err(field, '超出金额上限 %s' % MAX_MONEY)
+    return value
+
+
+def parse_ratio_pct(raw, *, field):
+    """解析比例（百分数，如 ``'30.00'`` 表示 30%），返回 ``Decimal`` 百分数。
+
+    规则：0 < 比例 ≤ 100（比例为 0 时按 ``ALLOW_ZERO_RATIO`` 决定）。
+    """
+    if _is_blank(raw):
+        raise _err(field, '必填')
+    text = str(raw).strip()
+    if text.endswith('%'):
+        text = text[:-1].strip()
+    try:
+        value = parse_money(text, allow_negative=False)
+    except TypeError:
+        raise _err(field, '格式错误（禁止使用浮点数）')
+    if value is None:
+        raise _err(field, '请输入有效比例（0~100，最多两位小数）')
+    if value > Decimal('100'):
+        raise _err(field, '比例必须在 0~100 之间')
+    if value == 0 and not ALLOW_ZERO_RATIO:
+        raise _err(field, '比例必须大于 0（如需 0% 请先与业务确认）')
+    return value
+
+
+def parse_date(raw, *, field, required=False):
+    """解析 ``YYYY-MM-DD`` 日期；非法抛 ``ValidationError``。"""
+    if _is_blank(raw):
+        if required:
+            raise _err(field, '必填')
+        return None
+    text = str(raw).strip()
+    try:
+        value = datetime.strptime(text, '%Y-%m-%d').date()
+    except ValueError:
+        raise _err(field, '格式应为 YYYY-MM-DD')
+    if not (MIN_DATE <= value <= MAX_DATE):
+        raise _err(field, '日期超出合理范围（1900~2100 年）')
+    return value
+
+
+def validate_project_dates(trial_date, acceptance_date):
+    """试运行/验收日期先后校验。"""
+    if trial_date and acceptance_date and acceptance_date < trial_date:
+        raise ValidationError('验收日期不能早于试运行日期')
+
+
+def validate_text(raw, *, field, required=False, max_len=None, allowed=None):
+    text = '' if raw is None else str(raw).strip()
+    if required and not text:
+        raise _err(field, '必填')
+    limit = max_len or MAX_TEXT.get(field)
+    if limit and len(text) > limit:
+        raise _err(field, '长度不能超过 %d 个字符' % limit)
+    if allowed is not None and text not in allowed:
+        raise _err(field, '取值不合法')
+    return text
+
+
+def validate_project_item_rows(form):
+    """校验「新建项目」的科目行（多科目动态表单）。
+
+    Returns: ``[{'item_name','tax_rate','original_amount','additional_amount'}]``
+    Raises: ``ValidationError``（收集所有错误一次返回）。
+    """
+    names = form.getlist('item_name')
+    taxes = form.getlist('tax_rate')
+    originals = form.getlist('original_amount')
+    additionals = form.getlist('additional_amount')
+    errors = []
+    rows = []
+    for idx in range(len(names)):
+        name = (names[idx] or '').strip()
+        if not name:
+            # 与旧逻辑一致：空行跳过（但至少要有 1 行有效科目）
+            continue
+        row_no = '第 %d 个科目' % (len(rows) + 1)
+        tax = (taxes[idx] if idx < len(taxes) else '') or ''
+        try:
+            tax = validate_text(tax, field='tax_rate', max_len=32, allowed=TAX_RATES)
+        except ValidationError as e:
+            errors.extend(e.errors)
+        try:
+            original = parse_amount(originals[idx] if idx < len(originals) else None,
+                                    field=row_no + '原金额', allow_zero=True)
+        except ValidationError as e:
+            errors.extend(e.errors)
+            original = ZERO
+        try:
+            additional = parse_amount(additionals[idx] if idx < len(additionals) else None,
+                                      field=row_no + '增补金额', required=False, allow_zero=True)
+        except ValidationError as e:
+            errors.extend(e.errors)
+            additional = ZERO
+        if len(name) > MAX_TEXT['item_name']:
+            errors.append('%s名称：长度不能超过 %d 个字符' % (row_no, MAX_TEXT['item_name']))
+        rows.append({'item_name': name, 'tax_rate': tax,
+                     'original_amount': original, 'additional_amount': additional})
+    if not rows and not errors:
+        errors.append('至少需要添加一个费用科目')
+    if errors:
+        raise ValidationError(errors)
+    return rows
+
+
+@dataclass
+class ContractSubmission:
+    """合同确认/回改的规范化提交值（全部 Decimal 或纯文本）。"""
+    contract_name: str
+    project_no: str
+    original_amount: Decimal
+    additional_amount: Decimal
+    tax_rate: str
+    payment_method: str
+    ratios_pct: dict
+    node_amounts: dict
+    expected_total: Decimal
+    contract_total: Decimal
+    tail: Decimal
+    tail_node: str
+    warnings: list = field(default_factory=list)
+
+
+def _base_for_node(node_type, original, additional):
+    """口径：首付款按科目原金额；其余按原金额+增补金额。"""
+    return original if node_type == 'first' else (original + additional)
+
+
+def node_base_amount(node, original_amount, additional_amount):
+    """按节点 calc_base 返回计算基数（Decimal）。"""
+    if node.calc_base == 'original':
+        return original_amount
+    return original_amount + additional_amount
+
+
+def build_contract_numbers(original_amount, additional_amount, ratios_pct):
+    """按口径计算 4 个节点应付并做尾差归集。
+
+    Returns: ``ContractSubmission`` 中金额部分（不含文本字段）。
+    Raises: ``ValidationError``。
+    """
+    # 比例合计 100% ± 0.01 个百分点
+    total_pct = sum((ratios_pct[nt] for nt in NODE_TYPES), Decimal('0'))
+    if abs(total_pct - Decimal('100')) > RATIO_SUM_TOLERANCE:
+        raise ValidationError(
+            '比例合计应为 100%%（容差 ±%.2f%%），当前为 %s%%'
+            % (RATIO_SUM_TOLERANCE, _plain_pct(total_pct)))
+
+    base_map = {nt: _base_for_node(nt, original_amount, additional_amount)
+                for nt in NODE_TYPES}
+    raw_amounts = {nt: base_map[nt] * ratios_pct[nt] / Decimal('100')
+                   for nt in NODE_TYPES}
+    node_amounts = {nt: _quantize(raw_amounts[nt]) for nt in NODE_TYPES}
+    expected_total = _quantize(sum(raw_amounts.values(), Decimal('0')))
+    tail = expected_total - sum(node_amounts.values(), ZERO)
+    tail_node = ''
+    if tail != 0:
+        before = dict(node_amounts)
+        try:
+            node_amounts = allocate_tail(node_amounts, expected_total, order=TAIL_ORDER)
+        except ValueError as e:
+            raise ValidationError('尾差归集失败：%s' % e)
+        # 记录尾差实际落到了哪个节点（便于页面说明）
+        for nt in TAIL_ORDER:
+            if nt in node_amounts and node_amounts[nt] != before.get(nt):
+                tail_node = nt
+                break
+
+    contract_total = (original_amount + additional_amount).quantize(CENT)
+    warnings = []
+    payable = sum(node_amounts.values(), ZERO)
+    if payable != contract_total:
+        msg = ('节点应付合计 %s 与合同金额 %s 相差 %s（当前口径：首付款按原金额，'
+               '其余按原金额+增补；增补的 %s%% 不产生应付）'
+               % (_money(payable), _money(contract_total),
+                  _money(contract_total - payable),
+                  _plain_pct(ratios_pct['first'])))
+        if CONTRACT_TOTAL_STRICT:
+            raise ValidationError(msg)
+        warnings.append(msg)
+    return {
+        'original_amount': original_amount,
+        'additional_amount': additional_amount,
+        'ratios_pct': dict(ratios_pct),
+        'node_amounts': node_amounts,
+        'expected_total': expected_total,
+        'contract_total': contract_total,
+        'tail': tail,
+        'tail_node': tail_node,
+        'warnings': warnings,
+    }
+
+
+def validate_contract_submission(form):
+    """校验合同确认/回改表单，返回规范化 ``ContractSubmission``。"""
+    errors = []
+
+    def _try(fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except ValidationError as e:
+            errors.extend(e.errors)
+            return None
+
+    contract_name = _try(validate_text, form.get('contract_name'),
+                         field='contract_name', required=True, max_len=256) or ''
+    project_no = _try(validate_text, form.get('project_no'),
+                      field='project_no', required=False, max_len=64) or ''
+    original = _try(parse_amount, form.get('original_amount'),
+                    field='原金额', allow_zero=False)
+    additional = _try(parse_amount, form.get('additional_amount'),
+                      field='增补金额', required=False) or ZERO
+    tax_rate = _try(validate_text, form.get('tax_rate'),
+                    field='tax_rate', required=False, max_len=32, allowed=TAX_RATES) or ''
+    payment_method = _try(validate_text, form.get('payment_method'),
+                          field='payment_method', required=False,
+                          max_len=256) or ''
+    ratios = {}
+    for nt in NODE_TYPES:
+        ratios[nt] = _try(parse_ratio_pct, form.get('ratio_' + nt),
+                          field=NODE_LABELS[nt] + '比例')
+
+    if errors:
+        raise ValidationError(errors)
+
+    numbers = build_contract_numbers(original, additional, ratios)
+    return ContractSubmission(
+        contract_name=contract_name, project_no=project_no,
+        original_amount=numbers['original_amount'],
+        additional_amount=numbers['additional_amount'],
+        tax_rate=tax_rate, payment_method=payment_method,
+        ratios_pct=numbers['ratios_pct'], node_amounts=numbers['node_amounts'],
+        expected_total=numbers['expected_total'],
+        contract_total=numbers['contract_total'],
+        tail=numbers['tail'], tail_node=numbers['tail_node'],
+        warnings=numbers['warnings'],
+    )
+
+
+def validate_node_action(node, action, form):
+    """校验节点申请 / 开票 / 付款的金额与上限，返回解析后的金额字典。"""
+    due = Decimal(node.due_amount or 0)
+    paid = Decimal(node.paid_amount or 0)
+    invoice = Decimal(node.invoice_amount or 0)
+
+    if action == 'apply':
+        amount = parse_amount(form.get('apply_amount'), field='申请金额', allow_zero=False)
+        remaining = (due - paid).quantize(CENT)
+        if amount > remaining:
+            raise ValidationError('申请金额 %s 超过该节点未付应付 %s'
+                                  % (_money(amount), _money(remaining)))
+        inv = parse_amount(form.get('invoice_amount'), field='发票金额', required=False)
+        if inv > 0 and inv > due:
+            raise ValidationError('发票金额不能超过节点应付金额 %s' % _money(due))
+        return {'apply_amount': amount, 'invoice_amount': inv}
+    if action == 'invoice':
+        amount = parse_amount(form.get('invoice_amount'), field='发票金额', allow_zero=False)
+        if invoice + amount > due:
+            raise ValidationError('累计开票金额 %s 将超过节点应付金额 %s'
+                                  % (_money(invoice + amount), _money(due)))
+        return {'invoice_amount': amount}
+    if action == 'pay':
+        amount = parse_amount(form.get('paid_amount'), field='付款金额', allow_zero=False)
+        remaining = (due - paid).quantize(CENT)
+        if amount > remaining:
+            raise ValidationError('付款金额 %s 超过该节点未付应付 %s'
+                                  % (_money(amount), _money(remaining)))
+        return {'paid_amount': amount}
+    raise ValidationError('未知操作：%s' % action)
+
+
+def _quantize(value):
+    return value.quantize(CENT, rounding=ROUND_HALF_UP)
+
+
+def _money(value):
+    from .money import fmt_money
+    return fmt_money(value, symbol=True)
+
+
+def _plain_pct(value):
+    text = format(value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP), 'f')
+    return text.rstrip('0').rstrip('.') + '%'

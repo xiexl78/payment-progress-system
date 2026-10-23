@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% block title %}项目管理 - 付款进度管理系统{% endblock %}
+{% block page_title %}项目管理{% endblock %}
+{% block content %}
+
+<div class="stats-grid">
+  <div class="stat-card">
+    <div class="label">项目总数</div>
+    <div class="value">{{ stats.total }}</div>
+  </div>
+  <div class="stat-card green">
+    <div class="label">进行中</div>
+    <div class="value">{{ stats.ongoing }}</div>
+  </div>
+  <div class="stat-card orange">
+    <div class="label">已完成</div>
+    <div class="value">{{ stats.done }}</div>
+  </div>
+  <div class="stat-card blue">
+    <div class="label">合同总额（元）</div>
+    <div class="value">{{ '{:,.0f}'.format(stats.amount) }}</div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="toolbar">
+    <form method="get" action="{{ url_for('main.projects') }}" class="left">
+      <input type="text" name="keyword" value="{{ keyword }}" placeholder="项目名称 / 编号" class="mid">
+      <select name="status">
+        <option value="">全部状态</option>
+        <option value="进行中" {{ 'selected' if status == '进行中' else '' }}>进行中</option>
+        <option value="已完成" {{ 'selected' if status == '已完成' else '' }}>已完成</option>
+        <option value="已归档" {{ 'selected' if status == '已归档' else '' }}>已归档</option>
+      </select>
+      <button type="submit" class="btn btn-outline btn-sm">查询</button>
+      {% if keyword or status %}
+      <a href="{{ url_for('main.projects') }}" class="btn btn-ghost btn-sm">重置</a>
+      {% endif %}
+    </form>
+    <div class="right">
+      {% if current_user.role in ('admin', 'operator') %}
+      <a href="{{ url_for('main.project_new') }}" class="btn btn-primary">+ 新建项目</a>
+      {% endif %}
+    </div>
+  </div>
+
+  {% if projects %}
+    {% for p in projects %}
+    <div class="project-row" style="border-bottom:1px solid #edf2f7; padding:14px 0; {{ 'border-bottom:none;' if loop.last }}">
+      <div class="info">
+        <div class="name">{{ p.name }}</div>
+        <div class="meta">
+          {{ p.project_no }}
+          · 试运行：{{ p.trial_date.strftime('%Y-%m-%d') if p.trial_date else '未登记' }}
+          · 验收：{{ p.acceptance_date.strftime('%Y-%m-%d') if p.acceptance_date else '未登记' }}
+          · 质保到期：{{ p.warranty_due_date.strftime('%Y-%m-%d') if p.warranty_due_date else '—' }}
+        </div>
+      </div>
+      <div class="amounts">
+        <div class="amt">
+          <div class="v">￥{{ '{:,.2f}'.format(p.total_amount()) }}</div>
+          <div class="l">合同总金额</div>
+        </div>
+        <div class="amt">
+          <div class="v text-success">￥{{ '{:,.2f}'.format(p.nodes|sum(attribute='paid_amount')|float) }}</div>
+          <div class="l">已付金额</div>
+        </div>
+      </div>
+      <div>
+        {% set due_all = p.nodes|sum(attribute='due_amount')|float %}
+        {% set paid_all = p.nodes|sum(attribute='paid_amount')|float %}
+        {% set pct = (paid_all / due_all * 100) if due_all else 0 %}
+        <div class="flex" style="justify-content:flex-end;">
+          <span class="badge {{ 'badge-green' if p.status == '已完成' else 'badge-blue' if p.status == '进行中' else 'badge-gray' }}">{{ p.status }}</span>
+          <span class="text-muted" style="font-size:12px;">{{ '%.1f'|format(pct) }}%</span>
+        </div>
+        <div class="progress-bar mt-8" style="margin-left:auto;"><div class="fill" style="width:{{ pct }}%;"></div></div>
+      </div>
+      <div class="actions">
+        <a href="{{ url_for('main.project_detail', project_id=p.id) }}" class="btn btn-outline btn-sm">查看详情</a>
+        {% if current_user.role in ('admin', 'operator') %}
+        <form method="post" action="{{ url_for('main.project_delete', project_id=p.id) }}" style="display:inline;" onsubmit="return confirm('确定删除「{{ p.name }}」？关联数据将全部清除，不可恢复。');">
+          <button type="submit" class="btn btn-ghost btn-sm text-danger">删除</button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  {% else %}
+    <div class="empty">暂无项目，点击右上角「新建项目」开始登记</div>
+  {% endif %}
+</div>
+
+{% endblock %}
