@@ -289,6 +289,47 @@ class AcceptanceRecord(db.Model):
         }
 
 
+class ImportBatch(db.Model):
+    """Excel 导入批次记录（批次 6b）
+
+    - 每次成功写库一条；``dry_run=True`` 的试运行也留一条（status='dry-run'）；
+    - ``file_hash`` = 源文件 SHA-256，用于追溯"同一份表是否重复导入"；
+    - 计数为本次实际写入的行数，便于对账。
+    """
+    __tablename__ = 'import_batches'
+    id = db.Column(db.Integer, primary_key=True)
+    ts = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    file_name = db.Column(db.String(256), nullable=False)
+    file_hash = db.Column(db.String(64), nullable=False, index=True)
+    mode = db.Column(db.String(16), nullable=False, default='import')   # import / dry-run
+    status = db.Column(db.String(16), nullable=False, default='success')  # success / dry-run / failed
+    projects_created = db.Column(db.Integer, nullable=False, default=0)
+    items_created = db.Column(db.Integer, nullable=False, default=0)
+    nodes_created = db.Column(db.Integer, nullable=False, default=0)
+    applications_created = db.Column(db.Integer, nullable=False, default=0)
+    records_created = db.Column(db.Integer, nullable=False, default=0)
+    acceptances_created = db.Column(db.Integer, nullable=False, default=0)
+    operator = db.Column(db.String(64), nullable=True)     # 命令行导出/系统
+    report_path = db.Column(db.String(512), nullable=True)
+    error_msg = db.Column(db.Text, nullable=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'ts': self.ts.strftime('%Y-%m-%d %H:%M:%S') if self.ts else None,
+            'file_name': self.file_name, 'file_hash': self.file_hash,
+            'mode': self.mode, 'status': self.status,
+            'projects_created': self.projects_created,
+            'items_created': self.items_created,
+            'nodes_created': self.nodes_created,
+            'applications_created': self.applications_created,
+            'records_created': self.records_created,
+            'acceptances_created': self.acceptances_created,
+            'operator': self.operator, 'report_path': self.report_path,
+            'error_msg': self.error_msg,
+        }
+
+
 class UserSession(db.Model):
     """服务端会话：登出/改密/重置后旧 Cookie 立即失效；敏感操作可轮换当前会话。"""
     __tablename__ = 'user_sessions'

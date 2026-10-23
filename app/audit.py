@@ -36,7 +36,7 @@ KNOWN_ACTIONS = (
     'contract.upload', 'contract.confirm', 'contract.confirm.failed',
     'contract.modify', 'contract.modify.blocked', 'contract.rerun',
     'user.create', 'user.disable', 'user.enable', 'user.delete',
-    'export.project', 'export.reports', 'export.audit',
+    'export.project', 'export.reports', 'export.audit', 'import.excel',
 )
 
 logger = logging.getLogger('payment.audit')

@@ -44,6 +44,24 @@ def local_today():
     return to_local(utcnow()).date()
 
 
+def local_datetime_to_utc(value):
+    """业务时区的本地 datetime/date → UTC naive（Excel 导入的时间列用）。
+
+    ``date`` 按当天 00:00 处理；已是 aware 的 datetime 直接换算。
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        moment = value
+    elif isinstance(value, date):
+        moment = datetime(value.year, value.month, value.day)
+    else:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=_tz())
+    return moment.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def local_date_start_utc(day):
     """业务时区某天 00:00 → UTC naive（用于审计筛选下界）。"""
     aware = datetime(day.year, day.month, day.day, tzinfo=_tz())

@@ -165,7 +165,9 @@ def create_app(config=None):
                     pass
 
     from .schema import upgrade_schema
-    upgrade_schema(app)
+    if not app.config.get('SKIP_SCHEMA_UPGRADE'):
+        # 只读场景（如导入 dry-run）可跳过，避免对现有库做任何 DDL 写入
+        upgrade_schema(app)
 
     from .security import init_security
     init_security(app)
