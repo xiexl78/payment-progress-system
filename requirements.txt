@@ -1,6 +1,35 @@
-flask>=3.0
-flask-sqlalchemy>=3.1
-pdfplumber>=0.11
-python-docx>=1.1
-requests>=2.31
-PyMuPDF>=1.23
+# 付款进度管理系统 · 运行依赖（锁定版本）
+# 锁定日期：2026-10-23（本机实测环境：Windows + Python 3.12.2）
+# 说明：本文件只锁直接依赖；含传递依赖的完整闭包见 requirements-lock.txt。
+# 安装：python -m pip install -r requirements.txt
+
+Flask==3.1.3
+Werkzeug==3.1.8
+Jinja2==3.1.6
+
+Flask-SQLAlchemy==3.1.1
+SQLAlchemy==2.1.5
+
+pdfplumber==0.11.10
+python-docx==1.2.0
+
+# PyMuPDF 许可结论：AGPL-3.0。仅限本单位内部使用（不分发、不作为对外服务/产品的一部分）；
+# 若需对外分发、SaaS 化或嵌入商业产品，必须先法务确认，或替换为 pdfplumber/pypdf 方案
+# （扫描件 PDF 渲染为图片再 OCR 的部分需要另找替代实现并重新验证）。
+# 注意：PyMuPDF 2.0 会引入 pymupdf_layout / pymupdf4llm / onnxruntime / numpy 等较多传递依赖
+# （安装体积约 200MB+），目标机安装前确认磁盘空间与 Python 版本（3.12 实测可用）。
+PyMuPDF==2.0
+
+# 图片/扫描件 PDF 端到端测试脚本（scripts/e2e_scan_pdf.py）依赖；
+# 生产环境的图片合同识别走 Windows 自带 OCR，不直接依赖 Pillow。
+Pillow==13.0.0
+
+# 合同识别测试脚本与 HTTP 调用使用
+requests==2.34.2
+
+# Excel 导入/导出（批次 6 使用；本机已安装验证）
+openpyxl==3.1.5
+
+# 生产 WSGI 服务器（部署用）。本机为开发环境，受沙箱权限限制未安装；
+# 目标机安装后请用 pip show waitress 校准版本并同步到 requirements-lock.txt。
+waitress==3.0.2

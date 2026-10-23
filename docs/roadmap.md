@@ -83,12 +83,12 @@
 | --- | --- | --- |
 | 1 金额与校验 | 部分完成 | `app/money.py`、`app/validation.py` 已接入；比例合计/负比例/负金额、HALF_UP 舍入已验证生效；**并发原子更新已完成**（付款用条件 UPDATE，节点已付=流水合计；8 并发申请只生成 1 张单） |
 | 2 合同回改 | 部分完成 | 改为就地更新、差异清单 + `confirm_token` 二次确认；有付款记录时不再 500；确认页回填现值待复核 |
-| 3 审计留痕 | 未开始 | `audit_logs`、`updated_at/by`、软删除均缺（P0-02） |
-| 4 安全基线 | 未开始 | CSRF、SECRET_KEY、改密、登录限速、错误页未做（P1-08/P1-09） |
+| 3 审计留痕 | 已完成（验收通过） | `audit_logs`、`updated_at/by`、登录/节点/项目/删除留痕与 `/admin/audit` 查询页已落地，10 项验收全部 PASS；物理删除保留审计日志（软删另算）；字段名为 `ts/object_type/object_id/ua`，与设计文档命名不一致待对齐 |
+| 4 安全基线 | 已完成（验收通过） | CSRF 强制校验、SECRET_KEY fail-fast、登出 POST、Cookie SameSite/8h、403/404/405/413/500 中文错误页、经办人删项目/改状态越权收口均已落地并通过回归（P1-08/P1-09/P1-01/P1-02/P2-01 大部分转 PASS） |
 | 5 备份与部署 | 脚本完成 | `scripts/backup.ps1`、`restore.ps1`、`sqlite_tool.py`、`verify_restored.py` 已落；未接入计划任务与应用启动自检 |
 | 6 导入导出 | 未开始 | 缺 `import_excel.py` / `export_excel.py` |
 
-**QA 回归现状**：`python tests/run_qa.py` → 124 项，93 PASS / 0 FAIL / 31 XFAIL（已知缺陷，按 P0/P1/P2 编号列出），退出码 0。临时库 + 随机端口，不碰 `instance/`。
+**QA 回归现状**：`python tests/run_qa.py` → 163 项，144 PASS / 0 FAIL / 19 XFAIL（已知缺陷，按 P0/P1/P2 编号列出），退出码 0。临时库 + 随机端口，不碰 `instance/`。批次 3 审计（含补充项）与批次 4a 安全基线已全部转 PASS；剩余 XFAIL 集中在 P0-03 备份恢复、并发丢失更新、部分 P1/P2（增补口径、状态回退、上传上限与 README 不一致等）。
 **已知环境坑**：本机 WinRT 沙箱限制导致图片/扫描件 OCR 不可用（0x80070005），目标机需实测；`e2e_test.py` 非幂等；`e2e_scan_pdf.py` 失败也退出 0。
 **计划外阻断**：2026-10-22 晚起团队模型额度耗尽（QUOTA 402），开发/测试/架构师暂时无法执行，代码与文档均已落盘。
 

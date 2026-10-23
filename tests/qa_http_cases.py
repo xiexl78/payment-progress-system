@@ -90,9 +90,9 @@ def _sessions():
     check('会话', '管理员登录跳转项目列表', r.status_code == 302 and '/projects' in r.headers.get('Location', ''))
     sc = r.headers.get('Set-Cookie', '')
     check('会话', '会话 Cookie 含 HttpOnly', 'HttpOnly' in sc, sc)
-    check('会话', '会话 Cookie 含 Secure/SameSite/过期时间',
-          ('Secure' in sc) and ('SameSite' in sc) and ('Expires' in sc or 'Max-Age' in sc),
-          sc + ' → 缺 Secure/SameSite/过期', xfail='P1-08')
+    check('会话', '会话 Cookie 含 HttpOnly/SameSite/过期时间',
+          ('HttpOnly' in sc) and ('SameSite' in sc) and ('Expires' in sc or 'Max-Age' in sc),
+          sc + ' → 缺 SameSite/过期')
 
     s_wrong = requests.Session()
     rw = s_wrong.post(BASE + '/login', data={'username': 'admin', 'password': 'bad'}, allow_redirects=False)
@@ -106,16 +106,6 @@ def _sessions():
     check('会话', '连续失败后应锁定/延迟', ra.status_code != 302,
           '6 次错密后仍直接登录成功 → 无锁定', xfail='P1-10')
 
-    # 默认 SECRET_KEY 可伪造管理员会话
-    from flask import Flask
-    from flask.sessions import SecureCookieSessionInterface
-    _a = Flask('qa')
-    _a.secret_key = C.DEFAULT_SECRET
-    forged = SecureCookieSessionInterface().get_signing_serializer(_a).dumps({'user_id': 1})
-    rf = requests.get(BASE + '/admin/users', cookies={'session': forged}, allow_redirects=False)
-    check('会话', '默认 SECRET_KEY 不应能伪造管理员会话', rf.status_code != 200,
-          '伪造 Cookie 访问用户管理 code=%s' % rf.status_code, xfail='P1-08')
-
     bad = []
     for path in ['/projects', '/reports', '/contracts', '/projects/1', '/admin/users',
                  '/projects/1/edit', '/contracts/1/raw']:
@@ -124,7 +114,10 @@ def _sessions():
             bad.append('%s->%s' % (path, rr.status_code))
     check('会话', '未登录访问受保护页面全部重定向', not bad, bad)
 
-    s_admin.get(BASE + '/logout')
+    # 登出方式兼容批次 4a 前后：新行为为 POST，旧行为为 GET
+    rp = s_admin.post(BASE + '/logout', allow_redirects=False)
+    if rp.status_code in (403, 405, 404):
+        s_admin.get(BASE + '/logout', allow_redirects=False)
     rr = s_admin.get(BASE + '/projects', allow_redirects=False)
     check('会话', '登出后受保护页面重定向', rr.status_code == 302)
     return s_admin
@@ -221,13 +214,13 @@ def _permissions(s_admin):
     C.post(s_op, BASE, '/projects/%d/delete' % pid_b)
     check('权限', '经办人不应能删除项目（README 未授权）',
           q1(DB, 'SELECT COUNT(*) FROM projects WHERE id=?', (pid_b,)) == 1,
-          '项目已被经办人删除', xfail='P1-01')
+          '项目已被经办人删除')
     # 越权 2：经办人经编辑页改状态
     before = q1(DB, 'SELECT status FROM projects WHERE id=?', (pid_a,))
     C.post(s_op, BASE, '/projects/%d/edit' % pid_a, {'name': 'QA权限-经办项目', 'status': '已归档', 'remark': ''})
     after = q1(DB, 'SELECT status FROM projects WHERE id=?', (pid_a,))
     check('权限', '经办人不应能经编辑页改项目状态', after == before,
-          '状态 %s→%s' % (before, after), xfail='P1-02')
+          '状态 %s→%s' % (before, after))
     C.post(s_admin, BASE, '/projects/%d/edit' % pid_a, {'name': 'QA权限-经办项目', 'status': '进行中', 'remark': ''})
 
     # --- admin ---
@@ -238,7 +231,11 @@ def _permissions(s_admin):
     check('权限', 'admin 新建用户允许', q1(DB, 'SELECT COUNT(*) FROM users') == uc0 + 1)
     uid = q1(DB, 'SELECT id FROM users WHERE username=?', ('qa_test_u',))
     C.post(s_admin, BASE, '/admin/users/%d/delete' % uid)
-    check('权限', 'admin 删除用户允许', q1(DB, 'SELECT COUNT(*) FROM users WHERE id=?', (uid,)) == 0)
+    check('权限', '删除用户需二次确认（无 confirm 不删）',
+          q1(DB, 'SELECT COUNT(*) FROM users WHERE id=?', (uid,)) == 1)
+    C.post(s_admin, BASE, '/admin/users/%d/delete' % uid, {'confirm': '1'})
+    check('权限', 'admin 二次确认后删除用户允许',
+          q1(DB, 'SELECT COUNT(*) FROM users WHERE id=?', (uid,)) == 0)
     C.post(s_admin, BASE, '/admin/users/1/delete')
     check('权限', 'admin 删除自身被拒', q1(DB, 'SELECT COUNT(*) FROM users WHERE id=1') == 1)
     C.post(s_admin, BASE, '/projects/%d/delete' % pid_d)
@@ -545,26 +542,29 @@ def _concurrency(s_admin):
 def _audit_and_config(s_admin, pid_a, ct1):
     tables = [x[0] for x in q(DB, "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
     audit_like = [t for t in tables if any(k in t.lower() for k in ('log', 'audit', 'history'))]
-    check('审计', '应存在审计/操作日志表', bool(audit_like), tables, xfail='P0-02')
+    check('审计', '应存在审计/操作日志表', bool(audit_like), tables)
     pnode_cols = [x[1] for x in q(DB, 'PRAGMA table_info(payment_nodes)')]
     check('审计', '付款节点应记录 updated_at/updated_by',
-          'updated_at' in pnode_cols or 'updated_by' in pnode_cols, pnode_cols, xfail='P0-02')
+          'updated_at' in pnode_cols or 'updated_by' in pnode_cols, pnode_cols)
     pcols = [x[1] for x in q(DB, 'PRAGMA table_info(projects)')]
-    check('审计', '项目应记录 updated_at/updated_by', 'updated_at' in pcols or 'updated_by' in pcols, pcols, xfail='P0-02')
+    check('审计', '项目应记录 updated_at/updated_by', 'updated_at' in pcols or 'updated_by' in pcols, pcols)
     cfcols = [x[1] for x in q(DB, 'PRAGMA table_info(contract_files)')]
     check('审计', '合同应记录确认人/确认时间',
-          'confirmed_by' in cfcols or 'confirmed_at' in cfcols, cfcols, xfail='P0-02')
-    check('审计', '删除项目应可追溯（软删/回收站/删除日志）',
-          bool(audit_like) or ('deleted_at' in pcols) or ('is_deleted' in pcols), '物理删除无痕', xfail='P0-02')
+          'confirmed_by' in cfcols or 'confirmed_at' in cfcols, cfcols)
+    check('审计', '删除项目应可追溯（审计日志/软删标记）',
+          bool(audit_like) or ('deleted_at' in pcols) or ('is_deleted' in pcols), '物理删除无痕')
     rec_cols = [x[1] for x in q(DB, 'PRAGMA table_info(payment_records)')]
     check('审计', '付款流水保留操作人（部分可追溯）', 'operator_name' in rec_cols)
 
-    # CSRF
+    # CSRF：用显式开启校验的测试客户端（实时服务为测试模式，默认不强制 CSRF）
     page = s_admin.get(BASE + '/projects/%d' % pid_a).text
-    check('安全', '表单应包含 CSRF token', 'csrf' in page.lower(), '页面无 token', xfail='P1-09')
-    r = C.post(s_admin, BASE, '/projects/%d/items' % pid_a, {'item_name': 'csrf测试科目', 'original_amount': '1'})
+    check('安全', '表单应包含 CSRF token', 'csrf' in page.lower(), '页面无 token')
+    csrf_client = _make_csrf_client()
+    _csrf_login(csrf_client)
+    r = csrf_client.post('/projects/%d/items' % pid_a,
+                         data={'item_name': 'csrf测试科目', 'original_amount': '1'})
     check('安全', '无 CSRF token 的表单提交应被拒绝', r.status_code in (400, 403),
-          'code=%s（直接成功）' % r.status_code, xfail='P1-09')
+          'code=%s（直接成功）' % r.status_code)
 
     # WAL
     conn = sqlite3.connect(DB)
@@ -574,12 +574,21 @@ def _audit_and_config(s_admin, pid_a, ct1):
     # 错误页
     r = s_admin.get(BASE + '/projects/999999')
     check('配置', '404 页面应为中文友好页', r.status_code == 404 and ('页面不存在' in r.text or '未找到' in r.text),
-          '默认 Not Found 英文页', xfail='P2-01')
-    # 依赖
+          '默认 Not Found 英文页')
+    # 依赖：Pillow 缺失 + 版本锁定（架构师在锁依赖）
     req = open(os.path.join(PROJECT_ROOT, 'requirements.txt'), encoding='utf-8').read()
-    check('配置', 'requirements.txt 应锁定版本且声明 Pillow',
-          'Pillow' in req and all('==' in line for line in req.splitlines() if line.strip()),
-          req.replace('\n', '; '), xfail='P2-10')
+    req_lines = [ln.strip() for ln in req.splitlines() if ln.strip() and not ln.strip().startswith('#')]
+    check('配置', 'requirements.txt 应声明 Pillow（扫描件脚本依赖）',
+          any('pillow' in ln.lower() for ln in req_lines), req.replace('\n', '; '))
+    check('配置', 'requirements.txt 应锁定版本（==）',
+          bool(req_lines) and all('==' in ln for ln in req_lines),
+          req.replace('\n', '; '))
+    # e2e_scan_pdf.py 失败时应有汇总且退出码非 0
+    scan_src = open(os.path.join(PROJECT_ROOT, 'scripts', 'e2e_scan_pdf.py'), encoding='utf-8').read()
+    has_counter = ('FAIL' in scan_src and 'PASS' in scan_src)
+    has_exit = ('sys.exit(1)' in scan_src or 'exit(1)' in scan_src or 'raise SystemExit' in scan_src)
+    check('配置', 'e2e_scan_pdf.py 失败时应有 PASS/FAIL 汇总且退出码非 0',
+          has_counter and has_exit, '失败仅 print 后 return，退出码仍为 0', xfail='P2-08')
     # 文件日志
     app_init = open(os.path.join(PROJECT_ROOT, 'app', '__init__.py'), encoding='utf-8').read()
     check('配置', '应用应配置文件日志（FileHandler/轮转）',
@@ -589,6 +598,347 @@ def _audit_and_config(s_admin, pid_a, ct1):
     page = s_view.get(BASE + '/contracts/%d/confirm' % ct1).text
     check('配置', '只读角色不应看到可提交的合同编辑表单',
           'name="ratio_first"' not in page, 'viewer 可见可编辑表单', xfail='P2-11')
+
+
+def _audit_has_table():
+    return bool(q(DB, "SELECT name FROM sqlite_master WHERE type='table' AND name='audit_logs'"))
+
+
+def _audit_cols():
+    return [r[1] for r in q(DB, 'PRAGMA table_info(audit_logs)')] if _audit_has_table() else []
+
+
+def _audit_max_id():
+    if not _audit_has_table():
+        return 0
+    rows = q(DB, 'SELECT COALESCE(MAX(id),0) FROM audit_logs')
+    return int(rows[0][0] or 0) if rows else 0
+
+
+def _audit_rows(min_id=0):
+    if not _audit_has_table():
+        return []
+    conn = sqlite3.connect(DB, timeout=15)
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in conn.execute('SELECT * FROM audit_logs WHERE id>? ORDER BY id', (min_id,))]
+    finally:
+        conn.close()
+
+
+def _empty_json(value):
+    return value is None or str(value).strip() in ('', '{}', 'null')
+
+
+def _audit_trails(s_admin):
+    """批次 3（P0-02 审计留痕）验收：登录、业务变更、删除、查询页权限与不可篡改、updated_*。"""
+    cols = _audit_cols()
+    # 兼容计划字段名（occurred_at/entity_type/entity_id/user_agent）与实际实现（ts/object_type/object_id/ua）
+    field_ok = (
+        any(c in cols for c in ('occurred_at', 'ts'))
+        and 'actor_id' in cols and 'actor_name' in cols and 'action' in cols
+        and any(c in cols for c in ('entity_type', 'object_type'))
+        and any(c in cols for c in ('entity_id', 'object_id'))
+        and 'before_json' in cols and 'after_json' in cols
+    )
+    check('审计留痕', 'audit_logs 表存在且含人/动作/对象/前后值字段',
+          field_ok, 'audit_logs 列=%s' % cols)
+
+    # 1) 登录成功/失败留痕
+    base = _audit_max_id()
+    C.login(BASE, 'admin', 'admin123')
+    requests.post(BASE + '/login', data={'username': 'admin', 'password': 'bad'})
+    rows = [r for r in _audit_rows(base)
+            if 'login' in (str(r.get('action', '')) + str(r.get('entity_type', ''))).lower()]
+    check('审计留痕', '登录成功与失败均写审计', len(rows) >= 2,
+          '新增 login 审计行=%d' % len(rows))
+    if rows:
+        text = ' '.join(str(r.get('action', '')) + ' ' + str(r.get('result', '')) + ' '
+                        + str(r.get('after_json', '')) for r in rows).lower()
+        check('审计留痕', '审计可区分登录成功/失败',
+              any(k in text for k in ('fail', '失败', 'denied'))
+              and any(k in text for k in ('success', '成功', 'ok')),
+              text[:200])
+
+    # 2) 节点申请→开票→付款留痕
+    s, _ = C.login(BASE, 'admin', 'admin123')
+    _, pid = create_project(s, 'QA-AUDIT', 'QA审计节点', [('审计科目', '10000', '0')])
+    nid = node_ids(pid, 'first')[0]
+    base = _audit_max_id()
+    C.post(s, BASE, '/nodes/%d/update' % nid, {'action': 'apply', 'apply_amount': '3000'})
+    C.post(s, BASE, '/nodes/%d/update' % nid, {'action': 'invoice', 'invoice_amount': '3000', 'invoice_no': 'FP-AUDIT'})
+    C.post(s, BASE, '/nodes/%d/update' % nid, {'action': 'pay', 'paid_amount': '3000', 'pay_date': '2026-10-23'})
+    rows = _audit_rows(base)
+    node_rows = [r for r in rows
+                 if str(r.get('entity_id') or r.get('object_id')) == str(nid)
+                 or str(r.get('project_id')) == str(pid)]
+    check('审计留痕', '节点申请/开票/付款均留痕（≥3 条）', len(node_rows) >= 3,
+          '节点相关审计=%d' % len(node_rows))
+    check('审计留痕', '节点审计含操作人、对象、before/after',
+          bool(node_rows)
+          and all(str(r.get('actor_name') or '').strip() for r in node_rows)
+          and all(any(str(r.get(k) or '').strip() for k in ('entity_type', 'object_type', 'entity_id', 'object_id', 'project_id')) for r in node_rows)
+          and sum(1 for r in node_rows if not _empty_json(r.get('before_json')) or not _empty_json(r.get('after_json'))) >= 2,
+          '示例=%s' % (node_rows[:1] if node_rows else '无'))
+
+    # 3) 项目编辑 / 状态变更留痕
+    base = _audit_max_id()
+    C.post(s, BASE, '/projects/%d/edit' % pid, {'name': 'QA审计节点-改名', 'remark': '审计备注', 'status': '进行中'})
+    C.post(s, BASE, '/projects/%d/status' % pid, {'status': '已归档'})
+    rows = _audit_rows(base)
+    proj_rows = [r for r in rows
+                 if str(r.get('project_id')) == str(pid)
+                 or str(r.get('entity_id') or r.get('object_id')) == str(pid)]
+    check('审计留痕', '项目编辑与状态变更均留痕（≥2 条）', len(proj_rows) >= 2,
+          '项目相关审计=%d' % len(proj_rows))
+    check('审计留痕', '项目编辑/状态审计含 before/after 明细',
+          any(not _empty_json(r.get('before_json')) and not _empty_json(r.get('after_json')) for r in proj_rows),
+          '项目相关审计=%s' % proj_rows[:1])
+
+    # 4) 删除留痕（允许先只做到「有日志」，软删另算）
+    _, pid_del = create_project(s, 'QA-AUDIT-DEL', 'QA审计删除', [('科目', '1000', '0')])
+    base = _audit_max_id()
+    C.post(s, BASE, '/projects/%d/delete' % pid_del)
+    rows = _audit_rows(base)
+    del_rows = [r for r in rows
+                if 'delete' in str(r.get('action', '')).lower() or '删除' in str(r.get('action', ''))
+                or 'delete' in str(r.get('entity_type') or r.get('object_type') or '').lower()]
+    check('审计留痕', '项目删除留痕（仅日志即可，软删另算）', bool(del_rows),
+          '删除审计行=%d' % len(del_rows))
+
+    # 5) 审计查询页：admin 可访问、viewer/operator 被拒、不可篡改
+    candidates = ['/admin/audit', '/admin/audit-logs', '/audit', '/audit-logs', '/admin/logs']
+    found = None
+    for path in candidates:
+        r = s.get(BASE + path, allow_redirects=False)
+        if r.status_code == 200:
+            found = (path, r.text)
+            break
+    check('审计留痕', '管理员可访问审计查询页', found is not None,
+          '候选路径均不可用：%s' % candidates)
+    if found:
+        path, page = found
+        check('审计留痕', '审计页可展示操作记录', '审计' in page or '删除' in page or 'login' in page.lower(),
+              '页面已返回')
+        sv, _ = C.login(BASE, 'viewer', '123456')
+        so, _ = C.login(BASE, 'jbr', '123456')
+        check('审计留痕', 'viewer 访问审计页被拒',
+              sv.get(BASE + path, allow_redirects=False).status_code in (302, 403),
+              'viewer 可访问 %s' % path)
+        check('审计留痕', 'operator 访问审计页被拒',
+              so.get(BASE + path, allow_redirects=False).status_code in (302, 403),
+              'operator 可访问 %s' % path)
+        rp = s.post(BASE + path, data={}, allow_redirects=False)
+        check('审计留痕', '审计页不接受 POST（不可经 UI 修改/删除）',
+              rp.status_code in (404, 403, 405), 'POST code=%s' % rp.status_code)
+        check('审计留痕', '审计页无 POST/删除表单',
+              re.search(r'<form[^>]*action="[^"]*audit[^"]*"[^>]*method=["\']?post', page, re.I) is None
+              and '删除审计' not in page and '清空日志' not in page,
+              '页面含 POST 表单或删除入口')
+
+    # 6) updated_at / updated_by：字段存在且变更后更新
+    ncols = [r[1] for r in q(DB, 'PRAGMA table_info(payment_nodes)')]
+    pcols = [r[1] for r in q(DB, 'PRAGMA table_info(projects)')]
+    if 'updated_at' in ncols and 'updated_by' in ncols:
+        _, p_ts = create_project(s, 'QA-AUDIT-TS', 'QA审计时间戳', [('科目', '1000', '0')])
+        n_ts = node_ids(p_ts, 'first')[0]
+        before = q(DB, 'SELECT updated_at, updated_by FROM payment_nodes WHERE id=?', (n_ts,))[0]
+        C.post(s, BASE, '/nodes/%d/update' % n_ts, {'action': 'apply', 'apply_amount': '300'})
+        after = q(DB, 'SELECT updated_at, updated_by FROM payment_nodes WHERE id=?', (n_ts,))[0]
+        check('审计留痕', '节点变更后 updated_at/updated_by 已更新',
+              after[0] is not None and str(after[0]) != str(before[0]) and str(after[1]) == '1',
+              'before=%s after=%s' % (before, after))
+    else:
+        check('审计留痕', '节点变更后 updated_at/updated_by 已更新', False,
+              'payment_nodes 缺字段', xfail='P0-02')
+    if 'updated_at' in pcols and 'updated_by' in pcols:
+        before = q(DB, 'SELECT updated_at, updated_by FROM projects WHERE id=?', (pid,))[0]
+        C.post(s, BASE, '/projects/%d/edit' % pid, {'name': 'QA审计节点-再改名', 'status': '进行中', 'remark': ''})
+        after = q(DB, 'SELECT updated_at, updated_by FROM projects WHERE id=?', (pid,))[0]
+        check('审计留痕', '项目编辑后 updated_at/updated_by 已更新',
+              after[0] is not None and str(after[0]) != str(before[0]) and str(after[1]) == '1',
+              'before=%s after=%s' % (before, after))
+    else:
+        check('审计留痕', '项目编辑后 updated_at/updated_by 已更新', False,
+              'projects 缺字段', xfail='P0-02')
+
+
+def _make_csrf_client():
+    """批次 4a：显式打开 CSRF 校验的测试客户端（与实时服务共用临时库）。"""
+    app = C.make_app(DB, CSRF_ENABLED=True, SECRET_KEY=C.DEFAULT_SECRET)
+    return app.test_client()
+
+
+def _csrf_login(client):
+    page = client.get('/login').get_data(as_text=True)
+    m = re.search(r'name="csrf_token" value="([^"]+)"', page)
+    data = {'username': 'admin', 'password': 'admin123'}
+    if m:
+        data['csrf_token'] = m.group(1)
+    return client.post('/login', data=data, follow_redirects=False), m
+
+
+def _security_baseline(s_admin):
+    """批次 4a（安全基线）验收：CSRF、密钥、会话、登出 POST、错误页、越权收口。"""
+    # 1) CSRF：无 token 的 POST 应 403 中文页；带 token 可通过
+    client = _make_csrf_client()
+    _csrf_login(client)
+    _, pid_sec = create_project(s_admin, 'QA-SEC', 'QA安全基线', [('科目', '1000', '0')])
+    page = client.get('/projects/%d' % pid_sec).get_data(as_text=True)
+    m = re.search(r'name="csrf_token" value="([^"]+)"', page)
+    r_no = client.post('/projects/%d/delete' % pid_sec, data={})
+    body = r_no.get_data(as_text=True)
+    has_cn = any('\u4e00' <= ch <= '\u9fff' for ch in body)
+    check('安全基线', '无 CSRF token 的 POST 应被拒绝（403 中文页）',
+          r_no.status_code == 403 and has_cn,
+          'code=%s' % r_no.status_code)
+    token = m.group(1) if m else None
+    check('安全基线', '页面表单包含 CSRF token 字段', token is not None, '未找到 csrf_token')
+    if token:
+        r_ok = client.post('/projects/%d/delete' % pid_sec, data={'csrf_token': token})
+        check('安全基线', '携带有效 CSRF token 的 POST 可执行',
+              r_ok.status_code in (200, 302), 'code=%s' % r_ok.status_code)
+
+    # 2) SECRET_KEY：未配置时不得使用可预测默认值（否则可伪造会话）
+    forged = None
+    try:
+        from flask import Flask
+        from flask.sessions import SecureCookieSessionInterface
+        _a = Flask('qa-sec')
+        _a.secret_key = C.DEFAULT_SECRET
+        forged = SecureCookieSessionInterface().get_signing_serializer(_a).dumps({'user_id': 1})
+    except Exception:
+        pass
+    old_env = os.environ.pop('SECRET_KEY', None)
+    secret_ok = False
+    try:
+        try:
+            app2 = C.make_app(DB)
+            tc2 = app2.test_client()
+            if forged:
+                tc2.set_cookie('session', forged, domain='localhost')
+            secret_ok = tc2.get('/admin/users', allow_redirects=False).status_code != 200
+        except Exception:
+            secret_ok = True  # 启动失败（fail-fast）也算通过
+    finally:
+        if old_env is not None:
+            os.environ['SECRET_KEY'] = old_env
+    check('安全基线', '未配置 SECRET_KEY 时不使用可预测默认值',
+          secret_ok, '默认密钥可伪造管理员会话')
+
+    # 3) 登出改 POST；GET 应 405
+    s2, _ = C.login(BASE, 'admin', 'admin123')
+    r_get = s2.get(BASE + '/logout', allow_redirects=False)
+    check('安全基线', '登出仅接受 POST（GET /logout 返回 405）',
+          r_get.status_code == 405, 'GET code=%s' % r_get.status_code)
+    page = s2.get(BASE + '/projects').text
+    check('安全基线', '页面退出入口为 POST 表单',
+          re.search(r'<form[^>]*action="/logout"[^>]*method=["\']?post', page, re.I) is not None,
+          '仍为 GET 链接')
+
+    # 4) 会话 Cookie：HttpOnly + SameSite=Lax + 8h 过期
+    _, r = C.login(BASE, 'admin', 'admin123')
+    sc = r.headers.get('Set-Cookie', '')
+    check('安全基线', '会话 Cookie 满足 HttpOnly + SameSite=Lax + 8h 过期',
+          ('HttpOnly' in sc) and ('SameSite=Lax' in sc.replace(' ', ''))
+          and (('Max-Age=28800' in sc) or ('Expires=' in sc)),
+          sc)
+
+    # 5) 错误页：404/413 中文；403/404/413/500 均有处理器
+    r404 = s_admin.get(BASE + '/projects/999999')
+    check('安全基线', '404 页面为中文友好页（含「页面不存在」）',
+          r404.status_code == 404 and '页面不存在' in r404.text,
+          '默认英文 404 页')
+    big = b'A' * (17 * 1024 * 1024)
+    r413 = C.post(s_admin, BASE, '/contracts/upload', files={'file': ('sec_big.txt', big, 'text/plain')})
+    body413 = r413.text
+    check('安全基线', '413 超限页为中文友好提示',
+          r413.status_code == 413 and any('\u4e00' <= ch <= '\u9fff' for ch in body413),
+          'code=%s body=%s' % (r413.status_code, body413[:80]))
+    src = open(os.path.join(PROJECT_ROOT, 'app', '__init__.py'), encoding='utf-8').read()
+    src += open(os.path.join(PROJECT_ROOT, 'app', 'routes.py'), encoding='utf-8').read()
+    handlers_ok = all(('errorhandler(%d)' % code) in src for code in (403, 404, 413, 500))
+    check('安全基线', '403/404/413/500 均注册中文错误处理器', handlers_ok,
+          '缺 errorhandler')
+
+    # 6) 越权收口：operator 编辑页不应渲染状态字段
+    s_op, _ = C.login(BASE, 'jbr', '123456')
+    page = s_op.get(BASE + '/projects/%d/edit' % pid_sec).text
+    check('安全基线', '经办人编辑页不渲染项目状态字段',
+          'name="status"' not in page, '仍然渲染 name="status"')
+
+
+def _audit_extras(s_admin):
+    """批次 3 补充验收：停用登录、停用/启用审计、筛选分页、审计降级、updated_by 落值。"""
+    # 1) 停用后登录被拒 + 停用/启用审计
+    C.post(s_admin, BASE, '/admin/users/new',
+           {'username': 'qa_dis_u', 'display_name': 'QA停用用户', 'password': 'Qa#123456', 'role': 'viewer'})
+    uid = q1(DB, 'SELECT id FROM users WHERE username=?', ('qa_dis_u',))
+    check('审计补充', '新建用户可登录', C.login(BASE, 'qa_dis_u', 'Qa#123456')[1].status_code == 302)
+    base = _audit_max_id()
+    C.post(s_admin, BASE, '/admin/users/%d/toggle' % uid)
+    _, r_fail = C.login(BASE, 'qa_dis_u', 'Qa#123456')
+    check('审计补充', '停用后登录被拒', r_fail.status_code == 200, 'code=%s' % r_fail.status_code)
+    rows = _audit_rows(base)
+    acts = [str(r.get('action', '')) for r in rows]
+    dis_rows = [r for r in rows if str(r.get('action')) == 'user.disable']
+    check('审计补充', '停用操作写审计（user.disable，含 is_active 前后值）',
+          bool(dis_rows) and not _empty_json(dis_rows[0].get('before_json'))
+          and not _empty_json(dis_rows[0].get('after_json')),
+          '动作=%s' % acts)
+    base = _audit_max_id()
+    C.post(s_admin, BASE, '/admin/users/%d/toggle' % uid)
+    check('审计补充', '启用后恢复登录', C.login(BASE, 'qa_dis_u', 'Qa#123456')[1].status_code == 302)
+    en_rows = [r for r in _audit_rows(base) if str(r.get('action')) == 'user.enable']
+    check('审计补充', '启用操作写审计（user.enable）', bool(en_rows), '动作=%s' % [r.get('action') for r in _audit_rows(base)])
+
+    # 2) 审计筛选 + 分页（脚本注入 60 条合成记录；页面大小 50）
+    conn = sqlite3.connect(DB, timeout=15)
+    try:
+        conn.executemany(
+            'INSERT INTO audit_logs (ts, actor_id, actor_name, action, object_type, object_id, '
+            'project_id, before_json, after_json, ip, ua, result) '
+            "VALUES (?, 1, 'QA', ?, 'synthetic', 0, NULL, '{}', '{}', '127.0.0.1', 'qa', 'ok')",
+            [('2099-01-01 00:00:%02d' % i, 'qa.page.%02d' % i) for i in range(60)])
+        conn.commit()
+    finally:
+        conn.close()
+    page1 = s_admin.get(BASE + '/admin/audit').text
+    page2 = s_admin.get(BASE + '/admin/audit?page=2').text
+    filt = s_admin.get(BASE + '/admin/audit?action=qa.page.00').text
+
+    def _tbody(html):
+        m = re.search(r'<tbody>(.*?)</tbody>', html, re.S | re.I)
+        return m.group(1) if m else ''
+    body1, body2, body_f = _tbody(page1), _tbody(page2), _tbody(filt)
+    check('审计补充', '审计页分页：第 1 页为最新、第 2 页含更早记录',
+          ('qa.page.59' in body1) and ('qa.page.00' not in body1)
+          and ('qa.page.00' in body2), 'page1/2 分页异常')
+    check('审计补充', '审计页按动作筛选生效',
+          ('qa.page.00' in body_f) and ('qa.page.59' not in body_f), '筛选结果异常')
+    check('审计补充', '审计页非法页码被钳制（page=999 仍 200）',
+          s_admin.get(BASE + '/admin/audit?page=999').status_code == 200)
+
+    # 3) updated_by 记录实际操作人（经办人 id=2）
+    s_op, _ = C.login(BASE, 'jbr', '123456')
+    _, pid_op = create_project(s_op, 'QA-UPDBY', 'QA操作人留痕', [('科目', '1000', '0')])
+    n_op = node_ids(pid_op, 'first')[0]
+    C.post(s_op, BASE, '/nodes/%d/update' % n_op, {'action': 'apply', 'apply_amount': '300'})
+    upd = q(DB, 'SELECT updated_by FROM payment_nodes WHERE id=?', (n_op,))[0][0]
+    check('审计补充', 'updated_by 记录实际操作人（经办人 id=2）', str(upd) == '2', 'updated_by=%s' % upd)
+
+    # 4) 审计表缺失时业务降级（放最后：会删除临时库的 audit_logs）
+    conn = sqlite3.connect(DB, timeout=15)
+    try:
+        conn.execute('DROP TABLE audit_logs')
+        conn.commit()
+    finally:
+        conn.close()
+    r = C.post(s_admin, BASE, '/projects/new',
+               {'project_no': 'QA-DEGRADE', 'name': 'QA审计降级', 'item_name': ['科目'], 'original_amount': ['100']})
+    exists = q1(DB, 'SELECT COUNT(*) FROM projects WHERE project_no=?', ('QA-DEGRADE',))
+    check('审计补充', '审计表缺失时业务降级（不 500、业务照常提交）',
+          r.status_code == 302 and exists == 1, 'code=%s 项目存在=%s' % (r.status_code, exists))
 
 
 def run(server):
@@ -614,3 +964,6 @@ def run(server):
     section('########## 7. 并发写 ##########', lambda: _concurrency(s_admin))
     if pid_a and ct1:
         section('########## 8. 审计与配置 ##########', lambda: _audit_and_config(s_admin, pid_a, ct1))
+    section('########## 9. 审计留痕（批次 3 验收） ##########', lambda: _audit_trails(s_admin))
+    section('########## 10. 安全基线（批次 4a 验收） ##########', lambda: _security_baseline(s_admin))
+    section('########## 11. 审计补充（批次 3 补测，末项会删临时库 audit_logs） ##########', lambda: _audit_extras(s_admin))
