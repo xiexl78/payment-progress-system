@@ -64,7 +64,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\backup.ps1 -SkipCode
 
 ## 3. 计划任务与告警
 
-见 [`deploy.md`](deploy.md) 第 8 节的 `schtasks` 命令（每日 12:30、18:30，SYSTEM 运行）。建议再增加外部巡检：每日读取最新 `daily\` 时间戳，超过 26 小时无新备份即告警；备份脚本非零退出码写入事件日志（可在计划任务后追加 `if ($LASTEXITCODE -ne 0) { Write-EventLog ... }` 包装脚本）。
+见 [`deploy.md`](deploy.md) 第 8 节的 `schtasks` 命令（每日 12:30、18:30，SYSTEM 运行，必须带 `-PythonExe <venv python>`）。建议再增加外部巡检：每日读取最新 `daily\` 时间戳，超过 26 小时无新备份即告警；备份脚本非零退出码写入事件日志（可在计划任务后追加 `if ($LASTEXITCODE -ne 0) { Write-EventLog ... }` 包装脚本）。
 
 ## 4. 恢复用法
 
@@ -75,18 +75,25 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\backup.ps1 -SkipCode
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\restore.ps1 `
   -BackupPath E:\PSBackup\daily\20261022-164947 -TargetDir X -VerifyOnly
 
-# 第 2 步：先恢复到临时目录做演练/核对
+# 第 2 步：先恢复到临时目录做演练/核对（Python 用目标机 venv）
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\restore.ps1 `
-  -BackupPath E:\PSBackup\daily\20261022-164947 -TargetDir D:\RestoreTest
-python scripts\verify_restored.py --db D:\RestoreTest\payment_progress.db
+  -BackupPath E:\PSBackup\daily\20261022-164947 -TargetDir D:\RestoreTest `
+  -PythonExe C:\Apps\payment-progress-system\.venv\Scripts\python.exe
+C:\Apps\payment-progress-system\.venv\Scripts\python.exe scripts\verify_restored.py --db D:\RestoreTest\payment_progress.db
 
 # 第 3 步：确认无误后恢复到在线数据目录（会把现场移到 .pre-restore-*，不直接删）
 Stop-Service PaymentSystem
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\restore.ps1 `
-  -BackupPath E:\PSBackup\daily\20261022-164947 -TargetDir C:\ProgramData\PaymentSystem\data -Force
-python scripts\verify_restored.py --db C:\ProgramData\PaymentSystem\data\payment_progress.db
+  -BackupPath E:\PSBackup\daily\20261022-164947 -TargetDir C:\ProgramData\PaymentSystem\data -Force `
+  -PythonExe C:\Apps\payment-progress-system\.venv\Scripts\python.exe
+C:\Apps\payment-progress-system\.venv\Scripts\python.exe scripts\verify_restored.py --db C:\ProgramData\PaymentSystem\data\payment_progress.db
 Start-Service PaymentSystem
 ```
+
+注意：
+- 备份/恢复脚本都支持 `-PythonExe`，目标机请显式指向 venv（SYSTEM 计划任务/服务环境里通常没有系统 Python）。
+- `verify_restored.py` 会自动从登录页读取 CSRF token 再提交登录（批次 4 起启用 CSRF）；若环境变量里设置了 `SECRET_KEY`（生产模式），也能正常校验。
+- 演练实测：`verify_restored.py` 9/9 通过；详见 [`deploy-drill.md`](deploy-drill.md)。
 
 恢复脚本行为：
 1. 校验 `backup.json` + `manifest.sha256`（任何文件被改/缺失 → 拒绝恢复，退出码 1）；

@@ -1,9 +1,10 @@
 # 部署手册（内网 Windows 单机 / 小服务器）
 
-- 版本：v1.0（2026-10-23）
+- 版本：v1.1（2026-10-23，已按部署演练修正）
 - 适用：单位内网，Windows 10/11 单机或 Windows Server 2019/2022，并发 5~20 人
-- 配套：[`backup-restore.md`](backup-restore.md)（备份恢复）、[`config.md`](config.md)（配置外置清单）
-- 前置依赖：**批次 4（安全基线 + 配置外置）完成前，本文中「数据目录外置」「启动自检」「/healthz」尚不能完全落地**；批次 4 前只能在开发目录内试运行，不得作为正式上线依据。
+- 配套：[`backup-restore.md`](backup-restore.md)（备份恢复）、[`config.md`](config.md)（配置外置清单）、[`deploy-drill.md`](deploy-drill.md)（本机部署演练记录与坑）
+- 状态：批次 4（安全基线）/批次 5（配置外置、启动自检、`/healthz`）已完成，本文步骤均已在隔离环境演练（见 `deploy-drill.md`）。
+- 注意：`requirements*.txt` **必须是纯 ASCII**（可含 BOM）。中文 Windows 下 pip 会把无 BOM 的 UTF-8 注释按 cp936 解码并报 `UnicodeDecodeError`（演练实测）。
 
 ## 1. 部署形态
 
@@ -41,12 +42,17 @@
    cd C:\Apps\payment-progress-system
    python -m venv .venv
    .\.venv\Scripts\python.exe -m pip install --upgrade pip
-   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+   # 首选按完整闭包安装（不含 waitress，见下）
+   .\.venv\Scripts\python.exe -m pip install -r requirements-lock.txt
    .\.venv\Scripts\python.exe -m pip install waitress==3.0.2
    .\.venv\Scripts\python.exe -m pip freeze > C:\ProgramData\PaymentSystem\logs\pip-freeze-target.txt
    ```
 
-4. 建数据目录（批次 4 后由配置决定；批次 4 前应用仍写项目内 `instance/`）：
+   - 离线/内网受限环境：先在可联网机器 `pip download -r requirements-lock.txt -d wheelhouse`，拷贝到目标机后
+     `pip install --no-index --find-links wheelhouse -r requirements-lock.txt`（演练环境 PyPI 下载停滞，此项必须提前准备）。
+   - 若只跑应用与 QA、暂不做扫描件识别，可先装 `requirements.txt`（含 PyMuPDF）或按锁文件装核心包；PyMuPDF 带 onnxruntime 等，约占 200MB+ 磁盘。
+
+4. 建数据目录（配置外置已生效：由 `DATA_DIR`/默认 `%ProgramData%\PaymentSystem\data` 决定）：
 
    ```powershell
    New-Item -ItemType Directory -Force C:\ProgramData\PaymentSystem\data, C:\ProgramData\PaymentSystem\backups, C:\ProgramData\PaymentSystem\logs
@@ -107,22 +113,22 @@ $nssm = 'C:\Tools\nssm\nssm.exe'
 | 项 | 做法 |
 | --- | --- |
 | 访问日志 | NSSM 重定向 Waitress 输出，按 10MB 轮转（见第 5 节） |
-| 应用日志 | 批次 4 增加 `logging` + RotatingFileHandler，写 `C:\ProgramData\PaymentSystem\logs\app.log`，保留 90 天 |
-| 健康检查 | 批次 4 增加 `/healthz`（DB 可读 + 数据目录可写 + 版本号）；临时用 `GET /login` 200 判断 |
+| 应用日志 | 目前应用日志输出到 stderr，由 NSSM 重定向并轮转（见第 5 节）；`FileHandler`/按天轮转仍为待办（QA P2-09），上线后以 NSSM 日志为准 |
+| 健康检查 | `/healthz` 已实现：DB 可读返回 200（含 db 路径/状态），不可读返回 503（无需登录）；可接监控探活 |
 | 巡检 | 每日计划任务输出：项目数/付款合计/最近备份时间/磁盘剩余到日志；备份脚本失败返回非零退出码，需接监控或人工查看 |
 | 服务 | NSSM 自动重启；Windows 事件日志记录服务启停 |
 
 ## 8. 计划任务（schtasks）
 
 ```powershell
-schtasks /Create /TN "PaymentSystem\Backup-1230" /TR "powershell -NoProfile -ExecutionPolicy Bypass -File C:\Apps\payment-progress-system\scripts\backup.ps1" /SC DAILY /ST 12:30 /RU "SYSTEM" /RL HIGHEST /F
-schtasks /Create /TN "PaymentSystem\Backup-1830" /TR "powershell -NoProfile -ExecutionPolicy Bypass -File C:\Apps\payment-progress-system\scripts\backup.ps1" /SC DAILY /ST 18:30 /RU "SYSTEM" /RL HIGHEST /F
+schtasks /Create /TN "PaymentSystem\Backup-1230" /TR "powershell -NoProfile -ExecutionPolicy Bypass -File C:\Apps\payment-progress-system\scripts\backup.ps1 -PythonExe C:\Apps\payment-progress-system\.venv\Scripts\python.exe" /SC DAILY /ST 12:30 /RU "SYSTEM" /RL HIGHEST /F
+schtasks /Create /TN "PaymentSystem\Backup-1830" /TR "powershell -NoProfile -ExecutionPolicy Bypass -File C:\Apps\payment-progress-system\scripts\backup.ps1 -PythonExe C:\Apps\payment-progress-system\.venv\Scripts\python.exe" /SC DAILY /ST 18:30 /RU "SYSTEM" /RL HIGHEST /F
 schtasks /Query /TN "PaymentSystem\Backup-1230" /V /FO LIST
 ```
 
-说明：脚本自动读取环境变量（`DATA_DIR`/`PAYMENT_BACKUP_DIR`），服务化后建议在系统环境变量中设置，计划任务以 SYSTEM 运行时同样可见；日志在 `backups\logs\backup-YYYYMMDD.log`。备份细节与恢复演练见 [`backup-restore.md`](backup-restore.md)。
+说明：备份脚本的 `-PythonExe` 必须指到 venv（SYSTEM 账号的 PATH 里通常没有 Python，演练验证过这一点）；脚本自动读取 `DATA_DIR`/`PAYMENT_BACKUP_DIR`（建议设为系统环境变量），日志在 `backups\logs\backup-YYYYMMDD.log`。
 
-## 9. 启动自检（批次 4 落地，上线前必须生效）
+## 9. 启动自检（已实现，上线前必须验证）
 
 启动失败必须**快速失败并写日志**，不允许带病运行：
 
@@ -130,15 +136,17 @@ schtasks /Query /TN "PaymentSystem\Backup-1230" /V /FO LIST
 | --- | --- |
 | `SECRET_KEY` 缺失 / 长度 < 32 / 等于默认值 | **拒绝启动**（否则可伪造会话） |
 | `APP_ENV=production` 且 `DEBUG=True` | **拒绝启动** |
-| `DATA_DIR` 不存在/不可写、DB 文件不可读 | **拒绝启动**，提示初始化或恢复 |
+| `DATA_DIR` 不存在/不可写、DB 文件不存在/整体不可读 | **拒绝启动**，提示初始化或恢复 |
 | `MAX_UPLOAD_MB` 非 1~100 整数 | **拒绝启动** |
-| `LLM_ENABLED=true` 但 `CONTRACT_LLM_*` 不完整 | 拒绝启动或降级并 WARN（二选一，配置文档定稿为拒绝） |
+| `LLM_ENABLED=true` 但 `CONTRACT_LLM_*` 不完整 | 拒绝启动（配置文档定稿为拒绝） |
 | OCR 语言包/引擎不可用 | WARN + 记录；上线验收必须实测扫描件 |
 | 备份目录不存在/不可写、最近备份超过 48h | WARN（由部署验收兜底） |
 
+> 演练发现：**页级损坏**的数据库不一定能让启动失败（`create_app` 的只读探针可能通过），此时 `/healthz` 返回 503，需按备份手册恢复；不要依赖启动自检发现所有损坏。数据库文件**缺失**时会明确 fail-fast（exit 1）。
+
 ## 10. 上线检查表（目标机验收）
 
-- [ ] 依赖安装完成，`pip freeze` 归档；`python tests/run_qa.py` 退出码 0
+- [ ] 依赖安装完成（`pip freeze` 归档）；`tests/run_qa.py` 在 venv 下跑出 **213 项 / PASS 201 / FAIL 0 / XFAIL 12**（退出码 0）。中文 Windows 需设 `PYTHONIOENCODING=utf-8`、`PYTHONUTF8=1`，并保证 `%ProgramData%\PaymentSystem` 可写（或按演练记录设置可写 ProgramData/开发环境变量）
 - [ ] 服务开机自启、重启后自动恢复；`GET /login` 200
 - [ ] HTTPS 可访问，HTTP 自动跳转；仅内网可达 443
 - [ ] 默认账号已改密；`SECRET_KEY` 非默认值；DEBUG 关闭
@@ -164,7 +172,7 @@ schtasks /Query /TN "PaymentSystem\Backup-1230" /V /FO LIST
 | --- | --- |
 | 服务启动即退出 | NSSM 错误日志；配置自检报错；端口 8080 被占 |
 | 保存报 `database is locked` | 是否有长事务（OCR/大数据导入）；备份是否在跑；防病毒是否锁文件；`busy_timeout` 是否生效 |
-| 上传 413 | 文件超过 `MAX_UPLOAD_MB`（当前实现 16MB，README 写 20MB，批次 4 统一） |
+| 上传 413 | 文件超过 `MAX_UPLOAD_MB`（默认 20MB，与 README 一致，可配 1~100） |
 | 图片/扫描件识别失败 | 目标机 OCR 语言包（设置→时间和语言→语言→中文 OCR）；WinRT 错误码 0x80070005 见第 10 节 |
 | 登录后立即掉线 | `SECRET_KEY` 每次重启变化（未外置）；多实例部署 |
 | 页面金额不对 | 是否导入历史数据口径问题；跑一致性自检脚本（阶段 1 交付） |

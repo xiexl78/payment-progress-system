@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """付款进度管理系统 - 恢复后冒烟校验（只读）
 
 用途：从备份恢复数据库后，在不启动正式服务的前提下，用 Flask test client
@@ -18,6 +18,7 @@
 """
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -76,10 +77,20 @@ def main(argv=None):
     check('数据库可查询（projects 表）', project_count >= 0)
     check('存在项目数据', project_count > 0, 'projects=%d' % project_count)
 
-    resp = client.post('/login', data={'username': args.username, 'password': args.password},
-                       follow_redirects=False)
+    # 登录：批次 4 起启用 CSRF，先从登录页抓 token 再提交（表单字段为 csrf_token）
+    login_page = client.get('/login').get_data(as_text=True)
+    token_match = re.search(r'name="csrf_token"[^>]*value="([^"]+)"', login_page)
+    csrf = token_match.group(1) if token_match else ''
+    form = {'username': args.username, 'password': args.password}
+    if csrf:
+        form['csrf_token'] = csrf
+    resp = client.post('/login', data=form, follow_redirects=False)
     login_ok = resp.status_code == 302
-    check('登录成功', login_ok, 'HTTP %s（账号 %s）' % (resp.status_code, args.username))
+    if login_ok and '/change-password' in (resp.headers.get('Location') or ''):
+        check('登录成功（需强制改密）', True, '转 /change-password，页面级冒烟跳过')
+        login_ok = False
+    else:
+        check('登录成功', login_ok, 'HTTP %s（账号 %s）' % (resp.status_code, args.username))
 
     if login_ok:
         resp = client.get('/projects')
@@ -95,7 +106,9 @@ def main(argv=None):
             check('项目详情页 200', resp.status_code == 200, 'HTTP %s' % resp.status_code)
             body = resp.get_data(as_text=True)
             check('项目详情含付款节点区块', '付款节点管理' in body)
-        client.get('/logout')
+        # 登出改为 POST（批次 4），沿用已取得的 CSRF token
+        if csrf:
+            client.post('/logout', data={'csrf_token': csrf})
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     total = len(RESULTS)
@@ -109,3 +122,4 @@ def main(argv=None):
 
 if __name__ == '__main__':
     sys.exit(main())
+
