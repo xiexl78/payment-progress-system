@@ -4,12 +4,21 @@
 用法（在工程根目录执行）：
     python scripts/init_db.py
         仅在库/表不存在时初始化；已有数据不动。
+    python scripts/init_db.py --no-seed
+        生产初始化：只建表结构与账号，不写演示项目（见下方 seed 规则）。
+    python scripts/init_db.py --seed
+        强制写入演示种子项目（即使在生产模式；演示/测试用）。
     python scripts/init_db.py --force
         重建：数据体检 → 在线备份并校验 → 输入库文件名二次确认 → 删除并重建。
     python scripts/init_db.py --force --yes
         非交互重建（计划任务/自动化），仍强制自动备份。
     python scripts/init_db.py --force --no-backup --yes
         显式跳过备份（仅排障用，高危；会打印 WARN）。
+
+演示数据（seed）规则：
+- `--seed` / `--no-seed` 显式指定优先；
+- 未指定时：`APP_ENV=production`（环境变量）默认**不写**演示项目；其余环境默认写入（兼容开发与测试）；
+- 只认环境变量 `APP_ENV`，不读 create_app 配置默认值，避免测试被误判为生产。
 
 安全约定：
 - 备份失败、备份校验失败、-wal 非空（服务可能仍在运行）→ 默认中止，数据库保持原样；
@@ -327,7 +336,25 @@ def parse_args(argv):
                         help='即使 -wal 非空（服务可能在跑）也继续（仅排障）')
     parser.add_argument('--data-dir', default=None, help='数据目录（默认 DATA_DIR 或项目 instance/）')
     parser.add_argument('--backup-dir', default=None, help='备份根目录（默认 <数据目录上级>/backups/pre-reset）')
+    seed_group = parser.add_mutually_exclusive_group()
+    seed_group.add_argument('--no-seed', action='store_true',
+                            help='不创建演示项目（生产初始化用；APP_ENV=production 时默认开启）')
+    seed_group.add_argument('--seed', action='store_true',
+                            help='强制创建演示项目（即使在生产模式；演示/测试用）')
     return parser.parse_args(argv)
+
+
+def resolve_seed(args):
+    """是否写入演示种子项目。
+
+    优先级：--seed / --no-seed 显式指定 > APP_ENV=production 默认不种 > 其余环境默认种。
+    注意：只认 APP_ENV 环境变量，未经 create_app 的配置默认值（避免测试环境被误判为生产）。
+    """
+    if args.seed:
+        return True
+    if args.no_seed:
+        return False
+    return os.environ.get('APP_ENV', '').strip().lower() != 'production'
 
 
 def resolve_data_dir(args):
@@ -341,7 +368,12 @@ def resolve_data_dir(args):
 def build_app(data_dir):
     db_path = os.path.join(data_dir, DB_NAME)
     os.makedirs(data_dir, exist_ok=True)
-    return create_app({'SQLALCHEMY_DATABASE_URI': 'sqlite:///' + db_path.replace('\\', '/')})
+    # 显式配置数据目录，避免 create_app 回退到 %ProgramData% 再做可写校验（初始化只关心 --data-dir）
+    return create_app({
+        'SQLALCHEMY_DATABASE_URI': 'sqlite:///' + db_path.replace('\\', '/'),
+        'DATA_DIR': data_dir,
+        'UPLOAD_DIR': os.path.join(data_dir, 'uploads'),
+    })
 
 
 def main(argv=None):
@@ -354,11 +386,14 @@ def main(argv=None):
     data_dir, db_path = resolve_data_dir(args)
     backup_dir = args.backup_dir or os.environ.get('PAYMENT_BACKUP_DIR') \
         or os.path.join(os.path.dirname(data_dir), 'backups', 'pre-reset')
+    do_seed = resolve_seed(args)
 
     _print('=' * 68)
     _print('付款进度管理系统 · 数据库初始化')
     _print('  数据库 : %s' % db_path)
     _print('  DATA_DIR: %s' % data_dir)
+    _print('  演示数据: %s' % ('写入（种子项目）' if do_seed
+                              else '跳过（--no-seed 或 APP_ENV=production）'))
     if args.force:
         _print('  模式   : --force（删除重建）')
     _print('=' * 68)
@@ -399,7 +434,13 @@ def main(argv=None):
         db.create_all()
         _print('[init] 数据表创建完成')
         seed_users()
-        seed_project()
+        if do_seed:
+            seed_project()
+        else:
+            # 不写演示项目时也要提交账号创建
+            db.session.commit()
+            _print('[init] 已跳过演示项目（--no-seed 或 APP_ENV=production）：'
+                   '只创建表结构与账号，不写入种子项目')
 
     _print('[init] 初始化完成')
     return 0

@@ -58,12 +58,15 @@
    New-Item -ItemType Directory -Force C:\ProgramData\PaymentSystem\data, C:\ProgramData\PaymentSystem\backups, C:\ProgramData\PaymentSystem\logs
    ```
 
-5. 初始化数据库（**仅首次**；会建默认账号，随后立即改密）：
+5. 初始化数据库（**仅首次**；生产用 `--no-seed` 只建表与账号，不写演示项目；随后立即改密）：
 
    ```powershell
    cd C:\Apps\payment-progress-system
-   .\.venv\Scripts\python.exe scripts\init_db.py
+   .\.venv\Scripts\python.exe scripts\init_db.py --no-seed
    ```
+
+   - 不传 `--no-seed` 时：`APP_ENV=production` 环境变量下也默认不写演示项目；开发/测试环境默认写入（兼容测试）；需要演示数据时可显式 `--seed`。
+   - 重置/重建（会先自动备份并要求二次确认）：`scripts\init_db.py --force --yes --no-seed`。
 
 6. 配置环境变量（见 [`config.md`](config.md)），至少设置 `SECRET_KEY`、`DATA_DIR`、`PAYMENT_BACKUP_DIR`。
 7. 首次登录后：修改 admin 密码；创建经办/查看账号；删除/停用不需要的示例账号。
