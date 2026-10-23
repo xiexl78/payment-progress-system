@@ -23,6 +23,9 @@
       <span class="badge {{ 'badge-green' if project.status == '已完成' else 'badge-blue' if project.status == '进行中' else 'badge-gray' }}">{{ project.status }}</span>
       {% if not project.deleted_at and current_user.role in ('admin', 'operator') %}
       <a href="{{ url_for('main.project_edit', project_id=project.id) }}" class="btn btn-outline btn-sm">编辑项目</a>
+      {% if project.status != '已归档' %}
+      <a href="{{ url_for('main.project_contract_change', project_id=project.id) }}" class="btn btn-outline btn-sm">合同变更</a>
+      {% endif %}
       {% endif %}
       <a href="{{ url_for('main.project_export', project_id=project.id) }}" class="btn btn-outline btn-sm">导出 Excel</a>
       {% if not project.deleted_at and current_user.role == 'admin' and project.status != '已归档' %}
@@ -53,6 +56,7 @@
     <div class="info-item"><div class="l">试运行日期</div><div class="v">{{ project.trial_date.strftime('%Y-%m-%d') if project.trial_date else '—' }}</div></div>
     <div class="info-item"><div class="l">验收日期</div><div class="v">{{ project.acceptance_date.strftime('%Y-%m-%d') if project.acceptance_date else '—' }}</div></div>
     <div class="info-item"><div class="l">质保到期</div><div class="v text-warning">{{ project.warranty_due_date.strftime('%Y-%m-%d') if project.warranty_due_date else '—' }}</div></div>
+    <div class="info-item"><div class="l">超付合计</div><div class="v {{ 'text-danger' if overpaid_total and overpaid_total > 0 else '' }}">￥{{ '{:,.2f}'.format(overpaid_total or 0) }}</div></div>
   </div>
   {% if project.remark %}<div class="mt-16 text-muted" style="font-size:13px;">备注：{{ project.remark }}</div>{% endif %}
 </div>
@@ -169,16 +173,23 @@
               <td>{{ n.item_name }}</td>
               <td class="num">￥{{ '{:,.2f}'.format(n.due_amount) }}</td>
               <td class="num">{% if n.invoice_amount > 0 %}￥{{ '{:,.2f}'.format(n.invoice_amount) }}{% else %}—{% endif %}</td>
-              <td class="num">{% if n.paid_amount > 0 %}￥{{ '{:,.2f}'.format(n.paid_amount) }}{% else %}—{% endif %}</td>
+              <td class="num">{% if n.paid_amount > 0 %}￥{{ '{:,.2f}'.format(n.paid_amount) }}{% else %}—{% endif %}
+                {% if n.paid_amount > n.due_amount %}
+                <div class="text-danger" style="font-size:12px;">超付 ￥{{ '{:,.2f}'.format(n.paid_amount - n.due_amount) }}（超付待处理，禁止再付款）</div>
+                {% endif %}
+              </td>
               <td>
-                {% if n.status == '已付款' %}<span class="badge badge-green">已付款</span>
+                {% if n.status == '超付待处理' %}<span class="badge badge-red">超付待处理</span>
+                {% elif n.status == '已付款' %}<span class="badge badge-green">已付款</span>
                 {% elif n.status == '已申请' %}<span class="badge badge-blue">已申请</span>
                 {% elif n.status == '未开票已申请' %}<span class="badge badge-orange">未开票已申请</span>
                 {% else %}<span class="badge badge-gray">未触发</span>{% endif %}
               </td>
               <td>
                 {% if current_user.role in ('admin', 'operator') %}
-                  {% if n.status == '未触发' %}
+                  {% if n.status == '超付待处理' %}
+                    <span class="text-danger" style="font-size:12px;">超付待处理：禁止再付款，需线下处理退款/抵扣</span>
+                  {% elif n.status == '未触发' %}
                     <form method="post" action="{{ url_for('main.node_update', node_id=n.id) }}" class="op-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                       <input type="hidden" name="action" value="apply">

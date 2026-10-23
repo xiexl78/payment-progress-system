@@ -44,7 +44,7 @@ RECORD_HEADERS = ('付款日期', '科目', '节点', '付款金额', '付款方
                   '凭证号', '经办人', '关联申请单号')
 ACCEPTANCE_HEADERS = ('验收日期', '验收人', '结论', '备注', '登记时间')
 REPORT_HEADERS = ('项目名称', '项目编号', '状态', '应付金额', '已开票', '已付金额',
-                  '未付金额', '付款进度(%)')
+                  '未付金额', '超付金额', '付款进度(%)')
 AUDIT_HEADERS = ('时间', '操作人', '角色', '动作', '对象类型', '对象ID',
                  '项目ID', '结果', 'IP', '浏览器', '变更前', '变更后')
 
@@ -332,10 +332,10 @@ def build_reports_workbook(rows, totals, reminders=None):
         (row['project'].name, row['project'].project_no, row['project'].status,
          money_value(row['due']), money_value(row['invoice']),
          money_value(row['paid']), money_value(row['unpaid']),
-         _pct_value(row['progress']))
+         money_value(row.get('overpaid', 0)), _pct_value(row['progress']))
         for row in rows
     ]
-    # 合计列：应付 / 已开票 / 已付 / 未付；进度按已付/应付重算
+    # 合计列：应付 / 已开票 / 已付 / 未付 / 超付；进度按已付/应付重算
     due_total = Decimal(str(totals.get('due', 0) or 0))
     paid_total = Decimal(str(totals.get('paid', 0) or 0))
     invoice_total = Decimal(str(totals.get('invoice', 0) or 0))
@@ -344,9 +344,10 @@ def build_reports_workbook(rows, totals, reminders=None):
     total_row = ('合计', '', '',
                  money_value(due_total), money_value(invoice_total),
                  money_value(paid_total), money_value(totals.get('unpaid', 0)),
+                 money_value(totals.get('overpaid', 0)),
                  _pct_value(progress_total))
     _add_sheet(workbook, '付款台账总览', REPORT_HEADERS, body,
-               money_cols=(4, 5, 6, 7), pct_cols=(8,), total_row=total_row)
+               money_cols=(4, 5, 6, 7, 8), pct_cols=(9,), total_row=total_row)
 
     if reminders:
         reminder_rows = []

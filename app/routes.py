@@ -23,7 +23,8 @@ from .exporter import (audit_csv_bytes, build_project_workbook,
                        workbook_bytes)
 from .models import (db, User, Project, ProjectItem, PaymentNode, PaymentApplication,
                      PaymentRecord, AcceptanceRecord, ContractFile, AuditLog)
-from .money import CENT, MAX_MONEY, ZERO, fmt_money as money_fmt, mul_ratio, sum_money
+from .money import (CENT, MAX_MONEY, ZERO, allocate_tail, fmt_money as money_fmt,
+                    mul_ratio, parse_money, sum_money)
 from .validation import (DEFAULT_ACCOUNT_PASSWORDS, PROJECT_STATUSES, NODE_TYPES,
                          NODE_LABELS, TAX_RATES, ValidationError, parse_amount,
                          parse_date, validate_contract_submission, validate_node_action,
@@ -591,9 +592,16 @@ def project_detail(project_id):
         g['sum_invoice'] += Decimal(node.invoice_amount or 0)
         g['sum_paid'] += Decimal(node.paid_amount or 0)
 
+    # 超付（合同变更后已付 > 新应付）：详情/报表展示，禁止再付款（批次 8）
+    overpaid_total = sum(((Decimal(node.paid_amount or 0)
+                           - Decimal(node.due_amount or 0))
+                          for node in project.nodes
+                          if Decimal(node.paid_amount or 0) > Decimal(node.due_amount or 0)),
+                         ZERO).quantize(CENT)
     acceptances = AcceptanceRecord.query.filter_by(project_id=project.id).order_by(AcceptanceRecord.acceptance_date.desc()).all()
     return render_template('project_detail.html', project=project, node_groups=node_groups,
-                           acceptances=acceptances, templates=NODE_TEMPLATES)
+                           acceptances=acceptances, templates=NODE_TEMPLATES,
+                           overpaid_total=overpaid_total)
 
 
 @bp.route('/projects/<int:project_id>/edit', methods=['GET', 'POST'])
@@ -830,6 +838,13 @@ def node_update(node_id):
 
         elif action == 'pay':
             parsed = validate_node_action(node, 'pay', request.form)
+            if Decimal(node.paid_amount or 0) >= Decimal(node.due_amount or 0):
+                # 合同变更后可能已超付/付清：禁止再付款（批次 8）
+                db.session.rollback()
+                flash('节点「%s」已付 %s、应付 %s，禁止再付款；如需调整请走合同变更'
+                      % (node.node_name, fmt_money(node.paid_amount),
+                         fmt_money(node.due_amount)), 'danger')
+                return redirect(detail_url)
             pay_date = parse_date(request.form.get('pay_date'), field='付款日期') or timeutil.local_today()
             pay_method = (request.form.get('pay_method') or '').strip()
             voucher = (request.form.get('voucher_no') or '').strip()
@@ -1605,6 +1620,381 @@ def contract_raw(contract_id):
     return render_template('contract_raw.html', contract=contract)
 
 
+# ---------- 合同变更（批次 8） ----------
+
+def _change_amount(raw, field, *, allow_negative=False):
+    """合同变更金额解析：增补金额允许负数；原金额不允许负数。"""
+    text = (raw or '').strip()
+    if not text:
+        raise ValidationError('%s：必填' % field)
+    try:
+        value = parse_money(text, allow_negative=allow_negative)
+    except TypeError:
+        raise ValidationError('%s：格式错误' % field)
+    if value is None:
+        raise ValidationError('%s：金额无效（最多两位小数%s）'
+                              % (field, '，允许负数' if allow_negative else '，不能为负'))
+    return value
+
+
+def _split_amount(total, weights):
+    """按权重把 amount 分摊到各科（ROUND_HALF_UP），尾差给最后一项。
+
+    ``weights`` 为 Decimal 列表（非负）；返回与 weights 等长的 Decimal 列表，
+    合计恰好等于 ``total``。最后一项过大时把超出部分从其它项回退。
+    """
+    count = len(weights)
+    if count == 0:
+        return []
+    weight_sum = sum(weights, Decimal('0'))
+    if weight_sum <= 0:
+        weights = [Decimal('1')] * count
+        weight_sum = Decimal(count)
+    parts = [(Decimal(total) * w / weight_sum).quantize(CENT, rounding=ROUND_HALF_UP)
+             for w in weights]
+    residual = (Decimal(total) - sum(parts, Decimal('0'))).quantize(CENT)
+    parts[-1] = (parts[-1] + residual).quantize(CENT)
+    # 负数回退：原金额不允许负数，若最后一项为负则从其它项挪
+    if parts[-1] < 0:
+        need = -parts[-1]
+        parts[-1] = ZERO
+        for index in range(count - 2, -1, -1):
+            if need <= 0:
+                break
+            move = min(parts[index], need)
+            parts[index] -= move
+            need -= move
+        if need > 0:
+            raise ValidationError('金额过小，无法按科目分摊，请调整金额')
+    return parts
+
+
+def _build_contract_change_plan(project, new_original, new_additional):
+    """合同变更计算计划：科目金额分摊 + 4 节点应付重算 + 差异/超付清单。
+
+    - 合同总额（新原金额+新增补金额）按各科目当前占比分摊到科目；
+    - 每个科目的 4 个节点按「科目新总额 × 现有比例」重算，首付款也改为总额基数；
+    - 每个科目内尾差归质保金（保证科目节点合计 = 科目新总额）；
+    - 已开票/已付/流水不动；已付 > 新应付的节点列入超付清单。
+    """
+    new_total = (new_original + new_additional).quantize(CENT)
+    items = list(project.items)
+    if not items:
+        raise ValidationError('项目没有费用科目，无法做合同变更')
+
+    old_originals = [Decimal(item.original_amount or 0) for item in items]
+    old_additionals = [Decimal(item.additional_amount or 0) for item in items]
+    old_totals = [old_originals[i] + old_additionals[i] for i in range(len(items))]
+    old_total = sum(old_totals, Decimal('0')).quantize(CENT)
+    old_original_total = sum(old_originals, Decimal('0')).quantize(CENT)
+
+    # 1) 合同总额按当前科目占比分摊（原总额<=0 时按等分兜底）
+    if old_total > 0:
+        new_totals = _split_amount(new_total, old_totals)
+    else:
+        new_totals = _split_amount(new_total, [Decimal('1')] * len(items))
+
+    # 2) 原金额/增补金额分别按原占比分摊，保证合计与输入一致
+    if old_original_total > 0:
+        new_originals = _split_amount(new_original, old_originals)
+    else:
+        new_originals = _split_amount(new_original, new_totals)
+    new_additionals = [(new_totals[i] - new_originals[i]).quantize(CENT)
+                       for i in range(len(items))]
+
+    # 3) 每个科目 4 节点重算（比例合计须 100%）
+    node_map = {node.node_type: node for node in project.nodes}
+    node_plan = []
+    item_changes = []
+    for index, item in enumerate(items):
+        item_nodes = {node.node_type: node for node in item.nodes}
+        missing = [nt for nt in NODE_TYPES if nt not in item_nodes]
+        if missing:
+            raise ValidationError('科目「%s」付款节点不完整（缺 %s），无法做合同变更'
+                                  % (item.item_name,
+                                     '、'.join(NODE_LABELS[nt] for nt in missing)))
+        ratio_sum = sum((Decimal(item_nodes[nt].ratio or 0) for nt in NODE_TYPES),
+                        Decimal('0'))
+        if abs(ratio_sum - Decimal('1')) > Decimal('0.01'):
+            raise ValidationError('科目「%s」节点比例合计为 %s，应为 100%%，请先修正比例'
+                                  % (item.item_name, _pct_str(ratio_sum)))
+        raw_dues = {nt: mul_ratio(new_totals[index],
+                                  Decimal(item_nodes[nt].ratio or 0))
+                    for nt in NODE_TYPES}
+        try:
+            dues = allocate_tail(raw_dues, new_totals[index])
+        except ValueError as exc:
+            raise ValidationError('科目「%s」尾差归集失败：%s'
+                                  % (item.item_name, exc))
+        for nt in NODE_TYPES:
+            node = item_nodes[nt]
+            paid_now = Decimal(node.paid_amount or 0)
+            new_due = dues[nt]
+            invoice_now = Decimal(node.invoice_amount or 0)
+            if paid_now > new_due:
+                # 超付待处理：标记状态并禁止再付款（批次 8）
+                new_status = '超付待处理'
+            elif node.status == '超付待处理':
+                # 变更后不再超付：恢复由已付/已开票推导的状态
+                new_status = ('已付款' if paid_now > 0
+                              else '已申请' if invoice_now > 0 else '未触发')
+            else:
+                new_status = node.status
+            node_plan.append({
+                'node': node,
+                'item': item,
+                'node_type': nt,
+                'old_due': Decimal(node.due_amount or 0),
+                'new_due': new_due,
+                'ratio': Decimal(node.ratio or 0),
+                'paid': paid_now,
+                'new_status': new_status,
+            })
+        item_changes.append({
+            'item': item,
+            'old_original': old_originals[index],
+            'old_additional': old_additionals[index],
+            'old_total': old_totals[index],
+            'new_original': new_originals[index],
+            'new_additional': new_additionals[index],
+            'new_total': new_totals[index],
+        })
+
+    # 4) 差异清单（合同级 + 科目级）
+    diff_rows = []
+    old_original_sum = sum(old_originals, Decimal('0')).quantize(CENT)
+    old_additional_sum = sum(old_additionals, Decimal('0')).quantize(CENT)
+    for label, old, new in (('原金额合计', old_original_sum, new_original),
+                            ('增补金额合计', old_additional_sum, new_additional),
+                            ('合同总额', old_total, new_total)):
+        if old != new:
+            diff_rows.append({'label': label, 'old': fmt_money(old),
+                              'new': fmt_money(new),
+                              'delta': _signed_money(new - old)})
+    for change in item_changes:
+        item = change['item']
+        if change['old_original'] != change['new_original']:
+            diff_rows.append({
+                'label': '科目「%s」原金额' % item.item_name,
+                'old': fmt_money(change['old_original']),
+                'new': fmt_money(change['new_original']),
+                'delta': _signed_money(change['new_original'] - change['old_original']),
+            })
+        if change['old_additional'] != change['new_additional']:
+            diff_rows.append({
+                'label': '科目「%s」增补金额' % item.item_name,
+                'old': fmt_money(change['old_additional']),
+                'new': fmt_money(change['new_additional']),
+                'delta': _signed_money(change['new_additional']
+                                       - change['old_additional']),
+            })
+
+    # 5) 节点应付差异 + 超付
+    node_rows = []
+    overpaid = []
+    for row in node_plan:
+        delta = (row['new_due'] - row['old_due']).quantize(CENT)
+        if delta != 0:
+            node_rows.append({
+                'label': '%s · %s' % (row['item'].item_name, row['node'].node_name),
+                'old': fmt_money(row['old_due']), 'new': fmt_money(row['new_due']),
+                'delta': _signed_money(delta),
+            })
+        if row['paid'] > row['new_due']:
+            overpaid.append({
+                'node': row['node'],
+                'label': '%s · %s' % (row['item'].item_name, row['node'].node_name),
+                'paid': row['paid'], 'due': row['new_due'],
+                'over': (row['paid'] - row['new_due']).quantize(CENT),
+            })
+    return {'new_total': new_total, 'item_changes': item_changes,
+            'node_plan': node_plan, 'diff_rows': diff_rows,
+            'node_rows': node_rows, 'overpaid': overpaid}
+
+
+def _contract_change_token(project, new_original, new_additional):
+    """差异确认凭据：与项目当前现值/新值绑定，防止旧确认页重复提交。"""
+    item_state = [[format(Decimal(item.original_amount or 0), 'f'),
+                   format(Decimal(item.additional_amount or 0), 'f')]
+                  for item in project.items]
+    payload = {'project_id': project.id, 'items': item_state,
+               'new': [format(new_original, 'f'), format(new_additional, 'f')]}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()
+
+
+def _contract_change_inputs(project):
+    """解析变更输入。
+
+    - 同时提供原金额+增补金额：按「变更后绝对值」处理（页面确认流程）；
+    - 只提供增补金额：按「本次调整额」处理（API/简化用法，测试与批处理用）。
+    """
+    original_raw = (request.form.get('original_amount') or '').strip()
+    additional_raw = (request.form.get('additional_amount') or '').strip()
+    current_original = project.total_original().quantize(CENT)
+    current_additional = project.total_additional().quantize(CENT)
+    if not original_raw and additional_raw:
+        delta = _change_amount(additional_raw, '增补调整额', allow_negative=True)
+        return current_original, (current_additional + delta).quantize(CENT)
+    new_original = (_change_amount(original_raw, '变更后原金额') if original_raw
+                    else current_original)
+    new_additional = (_change_amount(additional_raw, '变更后增补金额',
+                                     allow_negative=True) if additional_raw
+                      else current_additional)
+    return new_original, new_additional
+
+
+def _change_confirm_context(project, new_original, new_additional, plan):
+    return {
+        'project': project,
+        'item': project.items[0] if project.items else None,
+        'stage': 'confirm',
+        'values': {'original_amount': fmt_money(new_original),
+                   'additional_amount': fmt_money(new_additional)},
+        'diff_rows': plan['diff_rows'],
+        'node_rows': plan['node_rows'],
+        'overpaid': plan['overpaid'],
+        'confirm_token': _contract_change_token(project, new_original,
+                                                new_additional),
+    }
+
+
+def _apply_contract_change(project, plan):
+    """应用变更：科目金额 + 各节点应付/状态；保留开票/付款与流水。"""
+    operator_id = _operator_id()
+    before_items = {change['item'].id: {
+        'item_name': change['item'].item_name,
+        'original_amount': format(change['old_original'], 'f'),
+        'additional_amount': format(change['old_additional'], 'f'),
+    } for change in plan['item_changes']}
+    before_nodes = {row['node'].id: {
+        'item': row['item'].item_name, 'node_type': row['node_type'],
+        'due_amount': format(row['old_due'], 'f'),
+        'calc_base': row['node'].calc_base,
+        'status': row['node'].status,
+        'paid_amount': format(row['paid'], 'f'),
+        'invoice_amount': format(Decimal(row['node'].invoice_amount or 0), 'f'),
+    } for row in plan['node_plan']}
+    before = {'items': before_items, 'nodes': before_nodes,
+              'total': format(project.total_amount(), 'f')}
+
+    for change in plan['item_changes']:
+        item = change['item']
+        item.original_amount = change['new_original']
+        item.additional_amount = change['new_additional']
+        item.updated_by = operator_id
+    after_nodes = {}
+    for row in plan['node_plan']:
+        node = row['node']
+        node.due_amount = row['new_due']
+        node.calc_base = 'total'   # 首付款也改为按合同总额
+        node.status = row['new_status']
+        node.updated_by = operator_id
+        after_nodes[node.id] = {
+            'item': row['item'].item_name, 'node_type': row['node_type'],
+            'ratio': format(row['ratio'], 'f'),
+            'due_amount': format(row['new_due'], 'f'),
+            'calc_base': 'total',
+            'status': row['new_status'],
+            'paid_amount': format(row['paid'], 'f'),
+            'invoice_amount': format(Decimal(node.invoice_amount or 0), 'f'),
+            'overpaid': format((row['paid'] - row['new_due']).quantize(CENT), 'f')
+            if row['paid'] > row['new_due'] else '0.00',
+        }
+    project.updated_by = operator_id
+    audit_record('project.contract_change', 'project', project.id, project.id,
+                 before=before,
+                 after={'items': {change['item'].id: {
+                             'item_name': change['item'].item_name,
+                             'original_amount': format(change['new_original'], 'f'),
+                             'additional_amount': format(change['new_additional'], 'f'),
+                         } for change in plan['item_changes']},
+                        'total': format(plan['new_total'], 'f'),
+                        'nodes': after_nodes,
+                        'overpaid_node_ids': [row['node'].id
+                                              for row in plan['overpaid']]},
+                 critical=True)
+    db.session.commit()
+    return plan['new_total'], plan['overpaid']
+
+
+@bp.route('/projects/<int:project_id>/contract-change', methods=['GET', 'POST'])
+@login_required
+@role_required('admin', 'operator')
+def project_contract_change(project_id):
+    """合同变更：按变更后金额重算全部节点应付；已开票/已付/流水保留不动。"""
+    project = _get_project(project_id)
+    guard = _guard_writable_project(project)
+    if guard:
+        return guard
+    items = list(project.items)
+    if not items:
+        flash('项目没有费用科目，无法做合同变更', 'danger')
+        return redirect(url_for('main.project_detail', project_id=project.id))
+    current_values = {
+        'original_amount': fmt_money(project.total_original()),
+        'additional_amount': fmt_money(project.total_additional()),
+    }
+
+    if request.method == 'POST':
+        try:
+            new_original, new_additional = _contract_change_inputs(project)
+            plan = _build_contract_change_plan(project, new_original, new_additional)
+        except ValidationError as exc:
+            for message in exc.errors:
+                flash(message, 'danger')
+            return render_template('contract_change.html', project=project,
+                                   item=items[0], stage='form',
+                                   values=current_values)
+
+        token = _contract_change_token(project, new_original, new_additional)
+        submitted = (request.form.get('confirm_token') or '').strip()
+        if submitted and submitted != token:
+            # 旧确认页/现值已变化：重新出差异清单，不写库
+            return render_template('contract_change.html',
+                                   **_change_confirm_context(
+                                       project, new_original, new_additional, plan))
+
+        new_total, overpaid = _apply_contract_change(project, plan)
+        if overpaid:
+            flash('合同变更已保存：合同总额 %s 元；%d 个节点超付（超付待处理），请线下跟进'
+                  % (fmt_money(new_total), len(overpaid)), 'warning')
+        else:
+            flash('合同变更已保存：合同总额 %s 元，各节点应付已按新总额重算'
+                  % fmt_money(new_total), 'success')
+        return redirect(url_for('main.project_detail', project_id=project.id))
+
+    return render_template('contract_change.html', project=project, item=items[0],
+                           stage='form', values=current_values)
+
+
+@bp.route('/projects/<int:project_id>/contract-change/preview', methods=['POST'])
+@login_required
+@role_required('admin', 'operator')
+def project_contract_change_preview(project_id):
+    """合同变更第一步：只出差异清单 + 二次确认，不写库。"""
+    project = _get_project(project_id)
+    guard = _guard_writable_project(project)
+    if guard:
+        return guard
+    items = list(project.items)
+    if not items:
+        flash('项目没有费用科目，无法做合同变更', 'danger')
+        return redirect(url_for('main.project_detail', project_id=project.id))
+    try:
+        new_original, new_additional = _contract_change_inputs(project)
+        plan = _build_contract_change_plan(project, new_original, new_additional)
+    except ValidationError as exc:
+        for message in exc.errors:
+            flash(message, 'danger')
+        return render_template('contract_change.html', project=project,
+                               item=items[0], stage='form',
+                               values={'original_amount': fmt_money(project.total_original()),
+                                       'additional_amount': fmt_money(project.total_additional())})
+    return render_template('contract_change.html',
+                           **_change_confirm_context(project, new_original,
+                                                     new_additional, plan))
+
+
 # ---------- 报表与提醒 ----------
 
 def _reports_data():
@@ -1617,17 +2007,24 @@ def _reports_data():
         invoice = sum_money(n.invoice_amount for n in p.nodes)
         paid = sum_money(n.paid_amount for n in p.nodes)
         unpaid = (due - paid).quantize(CENT)
+        if unpaid < 0:
+            unpaid = ZERO   # 超付部分单列 overpaid，未付不出现负数
+        overpaid = sum_money(
+            [(Decimal(n.paid_amount or 0) - Decimal(n.due_amount or 0)).quantize(CENT)
+             for n in p.nodes
+             if Decimal(n.paid_amount or 0) > Decimal(n.due_amount or 0)])
         progress = ((paid / due * Decimal('100')).quantize(Decimal('0.1'))
                     if due else ZERO)
         rows.append({
             'project': p, 'due': due, 'invoice': invoice, 'paid': paid,
-            'unpaid': unpaid, 'progress': progress,
+            'unpaid': unpaid, 'progress': progress, 'overpaid': overpaid,
         })
     totals = {
         'due': sum_money(r['due'] for r in rows),
         'invoice': sum_money(r['invoice'] for r in rows),
         'paid': sum_money(r['paid'] for r in rows),
         'unpaid': sum_money(r['unpaid'] for r in rows),
+        'overpaid': sum_money(r['overpaid'] for r in rows),
     }
     # 待办提醒：质保到期、已申请待付款
     today = timeutil.local_today()
@@ -1649,7 +2046,8 @@ def reports():
     _projects, rows, totals, reminders = _reports_data()
     return render_template('reports.html', rows=rows,
                            total_due=totals['due'], total_paid=totals['paid'],
-                           total_unpaid=totals['unpaid'], reminders=reminders)
+                           total_unpaid=totals['unpaid'],
+                           total_overpaid=totals['overpaid'], reminders=reminders)
 
 
 # ---------- 导出（批次 6a） ----------

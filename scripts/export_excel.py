@@ -127,15 +127,23 @@ def _export_reports(app, projects, out_dir):
         invoice = sum_money(n.invoice_amount for n in project.nodes)
         paid = sum_money(n.paid_amount for n in project.nodes)
         unpaid = (due - paid).quantize(CENT)
+        if unpaid < 0:
+            unpaid = ZERO   # 超付单列，未付不为负
+        overpaid = sum_money(
+            [(Decimal(node.paid_amount or 0) - Decimal(node.due_amount or 0)).quantize(CENT)
+             for node in project.nodes
+             if Decimal(node.paid_amount or 0) > Decimal(node.due_amount or 0)])
         progress = ((paid / due * Decimal('100')).quantize(Decimal('0.1'))
                     if due else Decimal('0'))
         rows.append({'project': project, 'due': due, 'invoice': invoice,
-                     'paid': paid, 'unpaid': unpaid, 'progress': progress})
+                     'paid': paid, 'unpaid': unpaid, 'overpaid': overpaid,
+                     'progress': progress})
     totals = {
         'due': sum_money(r['due'] for r in rows),
         'invoice': sum_money(r['invoice'] for r in rows),
         'paid': sum_money(r['paid'] for r in rows),
         'unpaid': sum_money(r['unpaid'] for r in rows),
+        'overpaid': sum_money(r['overpaid'] for r in rows),
     }
     workbook = build_reports_workbook(rows, totals, _report_reminders(projects))
     payload = workbook_bytes(workbook)
