@@ -248,7 +248,7 @@ def _permissions(s_admin):
     check('权限', 'admin 删除项目改为软删除（列表不可见、数据保留）',
           q1(DB, 'SELECT COUNT(*) FROM projects WHERE id=?', (pid_d,)) == 1
           and ('deleted_at' in pcols) and not visible,
-          '物理删除或仍在列表', xfail='P1-01')
+          '物理删除或仍在列表')
     return pid_a, pid_c, ct1
 
 
@@ -348,12 +348,11 @@ def _state_and_money(s_admin, pid_a, pid_c):
     C.post(s_admin, BASE, '/projects/%d/status' % pid_c, {'status': '已归档'})
     C.post(s_admin, BASE, '/projects/%d/status' % pid_c, {'status': '进行中'})
     check('状态', '项目状态不应从已归档回退进行中',
-          q1(DB, 'SELECT status FROM projects WHERE id=?', (pid_c,)) == '已归档', xfail='P1-03')
+          q1(DB, 'SELECT status FROM projects WHERE id=?', (pid_c,)) == '已归档')
     C.post(s_admin, BASE, '/projects/%d/status' % pid_c, {'status': '已归档'})
     nid2 = node_ids(pid_c, 'acceptance')[0]
     C.post(s_admin, BASE, '/nodes/%d/update' % nid2, {'action': 'apply', 'apply_amount': '10'})
-    check('状态', '已归档项目应只读', q1(DB, 'SELECT status FROM payment_nodes WHERE id=?', (nid2,)) != '未开票已申请',
-          xfail='P1-03')
+    check('状态', '已归档项目应只读', q1(DB, 'SELECT status FROM payment_nodes WHERE id=?', (nid2,)) != '未开票已申请')
     C.post(s_admin, BASE, '/projects/%d/status' % pid_c, {'status': '进行中'})
     # 非法状态
     C.post(s_admin, BASE, '/projects/%d/edit' % pid_a, {'name': 'QA权限-经办项目', 'status': '<b>非法状态</b>'})
@@ -767,9 +766,11 @@ def _audit_trails(s_admin):
         check('审计留痕', '节点变更后 updated_at/updated_by 已更新', False,
               'payment_nodes 缺字段', xfail='P0-02')
     if 'updated_at' in pcols and 'updated_by' in pcols:
-        before = q(DB, 'SELECT updated_at, updated_by FROM projects WHERE id=?', (pid,))[0]
-        C.post(s, BASE, '/projects/%d/edit' % pid, {'name': 'QA审计节点-再改名', 'status': '进行中', 'remark': ''})
-        after = q(DB, 'SELECT updated_at, updated_by FROM projects WHERE id=?', (pid,))[0]
+        _, pid_ts = create_project(s_admin, 'QA-AUDIT-PTS', 'QA审计项目时间戳', [('科目', '1000', '0')])
+        before = q(DB, 'SELECT updated_at, updated_by FROM projects WHERE id=?', (pid_ts,))[0]
+        C.post(s_admin, BASE, '/projects/%d/edit' % pid_ts,
+               {'name': 'QA审计项目时间戳-改名', 'status': '进行中', 'remark': ''})
+        after = q(DB, 'SELECT updated_at, updated_by FROM projects WHERE id=?', (pid_ts,))[0]
         check('审计留痕', '项目编辑后 updated_at/updated_by 已更新',
               after[0] is not None and str(after[0]) != str(before[0]) and str(after[1]) == '1',
               'before=%s after=%s' % (before, after))
@@ -1144,8 +1145,7 @@ def _soft_delete_cases(s_admin):
         check('软删除', '删除后列表不可见且数据保留（软删）',
               exists == 1 and deleted_at is not None and 'QA软删项目' not in page
               and nodes_before == nodes_after,
-              'exists=%s deleted_at=%s nodes=%s→%s' % (exists, deleted_at, nodes_before, nodes_after),
-              xfail='P1-01')
+              'exists=%s deleted_at=%s nodes=%s→%s' % (exists, deleted_at, nodes_before, nodes_after))
         page = s_admin.get(BASE + '/reports').text
         check('软删除', '删除后报表不可见', 'QA软删项目' not in page, '报表仍可见')
         trash = s_admin.get(BASE + '/projects?deleted=1', allow_redirects=False)
@@ -1167,6 +1167,25 @@ def _soft_delete_cases(s_admin):
               q1(DB, 'SELECT COUNT(*) FROM projects WHERE id=?', (pid_arch,)) == 1
               and 'QA归档项目' in page)
 
+    # 软删除不解绑合同；对已删除项目的合同回改应被拒
+    _, ct_soft = upload(s_admin, SAMPLE_TXT, '软删合同.txt')
+    if ct_soft:
+        confirm_ct(s_admin, ct_soft, {'project_no': 'QA-SOFT-CT', 'contract_name': '软删合同项目',
+                                      'original_amount': '165000', 'additional_amount': '0', 'tax_rate': '13%',
+                                      'ratio_first': '30', 'ratio_progress': '52', 'ratio_acceptance': '15', 'ratio_warranty': '3'})
+        cpid = q1(DB, 'SELECT id FROM projects WHERE project_no=?', ('QA-SOFT-CT',))
+        if cpid:
+            C.post(s_admin, BASE, '/projects/%d/delete' % cpid)
+            bound = q1(DB, 'SELECT project_id FROM contract_files WHERE id=?', (ct_soft,))
+            check('软删除', '软删除不解绑合同（contract_files.project_id 保持）', bound == cpid, bound)
+            nodes_before = q1(DB, 'SELECT COUNT(*) FROM payment_nodes WHERE project_id=?', (cpid,))
+            confirm_ct(s_admin, ct_soft, {'contract_name': '软删合同项目（改价）', 'original_amount': '100000',
+                                          'additional_amount': '0', 'tax_rate': '13%',
+                                          'ratio_first': '30', 'ratio_progress': '52', 'ratio_acceptance': '15', 'ratio_warranty': '3'})
+            nodes_after = q1(DB, 'SELECT COUNT(*) FROM payment_nodes WHERE project_id=?', (cpid,))
+            check('软删除', '已删除项目的合同回改被拒（节点数不变）', nodes_before == nodes_after,
+                  '%s→%s' % (nodes_before, nodes_after))
+
     # 时间口径：存储统一 UTC；审计 ts 与业务 created_at 差值 <5 分钟
     from datetime import datetime
     conn = sqlite3.connect(DB)
@@ -1187,6 +1206,42 @@ def _soft_delete_cases(s_admin):
         pass
     check('时间口径', '审计 ts 与业务 created_at 存储时区一致（UTC，差值<5 分钟）',
           diff_ok, 'audit=%s created=%s' % (ts, created))
+
+
+
+def _archived_readonly_cases(s_admin):
+    """批次 5：归档项目只读（编辑/收付款/合同回改被拒）。"""
+    s_admin, _ = C.login(BASE, 'admin', 'admin123')
+    _, pid = create_project(s_admin, 'QA-ARCH-RO', 'QA归档只读', [('科目', '10000', '0')])
+    if pid is not None:
+        nid = node_ids(pid, 'first')[0]
+        C.post(s_admin, BASE, '/nodes/%d/update' % nid,
+               {'action': 'apply', 'apply_amount': '3000', 'invoice_no': 'FP-RO', 'invoice_amount': '3000'})
+        C.post(s_admin, BASE, '/projects/%d/status' % pid, {'status': '已归档'})
+        C.post(s_admin, BASE, '/projects/%d/edit' % pid, {'name': 'QA归档只读-改名', 'status': '已归档'})
+        check('归档只读', '归档项目编辑被拒（名称不变）',
+              q1(DB, 'SELECT name FROM projects WHERE id=?', (pid,)) == 'QA归档只读')
+        paid_before = q1(DB, 'SELECT paid_amount FROM payment_nodes WHERE id=?', (nid,))
+        C.post(s_admin, BASE, '/nodes/%d/update' % nid, {'action': 'pay', 'paid_amount': '100'})
+        check('归档只读', '归档项目收付款被拒（金额不变）',
+              q1(DB, 'SELECT paid_amount FROM payment_nodes WHERE id=?', (nid,)) == paid_before)
+
+    # 合同回改：归档后不得修改金额/比例
+    _, ct = upload(s_admin, SAMPLE_TXT, '归档合同.txt')
+    if ct:
+        confirm_ct(s_admin, ct, {'project_no': 'QA-CONF-RO', 'contract_name': '归档回改合同',
+                                 'original_amount': '165000', 'additional_amount': '0', 'tax_rate': '13%',
+                                 'ratio_first': '30', 'ratio_progress': '52', 'ratio_acceptance': '15', 'ratio_warranty': '3'})
+        cpid = q1(DB, 'SELECT id FROM projects WHERE project_no=?', ('QA-CONF-RO',))
+        if cpid:
+            C.post(s_admin, BASE, '/projects/%d/status' % cpid, {'status': '已归档'})
+            due_before = q1(DB, "SELECT due_amount FROM payment_nodes WHERE project_id=? AND node_type='first'", (cpid,))
+            confirm_ct(s_admin, ct, {'contract_name': '归档回改合同（改价）', 'original_amount': '100000',
+                                     'additional_amount': '0', 'tax_rate': '13%',
+                                     'ratio_first': '30', 'ratio_progress': '52', 'ratio_acceptance': '15', 'ratio_warranty': '3'})
+            due_after = q1(DB, "SELECT due_amount FROM payment_nodes WHERE project_id=? AND node_type='first'", (cpid,))
+            check('归档只读', '归档项目合同回改被拒（金额不变）',
+                  due_before == due_after, 'due %s→%s' % (due_before, due_after))
 
 
 def run(server):
@@ -1218,4 +1273,5 @@ def run(server):
     section('########## 11a. 会话失效补充（4b） ##########', lambda: _session_invalidation_cases(s_admin))
     section('########## 11b. 事务语义（审计与业务同事务） ##########', lambda: _tx_semantics(s_admin))
     section('########## 11c. 软删除与时间口径（下一批次验收） ##########', lambda: _soft_delete_cases(s_admin))
+    section('########## 11d. 归档只读（批次 5） ##########', lambda: _archived_readonly_cases(s_admin))
     section('########## 12. 审计补充（批次 3 补测，末项会删临时库 audit_logs） ##########', lambda: _audit_extras(s_admin))

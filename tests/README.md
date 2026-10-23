@@ -22,7 +22,7 @@ python tests/run_qa.py
 
 ## 三、当前基线（2026-10-23）
 
-`python tests/run_qa.py` → **200 项：182 PASS / 0 FAIL / 18 XFAIL / 0 XPASS，退出码 0**。
+`python tests/run_qa.py` → **213 项：201 PASS / 0 FAIL / 12 XFAIL / 0 XPASS，退出码 0**。
 
 状态含义：
 

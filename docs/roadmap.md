@@ -88,7 +88,7 @@
 | 5 备份与部署 | 脚本完成 | `scripts/backup.ps1`、`restore.ps1`、`sqlite_tool.py`、`verify_restored.py` 已落；未接入计划任务与应用启动自检 |
 | 6 导入导出 | 未开始 | 缺 `import_excel.py` / `export_excel.py` |
 
-**QA 回归现状**：`python tests/run_qa.py` → 200 项，182 PASS / 0 FAIL / 18 XFAIL（已知缺陷，按 P0/P1/P2 编号列出），退出码 0。临时库 + 随机端口，不碰 `instance/`。批次 3 审计、4a 安全基线、4b 密码/会话/限速已全部转 PASS；4c 软删除已完成回收站/恢复/审计，列表与报表过滤仍在收尾；剩余 XFAIL 集中在 P0-03 备份恢复、并发丢失更新、部分 P1/P2（增补口径、状态回退、上传上限与 README 不一致等）。
+**QA 回归现状**：`python tests/run_qa.py` → 213 项，201 PASS / 0 FAIL / 12 XFAIL（已知缺陷，按 P0/P1/P2 编号列出），退出码 0。临时库 + 随机端口，不碰 `instance/`。批次 3 审计、4a 安全基线、4b 密码/会话/限速已全部转 PASS；4c 软删除已完成回收站/恢复/审计，列表与报表过滤仍在收尾；剩余 XFAIL 集中在 P0-03 备份恢复、并发丢失更新、部分 P1/P2（增补口径、状态回退、上传上限与 README 不一致等）。
 **已知环境坑**：本机 WinRT 沙箱限制导致图片/扫描件 OCR 不可用（0x80070005），目标机需实测；`e2e_test.py` 非幂等；`e2e_scan_pdf.py` 失败也退出 0。
 **计划外阻断**：2026-10-22 晚起团队模型额度耗尽（QUOTA 402），开发/测试/架构师暂时无法执行，代码与文档均已落盘。
 

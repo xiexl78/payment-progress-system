@@ -53,7 +53,7 @@ def _case_missing_and_corrupt_db(tmp):
     client = app.test_client()
     r = client.post('/login', data={'username': 'admin', 'password': 'admin123'})
     check('恢复', '数据库文件缺失时应可恢复（自愈或友好提示）',
-          r.status_code != 500, '登录直接 %s 默认错误页' % r.status_code, xfail='P0-03')
+          r.status_code != 500, '登录直接 %s 默认错误页' % r.status_code)
     _dispose(app)
 
     corrupt = os.path.join(tmp, 'corrupt.db')
@@ -63,7 +63,7 @@ def _case_missing_and_corrupt_db(tmp):
     client = app.test_client()
     r = client.post('/login', data={'username': 'admin', 'password': 'admin123'})
     check('恢复', '数据库损坏时应可恢复（自愈或友好提示）',
-          r.status_code != 500, '登录直接 %s 默认错误页' % r.status_code, xfail='P0-03')
+          r.status_code != 500, '登录直接 %s 默认错误页' % r.status_code)
     _dispose(app)
 
     # 运行中文件锁保护
@@ -308,6 +308,93 @@ def _case_schema_upgrade(tmp):
         pass
 
 
+
+def _subprocess_app(tmp, env_extra, code='from app import create_app; a = create_app(); print(a.config["MAX_CONTENT_LENGTH"])', pop=('SECRET_KEY', 'PAYMENT_CONFIG_FILE', 'MAX_UPLOAD_MB', 'DATA_DIR')):
+    env = os.environ.copy()
+    for k in pop:
+        env.pop(k, None)
+    env.update(env_extra)
+    out = os.path.join(tmp, 'subproc_out.txt')
+    with open(out, 'w', encoding='utf-8') as f:
+        r = subprocess.run([sys.executable, '-c', code], cwd=PROJECT_ROOT, env=env,
+                           stdout=f, stderr=subprocess.STDOUT, timeout=120)
+    try:
+        text = open(out, encoding='utf-8').read()
+    except Exception:
+        text = ''
+    return r.returncode, text
+
+
+def _case_config_and_health(tmp):
+    print('\n########## 8. 配置优先级 / 启动 fail-fast / 健康检查（批次 5） ##########')
+    dbp = os.path.join(tmp, 'cfg.db')
+    seed_db(dbp)
+
+    # 1) 显式 config 覆盖环境变量（已支持）
+    old = os.environ.get('MAX_UPLOAD_MB')
+    os.environ['MAX_UPLOAD_MB'] = '25'
+    try:
+        app = make_app(dbp, MAX_CONTENT_LENGTH=7 * 1024 * 1024)
+        check('配置', '显式 config 覆盖环境变量',
+              app.config['MAX_CONTENT_LENGTH'] == 7 * 1024 * 1024, app.config['MAX_CONTENT_LENGTH'])
+        _dispose(app)
+    finally:
+        if old is None:
+            os.environ.pop('MAX_UPLOAD_MB', None)
+        else:
+            os.environ['MAX_UPLOAD_MB'] = old
+
+    # 2) 环境变量覆盖默认
+    rc, text = _subprocess_app(tmp, {'SECRET_KEY': 'qa-cfg-env-secret', 'MAX_UPLOAD_MB': '25'})
+    check('配置', '环境变量覆盖默认配置（MAX_UPLOAD_MB=25）',
+          rc == 0 and '26214400' in text, 'rc=%s out=%s' % (rc, text[-160:]))
+
+    # 3) PAYMENT_CONFIG_FILE 优先级（config 文件 > 默认）
+    cfg_file = os.path.join(tmp, 'payment.conf')
+    with open(cfg_file, 'w', encoding='utf-8') as f:
+        f.write('MAX_UPLOAD_MB=30\n')
+    rc, text = _subprocess_app(tmp, {'SECRET_KEY': 'qa-cfg-file-secret',
+                                     'PAYMENT_CONFIG_FILE': cfg_file})
+    check('配置', 'PAYMENT_CONFIG_FILE 配置生效（30MB）',
+          rc == 0 and '31457280' in text, 'rc=%s out=%s' % (rc, text[-160:]))
+
+    # 4) 缺 SECRET_KEY 启动 fail-fast
+    rc, text = _subprocess_app(tmp, {})
+    check('配置', '缺 SECRET_KEY 启动 fail-fast（明确报错）',
+          rc != 0 and 'SECRET_KEY' in text, 'rc=%s out=%s' % (rc, text[-160:]))
+
+    # 5) DATA_DIR 非法/不可写启动 fail-fast
+    fake_dir = os.path.join(tmp, 'not_a_dir')
+    with open(fake_dir, 'w', encoding='utf-8') as f:
+        f.write('x')
+    rc, text = _subprocess_app(tmp, {'SECRET_KEY': 'qa-cfg-data-secret', 'DATA_DIR': fake_dir})
+    check('配置', 'DATA_DIR 非法时启动明确报错',
+          rc != 0 and any(k in text for k in ('DATA_DIR', '数据目录')), 'rc=%s out=%s' % (rc, text[-160:]))
+
+    # 6) 缺库/坏库：登录页中文提示 + /healthz
+    missing = os.path.join(tmp, 'miss_cfg.db')
+    app = make_app(missing)
+    c = app.test_client()
+    page = c.get('/login').get_data(as_text=True)
+    check('健康检查', '数据库缺失时登录页中文提示（非 500）',
+          any(k in page for k in ('数据库', '初始化', 'init_db', '备份')), '登录页无提示')
+    hz = c.get('/healthz')
+    check('健康检查', '数据库缺失时 /healthz 返回明确状态',
+          hz.status_code in (200, 503) and any(k in hz.get_data(as_text=True).lower() for k in ('db', 'database', 'unhealthy', 'ok')),
+          'code=%s' % hz.status_code)
+    _dispose(app)
+
+    corrupt = os.path.join(tmp, 'corrupt_cfg.db')
+    with open(corrupt, 'wb') as f:
+        f.write(b'not a database' * 50)
+    app = make_app(corrupt)
+    c = app.test_client()
+    page = c.get('/login').get_data(as_text=True)
+    check('健康检查', '数据库损坏时登录页中文提示（非 500）',
+          any(k in page for k in ('数据库', '损坏', '备份', '恢复')), '登录页无提示')
+    _dispose(app)
+
+
 def run():
     tmp = tempfile.mkdtemp(prefix='payment_qa_db_')
     print('数据库专项临时目录: %s' % tmp)
@@ -319,5 +406,6 @@ def run():
         _case_cwd(tmp)
         _case_initdb()
         _case_schema_upgrade(tmp)
+        _case_config_and_health(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
