@@ -19,6 +19,7 @@ class User(db.Model):
     password_hash = db.Column(db.String(256), nullable=False)
     display_name = db.Column(db.String(64), nullable=False)
     role = db.Column(db.String(16), nullable=False, default='viewer')  # admin / operator / viewer
+    is_active = db.Column(db.Boolean, nullable=False, default=True)    # 停用后不能登录
     created_at = db.Column(db.DateTime, default=datetime.now)
 
     def set_password(self, raw):
@@ -31,6 +32,7 @@ class User(db.Model):
         return {
             'id': self.id, 'username': self.username,
             'display_name': self.display_name, 'role': self.role,
+            'is_active': bool(self.is_active),
         }
 
 
@@ -47,6 +49,8 @@ class Project(db.Model):
     remark = db.Column(db.Text, nullable=True)
     created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.now)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = db.Column(db.Integer, nullable=True)   # 最后修改人（不建外键，避免删用户受阻）
 
     items = db.relationship('ProjectItem', backref='project', cascade='all, delete-orphan', lazy='selectin')
     nodes = db.relationship('PaymentNode', backref='project', cascade='all, delete-orphan', lazy='selectin')
@@ -85,6 +89,8 @@ class ProjectItem(db.Model):
     tax_rate = db.Column(db.String(32), nullable=True)     # 如 13% / 6%
     original_amount = db.Column(db.Numeric(14, 2), nullable=False, default=0)
     additional_amount = db.Column(db.Numeric(14, 2), nullable=False, default=0)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = db.Column(db.Integer, nullable=True)
 
     nodes = db.relationship('PaymentNode', backref='item', cascade='all, delete-orphan', lazy='selectin')
 
@@ -119,6 +125,8 @@ class PaymentNode(db.Model):
     invoice_amount = db.Column(db.Numeric(14, 2), nullable=False, default=0)
     paid_amount = db.Column(db.Numeric(14, 2), nullable=False, default=0)
     status = db.Column(db.String(16), nullable=False, default='未触发')  # 未触发/未开票已申请/已申请/已付款
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = db.Column(db.Integer, nullable=True)
 
     applications = db.relationship('PaymentApplication', backref='node', cascade='all, delete-orphan', lazy='selectin')
 
@@ -240,6 +248,8 @@ class ContractFile(db.Model):
     error_msg = db.Column(db.String(512), nullable=True)
     created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.now)
+    confirmed_by = db.Column(db.Integer, nullable=True)      # 最后一次确认/回改人
+    confirmed_at = db.Column(db.DateTime, nullable=True)     # 最后一次确认/回改时间（UTC）
 
     project = db.relationship('Project', backref='contracts', lazy='selectin')
 
@@ -271,4 +281,45 @@ class AcceptanceRecord(db.Model):
             'conclusion': self.conclusion, 'acceptor': self.acceptor,
             'remark': self.remark,
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M') if self.created_at else None,
+        }
+
+
+class AuditLog(db.Model):
+    """操作审计日志（只追加，不更新不删除；P0-02）
+
+    - ``ts`` 统一存 UTC；页面按 UTC 展示并标注；
+    - ``before_json`` / ``after_json`` 存关注字段快照（JSON 字符串），
+      金额/状态/日期类变更必须留 before/after；
+    - 不建外键，保证项目/用户/合同被物理删除后日志仍然完整。
+    """
+    __tablename__ = 'audit_logs'
+    id = db.Column(db.Integer, primary_key=True)
+    ts = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    actor_id = db.Column(db.Integer, nullable=True)
+    actor_name = db.Column(db.String(64), nullable=True)
+    action = db.Column(db.String(64), nullable=False, index=True)   # 如 project.edit / node.pay
+    object_type = db.Column(db.String(32), nullable=True)           # project / item / node / contract / user / auth
+    object_id = db.Column(db.Integer, nullable=True)
+    project_id = db.Column(db.Integer, nullable=True, index=True)   # 便于按项目检索
+    before_json = db.Column(db.Text, nullable=True)
+    after_json = db.Column(db.Text, nullable=True)
+    ip = db.Column(db.String(45), nullable=True)
+    ua = db.Column(db.String(256), nullable=True)
+    result = db.Column(db.String(16), nullable=False, default='ok')  # ok / failed / denied / blocked
+
+    __table_args__ = (
+        db.Index('ix_audit_actor_ts', 'actor_id', 'ts'),
+        db.Index('ix_audit_project_ts', 'project_id', 'ts'),
+        db.Index('ix_audit_action_ts', 'action', 'ts'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'ts': self.ts.strftime('%Y-%m-%d %H:%M:%S') if self.ts else None,
+            'actor_id': self.actor_id, 'actor_name': self.actor_name,
+            'action': self.action, 'object_type': self.object_type,
+            'object_id': self.object_id, 'project_id': self.project_id,
+            'before_json': self.before_json, 'after_json': self.after_json,
+            'ip': self.ip, 'ua': self.ua, 'result': self.result,
         }

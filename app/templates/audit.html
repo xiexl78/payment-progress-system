@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+{% block title %}操作日志 - 付款进度管理系统{% endblock %}
+{% block page_title %}系统管理 · 操作日志{% endblock %}
+{% block content %}
+
+<div class="card">
+  <div class="card-title">
+    操作日志（只读）
+    <span class="sub">共 {{ total }} 条 · 时间为 UTC · 日志不可编辑/删除</span>
+  </div>
+
+  {% if errors %}
+  <div class="flash danger" style="margin-bottom:10px;">
+    {% for e in errors %}<div>{{ e }}</div>{% endfor %}
+  </div>
+  {% endif %}
+
+  <form method="get" action="{{ url_for('main.audit_logs') }}" class="row" style="flex-wrap:wrap;gap:10px;align-items:flex-end;">
+    <div>
+      <label class="field-label">项目</label>
+      <select name="project_id" class="mid">
+        <option value="">全部项目</option>
+        {% for p in projects %}
+        <option value="{{ p.id }}" {{ 'selected' if filters.get('project_id') == p.id else '' }}>{{ p.project_no }} · {{ p.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label class="field-label">操作人</label>
+      <input type="text" name="actor" value="{{ filters.get('actor', '') }}" class="small" placeholder="姓名或用户ID">
+    </div>
+    <div>
+      <label class="field-label">操作类型</label>
+      <select name="action" class="mid">
+        <option value="">全部类型</option>
+        {% for a in actions %}
+        <option value="{{ a }}" {{ 'selected' if filters.get('action') == a else '' }}>{{ a }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label class="field-label">开始日期（UTC）</label>
+      <input type="date" name="date_from" value="{{ filters.get('date_from', '') }}">
+    </div>
+    <div>
+      <label class="field-label">结束日期（UTC）</label>
+      <input type="date" name="date_to" value="{{ filters.get('date_to', '') }}">
+    </div>
+    <div class="flex" style="gap:8px;">
+      <button type="submit" class="btn btn-primary btn-sm">筛选</button>
+      <a href="{{ url_for('main.audit_logs') }}" class="btn btn-ghost btn-sm">重置</a>
+    </div>
+  </form>
+</div>
+
+<div class="card">
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th style="white-space:nowrap;">时间（UTC）</th>
+          <th>操作人</th>
+          <th>动作</th>
+          <th>对象</th>
+          <th>项目ID</th>
+          <th>结果</th>
+          <th>IP</th>
+          <th>变更详情</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td style="white-space:nowrap;font-size:12px;">{{ row.ts.strftime('%Y-%m-%d %H:%M:%S') if row.ts else '—' }}</td>
+          <td>{{ row.actor_name or ('ID:' ~ row.actor_id if row.actor_id else '—') }}</td>
+          <td><span class="badge badge-blue">{{ row.action }}</span></td>
+          <td>{{ row.object_type or '—' }}{% if row.object_id %} #{{ row.object_id }}{% endif %}</td>
+          <td>{{ row.project_id or '—' }}</td>
+          <td>
+            {% if row.result == 'ok' %}<span class="badge badge-green">ok</span>
+            {% elif row.result == 'blocked' %}<span class="badge badge-orange">blocked</span>
+            {% elif row.result == 'failed' %}<span class="badge badge-red">failed</span>
+            {% else %}<span class="badge badge-gray">{{ row.result }}</span>{% endif %}
+          </td>
+          <td style="font-size:12px;">{{ row.ip or '—' }}</td>
+          <td style="max-width:420px;">
+            {% if row.before_json or row.after_json %}
+            <details>
+              <summary style="cursor:pointer;color:var(--primary);font-size:12px;">查看 before / after</summary>
+              {% if row.before_json %}<div class="src-text" style="margin-top:4px;">before:</div>
+              <pre style="white-space:pre-wrap;word-break:break-all;font-size:12px;margin:2px 0 6px;">{{ row.before_json }}</pre>{% endif %}
+              {% if row.after_json %}<div class="src-text">after:</div>
+              <pre style="white-space:pre-wrap;word-break:break-all;font-size:12px;margin:2px 0 0;">{{ row.after_json }}</pre>{% endif %}
+            </details>
+            {% else %}
+            <span class="text-muted" style="font-size:12px;">—</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="8" class="empty">暂无日志</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if pages > 1 %}
+  <div class="flex mt-16" style="justify-content:flex-end;gap:8px;">
+    {% if page > 1 %}
+    <a class="btn btn-ghost btn-sm" href="{{ url_for('main.audit_logs', page=page-1, **filters) }}">上一页</a>
+    {% endif %}
+    <span class="text-muted" style="font-size:12px;">第 {{ page }} / {{ pages }} 页</span>
+    {% if page < pages %}
+    <a class="btn btn-ghost btn-sm" href="{{ url_for('main.audit_logs', page=page+1, **filters) }}">下一页</a>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+
+{% endblock %}

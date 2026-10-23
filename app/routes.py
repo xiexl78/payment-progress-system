@@ -12,9 +12,10 @@ from flask import Blueprint, render_template, request, redirect, url_for, sessio
 from sqlalchemy import or_, update
 
 from . import NODE_TEMPLATES, FLOW_STATUS
+from .audit import action_options, record as audit_record, snapshot as audit_snapshot
 from .contract_engine import extract_text, recognize_contract
 from .models import (db, User, Project, ProjectItem, PaymentNode, PaymentApplication,
-                     PaymentRecord, AcceptanceRecord, ContractFile)
+                     PaymentRecord, AcceptanceRecord, ContractFile, AuditLog)
 from .money import CENT, MAX_MONEY, ZERO, fmt_money as money_fmt, mul_ratio, sum_money
 from .validation import (PROJECT_STATUSES, NODE_TYPES, NODE_LABELS, TAX_RATES,
                          ValidationError, parse_amount, parse_date,
@@ -130,6 +131,48 @@ def _date_str(value):
     return value.isoformat() if value else None
 
 
+# ---------- 审计快照辅助 ----------
+
+_PROJECT_AUDIT_FIELDS = ('id', 'project_no', 'name', 'status', 'trial_date',
+                         'acceptance_date', 'warranty_due_date', 'remark',
+                         'created_by', 'updated_by')
+_ITEM_AUDIT_FIELDS = ('id', 'project_id', 'item_name', 'tax_rate',
+                      'original_amount', 'additional_amount', 'updated_by')
+_NODE_AUDIT_FIELDS = ('id', 'project_id', 'item_id', 'node_type', 'node_name',
+                      'ratio', 'calc_base', 'due_amount', 'due_date', 'trigger_date',
+                      'invoice_amount', 'paid_amount', 'status', 'updated_by')
+
+
+def _project_snapshot(project):
+    if project is None:
+        return None
+    data = audit_snapshot(project, _PROJECT_AUDIT_FIELDS)
+    try:
+        data['total_amount'] = format(Decimal(project.total_amount()), 'f')
+        data['item_count'] = len(project.items)
+        data['node_count'] = len(project.nodes)
+    except Exception:
+        pass
+    return data
+
+
+def _item_snapshot(item):
+    return audit_snapshot(item, _ITEM_AUDIT_FIELDS)
+
+
+def _node_snapshot(node):
+    return audit_snapshot(node, _NODE_AUDIT_FIELDS)
+
+
+def _now_utc():
+    return datetime.utcnow()
+
+
+def _operator_id():
+    user = current_user()
+    return user.id if user else None
+
+
 # ---------- 认证 ----------
 
 @bp.route('/login', methods=['GET', 'POST'])
@@ -141,15 +184,27 @@ def login():
         password = request.form.get('password') or ''
         user = User.query.filter_by(username=username).first()
         if user and user.check_password(password):
+            if not user.is_active:
+                audit_record('auth.login.failed', 'user', user.id, result='failed',
+                             after={'username': username, 'reason': '账号已停用'})
+                flash('账号已停用，请联系管理员', 'danger')
+                return render_template('login.html')
             session['user_id'] = user.id
+            audit_record('auth.login.success', 'user', user.id,
+                         after={'username': username})
             flash(f'欢迎回来，{user.display_name}', 'success')
             return redirect(url_for('main.projects'))
+        audit_record('auth.login.failed', 'user', user.id if user else None,
+                     result='failed', after={'username': username})
         flash('用户名或密码错误', 'danger')
     return render_template('login.html')
 
 
 @bp.route('/logout')
 def logout():
+    user = current_user()
+    if user:
+        audit_record('auth.logout', 'user', user.id, after={'username': user.username})
     session.clear()
     flash('已退出登录', 'info')
     return redirect(url_for('main.login'))
@@ -208,7 +263,8 @@ def project_new():
             return render_template('project_form.html', templates=templates, project=None)
 
         project = Project(project_no=project_no, name=name, remark=remark,
-                          status='进行中', created_by=current_user().id)
+                          status='进行中', created_by=current_user().id,
+                          updated_by=current_user().id)
         db.session.add(project)
         db.session.flush()
 
@@ -217,7 +273,8 @@ def project_new():
             item = ProjectItem(project_id=project.id, item_name=row['item_name'],
                                tax_rate=row['tax_rate'],
                                original_amount=row['original_amount'],
-                               additional_amount=row['additional_amount'])
+                               additional_amount=row['additional_amount'],
+                               updated_by=current_user().id)
             db.session.add(item)
             items.append(item)
         db.session.flush()
@@ -228,10 +285,12 @@ def project_new():
                 node = PaymentNode(project_id=project.id, item_id=it.id,
                                    node_type=t['node_type'], node_name=t['node_name'],
                                    ratio=Decimal(str(t['ratio'])), calc_base=t['calc_base'],
-                                   status='未触发')
+                                   status='未触发', updated_by=current_user().id)
                 node.recalc()
                 db.session.add(node)
         sync_project_dates(project)
+        audit_record('project.create', 'project', project.id, project.id,
+                     after=_project_snapshot(project))
         db.session.commit()
         flash(f'项目「{name}」创建成功，已自动生成付款节点', 'success')
         return redirect(url_for('main.project_detail', project_id=project.id))
@@ -283,12 +342,16 @@ def project_edit(project_id):
             for msg in exc.errors:
                 flash(msg, 'danger')
             return redirect(url_for('main.project_edit', project_id=project.id))
+        before = _project_snapshot(project)
         project.name = name
         project.remark = (request.form.get('remark') or '').strip()
         project.status = status
         project.trial_date = trial
         project.acceptance_date = acceptance
+        project.updated_by = current_user().id
         sync_project_dates(project)
+        audit_record('project.edit', 'project', project.id, project.id,
+                     before=before, after=_project_snapshot(project))
         db.session.commit()
         flash('项目信息已更新', 'success')
         return redirect(url_for('main.project_detail', project_id=project.id))
@@ -321,17 +384,20 @@ def item_add(project_id):
     item = ProjectItem(project_id=project.id, item_name=item_name,
                        tax_rate=tax_rate,
                        original_amount=original,
-                       additional_amount=additional)
+                       additional_amount=additional,
+                       updated_by=current_user().id)
     db.session.add(item)
     db.session.flush()
     for t in NODE_TEMPLATES:
         node = PaymentNode(project_id=project.id, item_id=item.id,
                            node_type=t['node_type'], node_name=t['node_name'],
                            ratio=Decimal(str(t['ratio'])), calc_base=t['calc_base'],
-                           status='未触发')
+                           status='未触发', updated_by=current_user().id)
         node.recalc()
         db.session.add(node)
     sync_project_dates(project)
+    audit_record('item.create', 'item', item.id, project.id,
+                 after=_item_snapshot(item))
     db.session.commit()
     flash(f'科目「{item_name}」已添加，节点已生成', 'success')
     return redirect(url_for('main.project_detail', project_id=project.id))
@@ -344,6 +410,9 @@ def project_delete(project_id):
     project = db.session.get(Project, project_id)
     if not project:
         abort(404)
+    before_snapshot = _project_snapshot(project)
+    audit_record('project.delete', 'project', project.id, project.id,
+                 before=before_snapshot, result='ok')
     # 级联清理关联数据（bulk delete 不触发 ORM cascade，按依赖顺序手动清理）
     node_ids = [n.id for n in PaymentNode.query.filter_by(project_id=project.id).all()]
     if node_ids:
@@ -370,7 +439,9 @@ def node_update(node_id):
     if not node:
         abort(404)
     detail_url = url_for('main.project_detail', project_id=node.project_id)
+    actor = current_user()
     action = request.form.get('action')
+    before_snapshot = _node_snapshot(node)
     try:
         if action == 'apply':
             parsed = validate_node_action(node, 'apply', request.form)
@@ -383,11 +454,13 @@ def node_update(node_id):
                 .where(PaymentNode.id == node.id,
                        PaymentNode.status == '未触发')
                 .values(status=new_status,
-                        invoice_amount=PaymentNode.invoice_amount + parsed['invoice_amount']))
+                        invoice_amount=PaymentNode.invoice_amount + parsed['invoice_amount'],
+                        updated_at=_now_utc(), updated_by=actor.id))
             if result.rowcount != 1:
                 db.session.rollback()
                 flash('发起申请失败：该节点已被他人处理或状态已变化，请刷新后重试', 'danger')
                 return redirect(detail_url)
+            db.session.refresh(node)
             app_obj = PaymentApplication(
                 node_id=node.id,
                 apply_no=make_apply_no(),
@@ -396,10 +469,16 @@ def node_update(node_id):
                 invoice_no=invoice_no or None,
                 description=desc or None,
                 status=new_status,
-                applicant_id=current_user().id,
-                applicant_name=current_user().display_name,
+                applicant_id=actor.id,
+                applicant_name=actor.display_name,
             )
             db.session.add(app_obj)
+            db.session.flush()
+            audit_record('node.apply', 'node', node.id, node.project_id,
+                         before=before_snapshot,
+                         after=dict(_node_snapshot(node),
+                                    apply_no=app_obj.apply_no,
+                                    apply_amount=app_obj.apply_amount))
             db.session.commit()
             flash('%s 已发起付款申请（%s）' % (node.node_name, app_obj.apply_no), 'success')
 
@@ -413,11 +492,13 @@ def node_update(node_id):
                        PaymentNode.status == '未开票已申请',
                        PaymentNode.invoice_amount + parsed['invoice_amount'] <= PaymentNode.due_amount)
                 .values(invoice_amount=PaymentNode.invoice_amount + parsed['invoice_amount'],
-                        status='已申请'))
+                        status='已申请',
+                        updated_at=_now_utc(), updated_by=actor.id))
             if result.rowcount != 1:
                 db.session.rollback()
                 flash('发票登记失败：节点状态已变化或累计开票将超过应付，请刷新后重试', 'danger')
                 return redirect(detail_url)
+            db.session.refresh(node)
             # 回填最近一笔申请单的发票信息（按申请时间排序，避免取错单）
             app_pending = (PaymentApplication.query
                            .filter_by(node_id=node.id)
@@ -430,6 +511,11 @@ def node_update(node_id):
                 app_pending.invoice_amount = (Decimal(app_pending.invoice_amount or 0)
                                               + parsed['invoice_amount'])
                 app_pending.status = '已申请'
+            audit_record('node.invoice', 'node', node.id, node.project_id,
+                         before=before_snapshot,
+                         after=dict(_node_snapshot(node),
+                                    invoice_no=invoice_no,
+                                    invoice_amount_delta=parsed['invoice_amount']))
             db.session.commit()
             flash('%s 发票信息已登记' % node.node_name, 'success')
 
@@ -445,7 +531,8 @@ def node_update(node_id):
                        PaymentNode.status == '已申请',
                        PaymentNode.paid_amount + parsed['paid_amount'] <= PaymentNode.due_amount)
                 .values(paid_amount=PaymentNode.paid_amount + parsed['paid_amount'],
-                        status='已付款'))
+                        status='已付款',
+                        updated_at=_now_utc(), updated_by=actor.id))
             if result.rowcount != 1:
                 db.session.rollback()
                 flash('付款失败：节点状态已变化或付款金额超过未付应付，请刷新后重试', 'danger')
@@ -463,13 +550,21 @@ def node_update(node_id):
                 pay_date=pay_date,
                 pay_method=pay_method or None,
                 voucher_no=voucher or None,
-                operator_id=current_user().id,
-                operator_name=current_user().display_name,
+                operator_id=actor.id,
+                operator_name=actor.display_name,
             )
             db.session.add(rec)
+            db.session.flush()
             if app_obj:
                 app_obj.status = '已付款'
                 app_obj.invoice_amount = Decimal(node.invoice_amount or 0)
+            audit_record('node.pay', 'node', node.id, node.project_id,
+                         before=before_snapshot,
+                         after=dict(_node_snapshot(node),
+                                    record_id=rec.id,
+                                    pay_amount=rec.paid_amount,
+                                    pay_date=_date_str(rec.pay_date),
+                                    pay_method=rec.pay_method))
             db.session.commit()
             flash('%s 已登记实际付款 %s 元' % (node.node_name, fmt_money(parsed['paid_amount'])), 'success')
     except ValidationError as exc:
@@ -502,8 +597,16 @@ def acceptance_add(project_id):
         remark=(request.form.get('remark') or '').strip() or None,
     )
     db.session.add(rec)
+    db.session.flush()
+    before = {'acceptance_date': _date_str(project.acceptance_date),
+              'warranty_due_date': _date_str(project.warranty_due_date)}
     project.acceptance_date = acc_date
+    project.updated_by = current_user().id
     sync_project_dates(project)
+    audit_record('acceptance.add', 'acceptance', rec.id, project.id, before=before,
+                 after={'acceptance_date': _date_str(project.acceptance_date),
+                        'warranty_due_date': _date_str(project.warranty_due_date),
+                        'acceptor': rec.acceptor, 'conclusion': rec.conclusion})
     db.session.commit()
     flash(f'验收记录已登记：{acc_date}，质保到期日自动推算为 {project.warranty_due_date}', 'success')
     return redirect(url_for('main.project_detail', project_id=project.id))
@@ -524,8 +627,12 @@ def trial_set(project_id):
         for msg in exc.errors:
             flash(msg, 'danger')
         return redirect(url_for('main.project_detail', project_id=project.id))
+    before = {'trial_date': _date_str(project.trial_date)}
     project.trial_date = trial_date
+    project.updated_by = current_user().id
     sync_project_dates(project)
+    audit_record('project.trial', 'project', project.id, project.id, before=before,
+                 after={'trial_date': _date_str(project.trial_date)})
     db.session.commit()
     flash(f'试运行日期已登记：{trial_date}，进度款节点已联动', 'success')
     return redirect(url_for('main.project_detail', project_id=project.id))
@@ -540,7 +647,11 @@ def project_status(project_id):
         abort(404)
     status = request.form.get('status')
     if status in ('进行中', '已完成', '已归档'):
+        before = {'status': project.status}
         project.status = status
+        project.updated_by = current_user().id
+        audit_record('project.status', 'project', project.id, project.id,
+                     before=before, after={'status': project.status})
         db.session.commit()
         flash(f'项目状态已更新为「{status}」', 'success')
     return redirect(url_for('main.project_detail', project_id=project.id))
@@ -645,6 +756,9 @@ def contract_upload():
     if text is None:
         contract.status = 'failed'
         contract.error_msg = extract_msg or '文本提取失败'
+        audit_record('contract.upload', 'contract', contract.id, result='failed',
+                     after={'file_name': contract.file_name, 'status': 'failed',
+                            'error': contract.error_msg})
         db.session.commit()
         flash('文本提取失败：%s' % (extract_msg or '未知错误'), 'danger')
         return redirect(url_for('main.contracts'))
@@ -655,6 +769,10 @@ def contract_upload():
     contract.engine = result.get('engine', 'rules')
     contract.status = 'recognized'
     contract.error_msg = rec_msg
+    audit_record('contract.upload', 'contract', contract.id,
+                 after={'file_name': contract.file_name, 'status': 'recognized',
+                        'engine': contract.engine,
+                        'contract_amount': (result or {}).get('contract_amount')})
     db.session.commit()
     flash('合同识别完成：%s' % (file.filename), 'success')
     return redirect(url_for('main.contract_confirm', contract_id=contract.id))
@@ -850,8 +968,10 @@ def _ratio_fraction(pct):
 
 def _apply_contract_values(project, submission, contract, *, update_amounts=True):
     """就地更新项目口径：只改基线，不触碰节点状态/开票/付款，不删除任何节点。"""
+    operator_id = _operator_id()
     project.name = submission.contract_name
     project.remark = _contract_remark(submission, contract.file_name)
+    project.updated_by = operator_id
     if not update_amounts:
         return
     items = list(project.items)
@@ -860,6 +980,7 @@ def _apply_contract_values(project, submission, contract, *, update_amounts=True
         item.original_amount = submission.original_amount
         item.additional_amount = submission.additional_amount
         item.tax_rate = submission.tax_rate or None
+        item.updated_by = operator_id
     node_map = {n.node_type: n for n in project.nodes}
     for nt in NODE_TYPES:
         node = node_map.get(nt)
@@ -870,22 +991,25 @@ def _apply_contract_values(project, submission, contract, *, update_amounts=True
         node.node_name = _node_name(nt, ratio)
         node.calc_base = 'original' if nt == 'first' else 'total'
         node.due_amount = submission.node_amounts[nt]
+        node.updated_by = operator_id
     sync_project_dates(project)
 
 
 def _create_contract_project(submission, contract):
     """首次确认：创建项目 + 单科目 + 4 节点（金额来自服务端校验结果）。"""
+    operator_id = _operator_id()
     project = Project(
         project_no=submission.project_no, name=submission.contract_name,
         status='进行中', remark=_contract_remark(submission, contract.file_name),
-        created_by=current_user().id,
+        created_by=operator_id, updated_by=operator_id,
     )
     db.session.add(project)
     db.session.flush()
     item = ProjectItem(project_id=project.id, item_name='合同价款',
                        tax_rate=submission.tax_rate or None,
                        original_amount=submission.original_amount,
-                       additional_amount=submission.additional_amount)
+                       additional_amount=submission.additional_amount,
+                       updated_by=operator_id)
     db.session.add(item)
     db.session.flush()
     for nt in NODE_TYPES:
@@ -893,7 +1017,8 @@ def _create_contract_project(submission, contract):
         node = PaymentNode(project_id=project.id, item_id=item.id, node_type=nt,
                            node_name=_node_name(nt, ratio), ratio=ratio,
                            calc_base='original' if nt == 'first' else 'total',
-                           due_amount=submission.node_amounts[nt], status='未触发')
+                           due_amount=submission.node_amounts[nt], status='未触发',
+                           updated_by=operator_id)
         db.session.add(node)
     sync_project_dates(project)
     return project
@@ -950,6 +1075,10 @@ def contract_confirm_submit(contract_id):
     try:
         submission = validate_contract_submission(request.form)
     except ValidationError as exc:
+        audit_record('contract.confirm.failed', 'contract', contract.id,
+                     contract.project_id, result='failed',
+                     after={'errors': exc.errors})
+        db.session.commit()
         return _render_confirm(contract, result,
                                values=_raw_contract_form_values(request.form),
                                is_update=is_update, errors=exc.errors,
@@ -971,6 +1100,10 @@ def contract_confirm_submit(contract_id):
                      if d['field'] in _FINANCIAL_FIELDS or d['field'].startswith('ratio_')]
         blockers = _contract_blockers(project)
         if financial and blockers:
+            audit_record('contract.modify.blocked', 'contract', contract.id,
+                         project.id, result='blocked',
+                         after={'blockers': blockers, 'diff': diff})
+            db.session.commit()
             return _render_confirm(contract, result,
                                    values=_raw_contract_form_values(request.form),
                                    is_update=True, project=project,
@@ -985,11 +1118,24 @@ def contract_confirm_submit(contract_id):
                                    diff=diff, confirm_token=expected_token)
 
         # 二次确认通过：就地更新（不删除节点，不触碰已发生的开票/付款/状态）
+        before_values = _project_contract_values(project)
         _apply_contract_values(project, submission, contract,
                                update_amounts=bool(financial))
         contract.contract_name = submission.contract_name
         contract.project_id = project.id
         contract.status = 'confirmed'
+        contract.confirmed_by = _operator_id()
+        contract.confirmed_at = _now_utc()
+        audit_record('contract.modify', 'contract', contract.id, project.id,
+                     before=before_values,
+                     after={'contract_name': submission.contract_name,
+                            'original_amount': submission.original_amount,
+                            'additional_amount': submission.additional_amount,
+                            'ratios_pct': {k: format(v, 'f')
+                                           for k, v in submission.ratios_pct.items()},
+                            'node_amounts': {k: format(v, 'f')
+                                             for k, v in submission.node_amounts.items()},
+                            'diff': diff})
         db.session.commit()
         for msg in submission.warnings:
             flash(msg, 'warning')
@@ -1009,6 +1155,15 @@ def contract_confirm_submit(contract_id):
     contract.project_id = project.id
     contract.contract_name = submission.contract_name
     contract.status = 'confirmed'
+    contract.confirmed_by = _operator_id()
+    contract.confirmed_at = _now_utc()
+    audit_record('contract.confirm', 'contract', contract.id, project.id,
+                 after={'project_id': project.id, 'project_no': project.project_no,
+                        'contract_name': submission.contract_name,
+                        'original_amount': submission.original_amount,
+                        'additional_amount': submission.additional_amount,
+                        'node_amounts': {k: format(v, 'f')
+                                         for k, v in submission.node_amounts.items()}})
     db.session.commit()
     for msg in submission.warnings:
         flash(msg, 'warning')
@@ -1038,10 +1193,13 @@ def contract_rerun(contract_id):
     if text is None:
         contract.status = 'failed'
         contract.error_msg = extract_msg or '文本提取失败'
+        audit_record('contract.rerun', 'contract', contract.id, contract.project_id,
+                     result='failed', after={'status': 'failed', 'error': contract.error_msg})
         db.session.commit()
         flash('重新识别失败：%s' % (extract_msg or '未知错误'), 'danger')
         return redirect(url_for('main.contracts'))
     was_confirmed = contract.status == 'confirmed'
+    before = {'status': contract.status, 'engine': contract.engine}
     result, rec_msg = recognize_contract(text, contract.file_name)
     contract.raw_text = text
     contract.result_json = json.dumps(result, ensure_ascii=False)
@@ -1049,6 +1207,10 @@ def contract_rerun(contract_id):
     if not was_confirmed:
         contract.status = 'recognized'
     contract.error_msg = rec_msg
+    audit_record('contract.rerun', 'contract', contract.id, contract.project_id,
+                 before=before,
+                 after={'status': contract.status, 'engine': contract.engine,
+                        'contract_amount': (result or {}).get('contract_amount')})
     db.session.commit()
     if was_confirmed:
         flash('已更新识别结果（该合同已生成项目，如按新结果重新生成请重新上传合同）', 'info')
@@ -1132,8 +1294,38 @@ def user_new():
     user = User(username=username, display_name=display_name, role=role)
     user.set_password(password)
     db.session.add(user)
+    db.session.flush()
+    audit_record('user.create', 'user', user.id,
+                 after={'username': user.username, 'display_name': user.display_name,
+                        'role': user.role, 'is_active': True})
     db.session.commit()
     flash(f'用户「{display_name}」已创建', 'success')
+    return redirect(url_for('main.users'))
+
+
+@bp.route('/admin/users/<int:user_id>/toggle', methods=['POST'])
+@login_required
+@role_required('admin')
+def user_toggle(user_id):
+    """停用 / 启用用户（P0-02 埋点；停用后不能登录，历史记录保留）。"""
+    user = db.session.get(User, user_id)
+    if not user:
+        abort(404)
+    if user.id == current_user().id:
+        flash('不能停用当前登录账号', 'danger')
+        return redirect(url_for('main.users'))
+    if user.is_active and user.role == 'admin':
+        active_admins = User.query.filter_by(role='admin', is_active=True).count()
+        if active_admins <= 1:
+            flash('至少需要保留一个启用的管理员账号', 'danger')
+            return redirect(url_for('main.users'))
+    before = {'is_active': bool(user.is_active)}
+    user.is_active = not bool(user.is_active)
+    audit_record('user.enable' if user.is_active else 'user.disable',
+                 'user', user.id, before=before,
+                 after={'is_active': user.is_active, 'username': user.username})
+    db.session.commit()
+    flash('用户「%s」已%s' % (user.display_name, '启用' if user.is_active else '停用'), 'success')
     return redirect(url_for('main.users'))
 
 
@@ -1147,10 +1339,80 @@ def user_delete(user_id):
     if user.id == current_user().id:
         flash('不能删除当前登录账号', 'danger')
         return redirect(url_for('main.users'))
+    audit_record('user.delete', 'user', user.id,
+                 before={'username': user.username, 'display_name': user.display_name,
+                         'role': user.role, 'is_active': user.is_active})
     db.session.delete(user)
     db.session.commit()
     flash(f'用户「{user.display_name}」已删除', 'success')
     return redirect(url_for('main.users'))
+
+
+# ---------- 操作审计（只读） ----------
+
+AUDIT_PAGE_SIZE = 50
+
+
+@bp.route('/admin/audit')
+@login_required
+@role_required('admin')
+def audit_logs():
+    project_id = request.args.get('project_id', type=int)
+    actor = (request.args.get('actor') or '').strip()
+    action = (request.args.get('action') or '').strip()
+    date_from_raw = (request.args.get('date_from') or '').strip()
+    date_to_raw = (request.args.get('date_to') or '').strip()
+    errors = []
+    date_from = date_to = None
+    try:
+        date_from = parse_date(date_from_raw, field='开始日期')
+    except ValidationError as exc:
+        errors.extend(exc.errors)
+    try:
+        date_to = parse_date(date_to_raw, field='结束日期')
+    except ValidationError as exc:
+        errors.extend(exc.errors)
+
+    query = AuditLog.query
+    if project_id:
+        query = query.filter(AuditLog.project_id == project_id)
+    if actor:
+        if actor.isdigit():
+            query = query.filter(or_(AuditLog.actor_id == int(actor),
+                                     AuditLog.actor_name.contains(actor)))
+        else:
+            query = query.filter(AuditLog.actor_name.contains(actor))
+    if action:
+        query = query.filter(AuditLog.action == action)
+    if date_from:
+        query = query.filter(AuditLog.ts >= datetime.combine(date_from, datetime.min.time()))
+    if date_to:
+        query = query.filter(AuditLog.ts <
+                             datetime.combine(date_to + timedelta(days=1), datetime.min.time()))
+
+    total = query.count()
+    page = max(1, request.args.get('page', 1, type=int) or 1)
+    pages = max(1, (total + AUDIT_PAGE_SIZE - 1) // AUDIT_PAGE_SIZE)
+    page = min(page, pages)
+    rows = (query.order_by(AuditLog.ts.desc(), AuditLog.id.desc())
+            .offset((page - 1) * AUDIT_PAGE_SIZE)
+            .limit(AUDIT_PAGE_SIZE).all())
+    filters = {}
+    if project_id:
+        filters['project_id'] = project_id
+    if actor:
+        filters['actor'] = actor
+    if action:
+        filters['action'] = action
+    if date_from_raw:
+        filters['date_from'] = date_from_raw
+    if date_to_raw:
+        filters['date_to'] = date_to_raw
+    projects = Project.query.order_by(Project.created_at.desc()).limit(200).all()
+    return render_template('audit.html', rows=rows, page=page, pages=pages,
+                           total=total, filters=filters, projects=projects,
+                           actions=action_options(), errors=errors,
+                           page_size=AUDIT_PAGE_SIZE)
 
 
 # ---------- 通用辅助 ----------
