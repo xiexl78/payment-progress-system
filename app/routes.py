@@ -517,7 +517,7 @@ def project_new():
         audit_record('project.create', 'project', project.id, project.id,
                      after=_project_snapshot(project), critical=False)
         db.session.commit()
-        flash(f'项目「{name}」创建成功，已自动生成付款节点', 'success')
+        flash('项目创建成功，已自动生成付款节点（编号：%s）' % project_no, 'success')
         return redirect(url_for('main.project_detail', project_id=project.id))
     return render_template('project_form.html', templates=templates, project=None)
 
