@@ -23,6 +23,7 @@
     {% endwith %}
 
     <form method="post" action="{{ url_for('main.login') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <div class="form-row">
         <label class="field-label">用户名</label>
         <input type="text" name="username" placeholder="请输入用户名" style="width:100%;" autofocus required>

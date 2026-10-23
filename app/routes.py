@@ -50,7 +50,43 @@ def login_required(f):
 @bp.app_context_processor
 def inject_current_user():
     """向所有模板注入当前登录用户，供 base 布局与各页面判断角色"""
-    return {'current_user': current_user()}
+    try:
+        return {'current_user': current_user()}
+    except Exception:
+        # 数据库不可用等场景下仍允许错误页渲染
+        return {'current_user': None}
+
+
+# ---------- 统一中文错误页（批次 4a） ----------
+
+@bp.app_errorhandler(403)
+def error_forbidden(error):
+    message = getattr(error, 'description', None) or '您没有执行该操作的权限。'
+    return render_template('error.html', code=403, title='无权限', message=message), 403
+
+
+@bp.app_errorhandler(404)
+def error_not_found(error):
+    return render_template('error.html', code=404, title='页面不存在',
+                           message='您访问的页面不存在或已被删除，请从左侧菜单重新进入。'), 404
+
+
+@bp.app_errorhandler(405)
+def error_method_not_allowed(error):
+    return render_template('error.html', code=405, title='请求方式不支持',
+                           message='该地址不支持当前请求方式，请从页面中的按钮重新操作。'), 405
+
+
+@bp.app_errorhandler(413)
+def error_payload_too_large(error):
+    return render_template('error.html', code=413, title='上传文件过大',
+                           message='上传文件超过 16MB 限制，请压缩或拆分后重试。'), 413
+
+
+@bp.app_errorhandler(500)
+def error_internal(error):
+    return render_template('error.html', code=500, title='服务器内部错误',
+                           message='系统处理请求时发生错误，请稍后重试；如持续出现请联系管理员。'), 500
 
 
 def role_required(*roles):
@@ -61,6 +97,13 @@ def role_required(*roles):
             if not u:
                 return redirect(url_for('main.login'))
             if u.role not in roles:
+                audit_record('auth.denied', object_type='endpoint', result='denied',
+                             after={'endpoint': request.endpoint,
+                                    'method': request.method,
+                                    'required_roles': list(roles),
+                                    'role': u.role},
+                             critical=False)
+                db.session.commit()
                 flash('您没有该操作的权限', 'danger')
                 return redirect(url_for('main.projects'))
             return f(*args, **kwargs)
@@ -187,24 +230,29 @@ def login():
             if not user.is_active:
                 audit_record('auth.login.failed', 'user', user.id, result='failed',
                              after={'username': username, 'reason': '账号已停用'})
+                db.session.commit()
                 flash('账号已停用，请联系管理员', 'danger')
                 return render_template('login.html')
             session['user_id'] = user.id
+            session.permanent = True
             audit_record('auth.login.success', 'user', user.id,
                          after={'username': username})
+            db.session.commit()
             flash(f'欢迎回来，{user.display_name}', 'success')
             return redirect(url_for('main.projects'))
         audit_record('auth.login.failed', 'user', user.id if user else None,
                      result='failed', after={'username': username})
+        db.session.commit()
         flash('用户名或密码错误', 'danger')
     return render_template('login.html')
 
 
-@bp.route('/logout')
+@bp.route('/logout', methods=['POST'])
 def logout():
     user = current_user()
     if user:
         audit_record('auth.logout', 'user', user.id, after={'username': user.username})
+        db.session.commit()
     session.clear()
     flash('已退出登录', 'info')
     return redirect(url_for('main.login'))
@@ -290,7 +338,7 @@ def project_new():
                 db.session.add(node)
         sync_project_dates(project)
         audit_record('project.create', 'project', project.id, project.id,
-                     after=_project_snapshot(project))
+                     after=_project_snapshot(project), critical=False)
         db.session.commit()
         flash(f'项目「{name}」创建成功，已自动生成付款节点', 'success')
         return redirect(url_for('main.project_detail', project_id=project.id))
@@ -332,9 +380,12 @@ def project_edit(project_id):
         try:
             name = validate_text(request.form.get('name') or project.name,
                                  field='项目名称', required=True, max_len=256)
-            status = (request.form.get('status') or project.status).strip()
-            if status not in PROJECT_STATUSES:
+            requested_status = (request.form.get('status') or project.status).strip()
+            if current_user().role != 'admin' and requested_status != project.status:
+                raise ValidationError('仅管理员可以修改项目状态')
+            if requested_status not in PROJECT_STATUSES:
                 raise ValidationError('项目状态取值不合法')
+            status = requested_status if current_user().role == 'admin' else project.status
             trial = parse_date(request.form.get('trial_date'), field='试运行日期')
             acceptance = parse_date(request.form.get('acceptance_date'), field='验收日期')
             validate_project_dates(trial, acceptance)
@@ -351,7 +402,7 @@ def project_edit(project_id):
         project.updated_by = current_user().id
         sync_project_dates(project)
         audit_record('project.edit', 'project', project.id, project.id,
-                     before=before, after=_project_snapshot(project))
+                     before=before, after=_project_snapshot(project), critical=False)
         db.session.commit()
         flash('项目信息已更新', 'success')
         return redirect(url_for('main.project_detail', project_id=project.id))
@@ -397,7 +448,7 @@ def item_add(project_id):
         db.session.add(node)
     sync_project_dates(project)
     audit_record('item.create', 'item', item.id, project.id,
-                 after=_item_snapshot(item))
+                 after=_item_snapshot(item), critical=False)
     db.session.commit()
     flash(f'科目「{item_name}」已添加，节点已生成', 'success')
     return redirect(url_for('main.project_detail', project_id=project.id))
@@ -405,7 +456,7 @@ def item_add(project_id):
 
 @bp.route('/projects/<int:project_id>/delete', methods=['POST'])
 @login_required
-@role_required('admin', 'operator')
+@role_required('admin')
 def project_delete(project_id):
     project = db.session.get(Project, project_id)
     if not project:
@@ -606,7 +657,8 @@ def acceptance_add(project_id):
     audit_record('acceptance.add', 'acceptance', rec.id, project.id, before=before,
                  after={'acceptance_date': _date_str(project.acceptance_date),
                         'warranty_due_date': _date_str(project.warranty_due_date),
-                        'acceptor': rec.acceptor, 'conclusion': rec.conclusion})
+                        'acceptor': rec.acceptor, 'conclusion': rec.conclusion},
+                 critical=False)
     db.session.commit()
     flash(f'验收记录已登记：{acc_date}，质保到期日自动推算为 {project.warranty_due_date}', 'success')
     return redirect(url_for('main.project_detail', project_id=project.id))
@@ -632,7 +684,7 @@ def trial_set(project_id):
     project.updated_by = current_user().id
     sync_project_dates(project)
     audit_record('project.trial', 'project', project.id, project.id, before=before,
-                 after={'trial_date': _date_str(project.trial_date)})
+                 after={'trial_date': _date_str(project.trial_date)}, critical=False)
     db.session.commit()
     flash(f'试运行日期已登记：{trial_date}，进度款节点已联动', 'success')
     return redirect(url_for('main.project_detail', project_id=project.id))
@@ -651,7 +703,7 @@ def project_status(project_id):
         project.status = status
         project.updated_by = current_user().id
         audit_record('project.status', 'project', project.id, project.id,
-                     before=before, after={'status': project.status})
+                     before=before, after={'status': project.status}, critical=False)
         db.session.commit()
         flash(f'项目状态已更新为「{status}」', 'success')
     return redirect(url_for('main.project_detail', project_id=project.id))
@@ -758,7 +810,7 @@ def contract_upload():
         contract.error_msg = extract_msg or '文本提取失败'
         audit_record('contract.upload', 'contract', contract.id, result='failed',
                      after={'file_name': contract.file_name, 'status': 'failed',
-                            'error': contract.error_msg})
+                            'error': contract.error_msg}, critical=False)
         db.session.commit()
         flash('文本提取失败：%s' % (extract_msg or '未知错误'), 'danger')
         return redirect(url_for('main.contracts'))
@@ -772,7 +824,8 @@ def contract_upload():
     audit_record('contract.upload', 'contract', contract.id,
                  after={'file_name': contract.file_name, 'status': 'recognized',
                         'engine': contract.engine,
-                        'contract_amount': (result or {}).get('contract_amount')})
+                        'contract_amount': (result or {}).get('contract_amount')},
+                 critical=False)
     db.session.commit()
     flash('合同识别完成：%s' % (file.filename), 'success')
     return redirect(url_for('main.contract_confirm', contract_id=contract.id))
@@ -1077,7 +1130,7 @@ def contract_confirm_submit(contract_id):
     except ValidationError as exc:
         audit_record('contract.confirm.failed', 'contract', contract.id,
                      contract.project_id, result='failed',
-                     after={'errors': exc.errors})
+                     after={'errors': exc.errors}, critical=False)
         db.session.commit()
         return _render_confirm(contract, result,
                                values=_raw_contract_form_values(request.form),
@@ -1102,7 +1155,7 @@ def contract_confirm_submit(contract_id):
         if financial and blockers:
             audit_record('contract.modify.blocked', 'contract', contract.id,
                          project.id, result='blocked',
-                         after={'blockers': blockers, 'diff': diff})
+                         after={'blockers': blockers, 'diff': diff}, critical=False)
             db.session.commit()
             return _render_confirm(contract, result,
                                    values=_raw_contract_form_values(request.form),
@@ -1194,7 +1247,8 @@ def contract_rerun(contract_id):
         contract.status = 'failed'
         contract.error_msg = extract_msg or '文本提取失败'
         audit_record('contract.rerun', 'contract', contract.id, contract.project_id,
-                     result='failed', after={'status': 'failed', 'error': contract.error_msg})
+                     result='failed', after={'status': 'failed', 'error': contract.error_msg},
+                     critical=False)
         db.session.commit()
         flash('重新识别失败：%s' % (extract_msg or '未知错误'), 'danger')
         return redirect(url_for('main.contracts'))
@@ -1210,7 +1264,8 @@ def contract_rerun(contract_id):
     audit_record('contract.rerun', 'contract', contract.id, contract.project_id,
                  before=before,
                  after={'status': contract.status, 'engine': contract.engine,
-                        'contract_amount': (result or {}).get('contract_amount')})
+                        'contract_amount': (result or {}).get('contract_amount')},
+                 critical=False)
     db.session.commit()
     if was_confirmed:
         flash('已更新识别结果（该合同已生成项目，如按新结果重新生成请重新上传合同）', 'info')
@@ -1339,6 +1394,10 @@ def user_delete(user_id):
     if user.id == current_user().id:
         flash('不能删除当前登录账号', 'danger')
         return redirect(url_for('main.users'))
+    # 删除前要求：已停用，或显式二次确认（表单 hidden confirm=1）
+    if user.is_active and request.form.get('confirm') != '1':
+        flash('请先停用该用户，或在删除确认框中二次确认后再删除', 'danger')
+        return redirect(url_for('main.users'))
     audit_record('user.delete', 'user', user.id,
                  before={'username': user.username, 'display_name': user.display_name,
                          'role': user.role, 'is_active': user.is_active})
@@ -1411,7 +1470,7 @@ def audit_logs():
     projects = Project.query.order_by(Project.created_at.desc()).limit(200).all()
     return render_template('audit.html', rows=rows, page=page, pages=pages,
                            total=total, filters=filters, projects=projects,
-                           actions=action_options(), errors=errors,
+                           actions=action_options(action or None), errors=errors,
                            page_size=AUDIT_PAGE_SIZE)
 
 

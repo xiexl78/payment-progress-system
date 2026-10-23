@@ -13,6 +13,7 @@
       {% endif %}
       {% if current_user.role == 'admin' and project.status != '已归档' %}
       <form method="post" action="{{ url_for('main.project_status', project_id=project.id) }}" class="op-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <select name="status">
           <option value="进行中" {{ 'selected' if project.status == '进行中' else '' }}>进行中</option>
           <option value="已完成" {{ 'selected' if project.status == '已完成' else '' }}>已完成</option>
@@ -21,8 +22,9 @@
         <button type="submit" class="btn btn-ghost btn-sm">更新状态</button>
       </form>
       {% endif %}
-      {% if current_user.role in ('admin', 'operator') %}
+      {% if current_user.role == 'admin' %}
       <form method="post" action="{{ url_for('main.project_delete', project_id=project.id) }}" class="op-form" onsubmit="return confirm('确定删除该项目？关联的付款节点、申请、发票、付款记录将全部清除，不可恢复。');">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button type="submit" class="btn btn-ghost btn-sm text-danger">删除项目</button>
       </form>
       {% endif %}
@@ -48,6 +50,7 @@
   <div class="form-panel">
     <div class="row">
       <form method="post" action="{{ url_for('main.trial_set', project_id=project.id) }}" class="op-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <label class="field-label mb-8" style="margin:0;">进度款触发（试运行日期）</label>
         <input type="date" name="trial_date" value="{{ project.trial_date.strftime('%Y-%m-%d') if project.trial_date else '' }}">
         <button type="submit" class="btn btn-outline btn-sm">保存试运行日期</button>
@@ -55,6 +58,7 @@
     </div>
     <div class="row">
       <form method="post" action="{{ url_for('main.acceptance_add', project_id=project.id) }}" class="op-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <label class="field-label mb-8" style="margin:0;">验收登记（自动推算质保到期）</label>
         <input type="date" name="acceptance_date" value="{{ project.acceptance_date.strftime('%Y-%m-%d') if project.acceptance_date else '' }}">
         <input type="text" name="acceptor" placeholder="验收人" class="small">
@@ -90,6 +94,7 @@
   </div>
   <div id="item-add-panel" class="form-panel" style="display:none;">
     <form method="post" action="{{ url_for('main.item_add', project_id=project.id) }}" class="row">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <div><label class="field-label">科目名称 *</label><input type="text" name="item_name" class="mid" required></div>
       <div><label class="field-label">税率</label><select name="tax_rate"><option value="">—</option><option>13%</option><option>9%</option><option>6%</option><option>3%</option></select></div>
       <div><label class="field-label">原金额</label><input type="number" name="original_amount" class="mid" step="0.01" min="0" value="0"></div>
@@ -161,6 +166,7 @@
                 {% if current_user.role in ('admin', 'operator') %}
                   {% if n.status == '未触发' %}
                     <form method="post" action="{{ url_for('main.node_update', node_id=n.id) }}" class="op-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                       <input type="hidden" name="action" value="apply">
                       <input type="number" name="apply_amount" class="small" step="0.01" min="0.01" value="{{ '%.2f'|format(n.due_amount) if n.due_amount else '' }}" placeholder="申请额">
                       <input type="text" name="invoice_no" class="small" placeholder="发票号（可选）">
@@ -169,6 +175,7 @@
                   {% elif n.status == '未开票已申请' %}
                     <span class="text-muted" style="font-size:12px;margin-right:6px;">已申请，待补发票</span>
                     <form method="post" action="{{ url_for('main.node_update', node_id=n.id) }}" class="op-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                       <input type="hidden" name="action" value="invoice">
                       <input type="number" name="invoice_amount" class="small" step="0.01" min="0.01" value="{{ '%.2f'|format(n.due_amount) if n.due_amount else '' }}">
                       <input type="text" name="invoice_no" class="small" placeholder="发票号">
@@ -176,6 +183,7 @@
                     </form>
                   {% elif n.status == '已申请' %}
                     <form method="post" action="{{ url_for('main.node_update', node_id=n.id) }}" class="op-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                       <input type="hidden" name="action" value="pay">
                       <input type="number" name="paid_amount" class="small" step="0.01" min="0.01" value="{{ '%.2f'|format(n.due_amount - n.paid_amount) if (n.due_amount - n.paid_amount) > 0 else '' }}" placeholder="实付额">
                       <input type="date" name="pay_date" class="small">

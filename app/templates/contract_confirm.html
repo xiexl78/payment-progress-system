@@ -67,6 +67,7 @@
   {% endif %}
 
   <form method="post" action="{{ url_for('main.contract_confirm_submit', contract_id=contract.id) }}" id="confirm-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     {% if confirm_token %}
     <input type="hidden" name="confirm_token" value="{{ confirm_token }}">
     {% endif %}
@@ -199,7 +200,8 @@
     </div>
   </form>
 
-  <form method="post" action="{{ url_for('main.contract_rerun', contract_id=contract.id) }}" id="rerun-form" style="display:none;"></form>
+  <form method="post" action="{{ url_for('main.contract_rerun', contract_id=contract.id) }}" id="rerun-form" style="display:none;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"></form>
 </div>
 
 <script>

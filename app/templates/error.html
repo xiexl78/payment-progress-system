@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}{{ code }} {{ title }} - 付款进度管理系统{% endblock %}
+{% block page_title %}{{ code }} · {{ title }}{% endblock %}
+{% block content %}
+
+<div class="card" style="max-width:720px;margin:40px auto;text-align:center;">
+  <div style="font-size:56px;font-weight:700;color:var(--primary);line-height:1.1;">{{ code }}</div>
+  <div style="font-size:20px;margin:10px 0 6px;">{{ title }}</div>
+  <div class="text-muted" style="font-size:14px;margin-bottom:22px;">{{ message }}</div>
+  <div class="flex" style="justify-content:center;gap:10px;">
+    <a href="{{ url_for('main.projects') }}" class="btn btn-primary">返回项目列表</a>
+    <a href="{{ url_for('main.login') }}" class="btn btn-ghost">返回登录</a>
+  </div>
+</div>
+
+{% endblock %}

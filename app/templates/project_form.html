@@ -9,6 +9,7 @@
   </div>
 
   <form method="post" action="{{ url_for('main.project_edit', project_id=project.id) if project else url_for('main.project_new') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <div class="form-grid">
       <div class="form-row">
         <label class="field-label">项目编号 *</label>
@@ -24,6 +25,7 @@
 
     {% if project %}
     <div class="form-grid">
+      {% if current_user.role == 'admin' %}
       <div class="form-row">
         <label class="field-label">项目状态</label>
         <select name="status" style="width:100%;">
@@ -32,6 +34,7 @@
           <option value="已归档" {{ 'selected' if project.status == '已归档' else '' }}>已归档</option>
         </select>
       </div>
+      {% endif %}
       <div class="form-row">
         <label class="field-label">试运行日期</label>
         <input type="date" name="trial_date" value="{{ project.trial_date.strftime('%Y-%m-%d') if project.trial_date else '' }}" style="width:100%;">

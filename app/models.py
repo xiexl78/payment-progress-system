@@ -297,6 +297,7 @@ class AuditLog(db.Model):
     ts = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
     actor_id = db.Column(db.Integer, nullable=True)
     actor_name = db.Column(db.String(64), nullable=True)
+    actor_role = db.Column(db.String(16), nullable=True)            # 操作人角色快照
     action = db.Column(db.String(64), nullable=False, index=True)   # 如 project.edit / node.pay
     object_type = db.Column(db.String(32), nullable=True)           # project / item / node / contract / user / auth
     object_id = db.Column(db.Integer, nullable=True)
@@ -311,6 +312,7 @@ class AuditLog(db.Model):
         db.Index('ix_audit_actor_ts', 'actor_id', 'ts'),
         db.Index('ix_audit_project_ts', 'project_id', 'ts'),
         db.Index('ix_audit_action_ts', 'action', 'ts'),
+        db.Index('ix_audit_object_ts', 'object_type', 'object_id', 'ts'),
     )
 
     def to_dict(self):
@@ -318,6 +320,7 @@ class AuditLog(db.Model):
             'id': self.id,
             'ts': self.ts.strftime('%Y-%m-%d %H:%M:%S') if self.ts else None,
             'actor_id': self.actor_id, 'actor_name': self.actor_name,
+            'actor_role': self.actor_role,
             'action': self.action, 'object_type': self.object_type,
             'object_id': self.object_id, 'project_id': self.project_id,
             'before_json': self.before_json, 'after_json': self.after_json,

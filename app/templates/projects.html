@@ -78,8 +78,9 @@
       </div>
       <div class="actions">
         <a href="{{ url_for('main.project_detail', project_id=p.id) }}" class="btn btn-outline btn-sm">查看详情</a>
-        {% if current_user.role in ('admin', 'operator') %}
+        {% if current_user.role == 'admin' %}
         <form method="post" action="{{ url_for('main.project_delete', project_id=p.id) }}" style="display:inline;" onsubmit="return confirm('确定删除「{{ p.name }}」？关联数据将全部清除，不可恢复。');">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button type="submit" class="btn btn-ghost btn-sm text-danger">删除</button>
         </form>
         {% endif %}

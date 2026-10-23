@@ -13,6 +13,7 @@
 
   <div id="user-add-panel" class="form-panel" style="display:none;">
     <form method="post" action="{{ url_for('main.user_new') }}" class="row">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <div><label class="field-label">用户名 *</label><input type="text" name="username" class="mid" required></div>
       <div><label class="field-label">姓名 *</label><input type="text" name="display_name" class="mid" required></div>
       <div><label class="field-label">初始密码 *</label><input type="password" name="password" class="mid" required></div>
@@ -49,9 +50,12 @@
           <td>
             {% if u.id != current_user.id %}
             <form method="post" action="{{ url_for('main.user_toggle', user_id=u.id) }}" class="op-form" style="display:inline;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
               <button type="submit" class="btn btn-ghost btn-sm">{{ '停用' if u.is_active else '启用' }}</button>
             </form>
             <form method="post" action="{{ url_for('main.user_delete', user_id=u.id) }}" class="op-form" style="display:inline;" onsubmit="return confirm('确定删除用户「{{ u.display_name }}」？');">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <input type="hidden" name="confirm" value="1">
               <button type="submit" class="btn btn-danger btn-sm">删除</button>
             </form>
             {% else %}

@@ -7,6 +7,7 @@
 <div class="card">
   <div class="card-title">上传合同<span class="sub">系统自动提取合同金额、税率、付款条件与节点比例，识别结果需人工确认后生成付款节点</span></div>
   <form method="post" action="{{ url_for('main.contract_upload') }}" enctype="multipart/form-data" class="flex" style="gap:12px;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="file" name="file" accept=".pdf,.docx,.txt,.md,.jpg,.jpeg,.png,.bmp,.webp" style="flex:1;" required>
     <button type="submit" class="btn btn-primary">上传并识别</button>
   </form>
@@ -66,6 +67,7 @@
               {% endif %}
               {% if current_user.role in ('admin', 'operator') and c.status in ('recognized', 'confirmed') %}
               <form method="post" action="{{ url_for('main.contract_rerun', contract_id=c.id) }}" style="display:inline;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <button type="submit" class="btn btn-ghost btn-sm">重新识别</button>
               </form>
               {% endif %}

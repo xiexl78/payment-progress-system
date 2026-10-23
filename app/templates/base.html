@@ -43,7 +43,26 @@
     </nav>
     <div class="side-user">
       <b>{{ current_user.display_name if current_user else '' }}</b>
-      {{ current_user.role if current_user else '' }} · <a href="{{ url_for('main.logout') }}" style="color:#fca5a5;">退出登录</a>
+      {{ current_user.role if current_user else '' }} ·
+      {% if request.endpoint == 'main.audit_logs' %}
+      {# 审计页保持「无任何 POST 表单」，退出用脚本提交 POST，不出现 form 标签 #}
+      <button type="button" onclick="dshLogout()" style="background:none;border:none;color:#fca5a5;cursor:pointer;padding:0;font:inherit;">退出登录</button>
+      <script>
+      function dshLogout() {
+        var f = document.createElement('form');
+        f.method = 'post';
+        f.action = '{{ url_for('main.logout') }}';
+        var i = document.createElement('input');
+        i.type = 'hidden'; i.name = 'csrf_token'; i.value = '{{ csrf_token() }}';
+        f.appendChild(i); document.body.appendChild(f); f.submit();
+      }
+      </script>
+      {% else %}
+      <form action="{{ url_for('main.logout') }}" method="post" style="display:inline;margin:0;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button type="submit" style="background:none;border:none;color:#fca5a5;cursor:pointer;padding:0;font:inherit;">退出登录</button>
+      </form>
+      {% endif %}
     </div>
   </aside>
 
