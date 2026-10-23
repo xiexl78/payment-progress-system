@@ -39,6 +39,7 @@
 """
 import argparse
 import hashlib
+import json
 import os
 import sys
 from datetime import date, datetime, timedelta
@@ -875,12 +876,25 @@ def verify_new_projects(plan, errors, warnings):
 
 # ---------- 阶段 2：与现有库比对 / 差异分类 ----------
 
+def _date_text(value):
+    return value.isoformat() if value else '空'
+
+
 def _project_change_list(dbp, data):
     changes = []
     if dbp.name != data['name']:
         changes.append('项目名称「%s」→「%s」' % (dbp.name, data['name']))
     if (dbp.remark or '') != (data['remark'] or ''):
         changes.append('备注「%s」→「%s」' % (dbp.remark or '', data['remark'] or ''))
+    if (dbp.status or '') != (data['status'] or ''):
+        changes.append('项目状态 %s→%s' % (dbp.status, data['status']))
+    if dbp.trial_date != data['trial_date']:
+        changes.append('试运行日期 %s→%s'
+                       % (_date_text(dbp.trial_date), _date_text(data['trial_date'])))
+    if dbp.acceptance_date != data['acceptance_date']:
+        changes.append('验收日期 %s→%s'
+                       % (_date_text(dbp.acceptance_date),
+                          _date_text(data['acceptance_date'])))
     return changes
 
 
@@ -955,6 +969,8 @@ def classify_against_db(plan, update_existing):
         changes = _project_change_list(dbp, project)
         project['_changes'] = changes
         touched = bool(changes)
+        dates_changed = (dbp.trial_date != project['trial_date']
+                         or dbp.acceptance_date != project['acceptance_date'])
         if changes:
             diff['update'].append('项目 %s：%s' % (project_no, '；'.join(changes)))
         db_items = {item.item_name: item for item in dbp.items}
@@ -998,6 +1014,13 @@ def classify_against_db(plan, update_existing):
                            NODE_TYPE_LABELS[node['node_type']],
                            _pct_text(dbnode.ratio), dbnode.due_amount,
                            _pct_text(node['ratio']), node['due_amount']))
+                    if dates_changed and node['node_type'] in ('progress', 'acceptance',
+                                                               'warranty'):
+                        diff['frozen'].append(
+                            '项目 %s 科目「%s」%s：项目试运行/验收日期变化，'
+                            '但该节点已有业务，触发/应付日期冻结不改（需人工处理）'
+                            % (project_no, item['item_name'],
+                               NODE_TYPE_LABELS[node['node_type']]))
                     continue
                 node['_db_id'] = dbnode.id
                 if node['source'] == 'excel':
@@ -1014,6 +1037,29 @@ def classify_against_db(plan, update_existing):
                 node['_new_ratio'] = new_ratio
                 node['_new_due'] = new_due
                 node_changes = _node_change_list(dbnode, new_ratio, new_due)
+                if dates_changed:
+                    # 项目试运行/验收日期变化 → 按新日期重算派生日期（业务节点已冻结）
+                    new_trigger = dbnode.trigger_date
+                    new_due_date = dbnode.due_date
+                    wanted_acceptance = project['acceptance_date']
+                    if node['node_type'] == 'progress':
+                        new_trigger = project['trial_date']
+                    elif node['node_type'] == 'acceptance':
+                        new_trigger = wanted_acceptance
+                    elif node['node_type'] == 'warranty':
+                        new_due_date = ((wanted_acceptance
+                                         + timedelta(days=WARRANTY_DAYS))
+                                        if wanted_acceptance else None)
+                    node['_new_trigger'] = new_trigger
+                    node['_new_due_date'] = new_due_date
+                    if new_trigger != dbnode.trigger_date:
+                        node_changes.append('触发日期 %s→%s'
+                                            % (_date_text(dbnode.trigger_date),
+                                               _date_text(new_trigger)))
+                    if new_due_date != dbnode.due_date:
+                        node_changes.append('应付日期 %s→%s'
+                                            % (_date_text(dbnode.due_date),
+                                               _date_text(new_due_date)))
                 node['_changes'] = node_changes
                 if node_changes:
                     node['_action'] = 'update'
@@ -1171,11 +1217,24 @@ def _fill_dates(project, nodes):
 
 
 def _batch_row(action, object_type, obj=None, project_no=None, item_name=None,
-               node_type=None, detail=None):
+               node_type=None, detail=None, before=None, after=None):
     return {'action': action, 'object_type': object_type,
             'object_id': getattr(obj, 'id', None) if obj is not None else None,
             'project_no': project_no, 'item_name': item_name,
-            'node_type': node_type, 'detail': detail}
+            'node_type': node_type, 'detail': detail,
+            'before_json': (json.dumps(before, ensure_ascii=False, sort_keys=True,
+                                       default=str) if before is not None else None),
+            'after_json': (json.dumps(after, ensure_ascii=False, sort_keys=True,
+                                      default=str) if after is not None else None)}
+
+
+def _plain(value):
+    """把模型值转成可 JSON 序列化的值（Decimal/date 等）。"""
+    if isinstance(value, Decimal):
+        return format(value, 'f')
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    return value
 
 
 def write_plan(plan, batch_meta):
@@ -1188,7 +1247,8 @@ def write_plan(plan, batch_meta):
     batch_rows = []
     try:
         diff = plan.get('diff') or {}
-        counters['frozen_count'] = len(diff.get('frozen', []))
+        counters['frozen_count'] = sum(1 for node in plan['nodes']
+                                       if node.get('_action') == 'frozen')
         counters['skipped_count'] = (len(diff.get('skip', []))
                                      + int(diff.get('records_skipped', 0)))
 
@@ -1272,13 +1332,30 @@ def write_plan(plan, batch_meta):
             project_no = data['project_no']
             project = db.session.get(Project, data['_db_id'])
             if action == 'update':
+                before = {'name': project.name, 'remark': project.remark,
+                          'status': project.status,
+                          'trial_date': _plain(project.trial_date),
+                          'acceptance_date': _plain(project.acceptance_date),
+                          'warranty_due_date': _plain(project.warranty_due_date)}
                 project.name = data['name']
                 project.remark = data['remark']
+                project.status = data['status']
+                project.trial_date = data['trial_date']
+                project.acceptance_date = data['acceptance_date']
+                project.warranty_due_date = (
+                    data['acceptance_date'] + timedelta(days=WARRANTY_DAYS)
+                    if data['acceptance_date'] else None)
                 project.updated_by = None
+                after = {'name': project.name, 'remark': project.remark,
+                         'status': project.status,
+                         'trial_date': _plain(project.trial_date),
+                         'acceptance_date': _plain(project.acceptance_date),
+                         'warranty_due_date': _plain(project.warranty_due_date)}
                 counters['projects_updated'] += 1
                 batch_rows.append(_batch_row(
                     'update', 'project', project, project_no,
-                    detail='；'.join(data.get('_changes') or [])))
+                    detail='；'.join(data.get('_changes') or []),
+                    before=before, after=after))
             for item_data in plan['items']:
                 if item_data['project_no'] != project_no:
                     continue
@@ -1286,15 +1363,22 @@ def write_plan(plan, batch_meta):
                 action = item_data.get('_action')
                 if action == 'update':
                     item = db.session.get(ProjectItem, item_data['_db_id'])
+                    before = {'original_amount': _plain(item.original_amount),
+                              'additional_amount': _plain(item.additional_amount),
+                              'tax_rate': item.tax_rate}
                     item.original_amount = item_data['original_amount']
                     item.additional_amount = item_data['additional_amount']
                     item.tax_rate = item_data['tax_rate']
                     item.updated_by = None
                     item_objs[key] = item
                     counters['items_updated'] += 1
+                    after = {'original_amount': _plain(item.original_amount),
+                             'additional_amount': _plain(item.additional_amount),
+                             'tax_rate': item.tax_rate}
                     batch_rows.append(_batch_row(
                         'update', 'item', item, project_no, item_data['item_name'],
-                        detail='；'.join(item_data.get('_changes') or [])))
+                        detail='；'.join(item_data.get('_changes') or []),
+                        before=before, after=after))
                 elif action == 'create':
                     item = ProjectItem(project_id=project.id,
                                        item_name=item_data['item_name'],
@@ -1315,15 +1399,28 @@ def write_plan(plan, batch_meta):
                 action = node_data.get('_action')
                 if action == 'update':
                     node = db.session.get(PaymentNode, node_data['_db_id'])
+                    before = {'ratio': _plain(node.ratio),
+                              'due_amount': _plain(node.due_amount),
+                              'trigger_date': _plain(node.trigger_date),
+                              'due_date': _plain(node.due_date)}
                     node.ratio = node_data['_new_ratio']
                     node.due_amount = node_data['_new_due']
+                    if '_new_trigger' in node_data:
+                        node.trigger_date = node_data['_new_trigger']
+                    if '_new_due_date' in node_data:
+                        node.due_date = node_data['_new_due_date']
                     node.updated_by = None
                     node_objs[key] = node
                     counters['nodes_updated'] += 1
+                    after = {'ratio': _plain(node.ratio),
+                             'due_amount': _plain(node.due_amount),
+                             'trigger_date': _plain(node.trigger_date),
+                             'due_date': _plain(node.due_date)}
                     batch_rows.append(_batch_row(
                         'update', 'node', node, project_no, node_data['item_name'],
                         node_data['node_type'],
-                        detail='；'.join(node_data.get('_changes') or [])))
+                        detail='；'.join(node_data.get('_changes') or []),
+                        before=before, after=after))
                 elif action == 'frozen':
                     node = db.session.get(PaymentNode, node_data['_db_id'])
                     node_objs[key] = node
@@ -1436,6 +1533,9 @@ def write_plan(plan, batch_meta):
                             'file_name': batch_meta['file_name'],
                             'file_hash': batch_meta['file_hash'],
                             'counts': dict(counters),
+                            'changes': (diff.get('update') or [])[:50],
+                            'frozen': (diff.get('frozen') or [])[:20],
+                            'skipped': (diff.get('skip') or [])[:20],
                             'report_path': batch_meta.get('report_path')},
                      actor=(None, '命令行导入', 'system'), critical=False)
         db.session.commit()

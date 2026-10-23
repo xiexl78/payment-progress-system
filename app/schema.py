@@ -50,6 +50,11 @@ _COLUMN_PATCHES = {
         'frozen_count': 'INTEGER NOT NULL DEFAULT 0',
         'skipped_count': 'INTEGER NOT NULL DEFAULT 0',
     },
+    # 批次 7 回滚需要的原值/新值快照
+    'import_batch_rows': {
+        'before_json': 'TEXT',
+        'after_json': 'TEXT',
+    },
 }
 
 #: audit_logs 后续版本补充的列

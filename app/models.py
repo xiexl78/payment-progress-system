@@ -363,6 +363,9 @@ class ImportBatchRow(db.Model):
     item_name = db.Column(db.String(128), nullable=True)
     node_type = db.Column(db.String(16), nullable=True)
     detail = db.Column(db.Text, nullable=True)
+    # 更新行的原值/新值（JSON），供「按批次回滚」恢复；新建行为空
+    before_json = db.Column(db.Text, nullable=True)
+    after_json = db.Column(db.Text, nullable=True)
 
     def to_dict(self):
         return {
@@ -370,6 +373,7 @@ class ImportBatchRow(db.Model):
             'object_type': self.object_type, 'object_id': self.object_id,
             'project_no': self.project_no, 'item_name': self.item_name,
             'node_type': self.node_type, 'detail': self.detail,
+            'before_json': self.before_json, 'after_json': self.after_json,
         }
 
 
