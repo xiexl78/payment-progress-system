@@ -508,6 +508,32 @@ def projects():
                            keyword=keyword, status=status, deleted_view=deleted_view)
 
 
+def _create_item_nodes(item, operator_id=None):
+    """为科目生成 4 个付款节点：统一按「科目总额×比例」，尾差归质保金。
+
+    统一口径（批次 8）：首付款也按 原金额+增补金额 计算；逐项 ROUND_HALF_UP
+    后用 ``allocate_tail`` 归集尾差，保证 Σ节点应付 = 科目总额。
+    """
+    base_total = (Decimal(item.original_amount or 0)
+                  + Decimal(item.additional_amount or 0)).quantize(CENT)
+    ratios = {t['node_type']: Decimal(str(t['ratio'])) for t in NODE_TEMPLATES}
+    raw_dues = {nt: mul_ratio(base_total, ratios[nt]) for nt in ratios}
+    try:
+        dues = allocate_tail(raw_dues, base_total)
+    except ValueError:
+        dues = raw_dues
+    nodes = []
+    for t in NODE_TEMPLATES:
+        node = PaymentNode(project_id=item.project_id, item_id=item.id,
+                           node_type=t['node_type'], node_name=t['node_name'],
+                           ratio=ratios[t['node_type']], calc_base='total',
+                           due_amount=dues[t['node_type']],
+                           status='未触发', updated_by=operator_id)
+        db.session.add(node)
+        nodes.append(node)
+    return nodes
+
+
 @bp.route('/projects/new', methods=['GET', 'POST'])
 @login_required
 @role_required('admin', 'operator')
@@ -549,15 +575,9 @@ def project_new():
                 items.append(item)
             db.session.flush()
 
-            # 为每个科目生成 4 个付款节点
+            # 为每个科目生成 4 个付款节点（统一口径 + 尾差归集）
             for it in items:
-                for t in NODE_TEMPLATES:
-                    node = PaymentNode(project_id=project.id, item_id=it.id,
-                                       node_type=t['node_type'], node_name=t['node_name'],
-                                       ratio=Decimal(str(t['ratio'])), calc_base=t['calc_base'],
-                                       status='未触发', updated_by=current_user().id)
-                    node.recalc()
-                    db.session.add(node)
+                _create_item_nodes(it, current_user().id)
             sync_project_dates(project)
             audit_record('project.create', 'project', project.id, project.id,
                          after=_project_snapshot(project), critical=False)
@@ -680,13 +700,7 @@ def item_add(project_id):
                        updated_by=current_user().id)
     db.session.add(item)
     db.session.flush()
-    for t in NODE_TEMPLATES:
-        node = PaymentNode(project_id=project.id, item_id=item.id,
-                           node_type=t['node_type'], node_name=t['node_name'],
-                           ratio=Decimal(str(t['ratio'])), calc_base=t['calc_base'],
-                           status='未触发', updated_by=current_user().id)
-        node.recalc()
-        db.session.add(node)
+    _create_item_nodes(item, current_user().id)
     sync_project_dates(project)
     audit_record('item.create', 'item', item.id, project.id,
                  after=_item_snapshot(item), critical=False)
