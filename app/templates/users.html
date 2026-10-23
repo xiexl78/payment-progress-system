@@ -47,7 +47,7 @@
             {% else %}<span class="badge badge-gray">已停用</span>{% endif %}
             {% if u.must_change_password %}<span class="badge badge-orange">待改密</span>{% endif %}
           </td>
-          <td>{{ u.created_at.strftime('%Y-%m-%d %H:%M') if u.created_at else '—' }}</td>
+          <td>{{ u.created_at|localtime('%Y-%m-%d %H:%M') }}</td>
           <td>
             {% if u.id != current_user.id %}
             <form method="post" action="{{ url_for('main.user_toggle', user_id=u.id) }}" class="op-form" style="display:inline;">

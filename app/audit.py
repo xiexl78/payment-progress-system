@@ -30,7 +30,7 @@ KNOWN_ACTIONS = (
     'auth.login.success', 'auth.login.failed', 'auth.logout', 'auth.denied',
     'auth.login.locked', 'auth.login.force_change', 'auth.csrf_blocked',
     'project.create', 'project.edit', 'project.status', 'project.delete',
-    'project.trial', 'item.create',
+    'project.restore', 'project.trial', 'item.create',
     'node.apply', 'node.invoice', 'node.pay',
     'acceptance.add',
     'contract.upload', 'contract.confirm', 'contract.confirm.failed',

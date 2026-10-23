@@ -2,6 +2,7 @@
 
 - 审查人：架构师；代码：`app/audit.py`（164 行）、`app/models.py::AuditLog`、`app/routes.py` 埋点 28 处、`templates/audit.html`
 - 方法：代码通读 + 临时库探针实测（不碰 `instance/`）
+- **字段命名差异说明（2026-10-23 定）**：实现用 `ts / object_type / object_id / ua / actor_name`，设计稿（`review-technical.md` §10.2）用 `occurred_at / entity_type / entity_id / user_agent / actor_name`；两者语义一致，**以本次实现命名为准**，不改代码、不回改设计稿，后续审计相关文档/查询/导出都按实现字段名书写。
 - 结论：**字段与页面方向正确，但事务语义有实测缺陷、埋点有缺口，修完再合入**。
 
 ## 一、必须修（P0）
@@ -58,3 +59,7 @@
 - [ ] `python tests/run_qa.py` 退出码 0，审计用例从 XFAIL 转 PASS
 - [ ] 页面：admin 可筛选（项目/人/动作/日期）、分页、只读，无编辑删除入口
 - [ ] 90 秒内能回答："某项目某节点在什么时间被谁把金额/付款状态从 X 改成 Y"（用页面 + 关联审计）
+
+## 五、与 `docs/review-technical.md` §10 设计稿的命名差异（以实现为准）
+
+批次 3 落地时 `audit_logs` 实际字段名为 `ts / object_type / object_id / ua`，与 §10 设计稿的 `occurred_at / entity_type / entity_id / user_agent` 不同，语义一致；查询页路径为 `/admin/audit`。后续文档与用例以实际实现命名为准，如要统一命名建议补一次迁移说明，避免误读。

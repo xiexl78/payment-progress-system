@@ -7,6 +7,8 @@
 import os
 import re
 import sqlite3
+import subprocess
+import sys
 import threading
 
 import requests
@@ -239,7 +241,14 @@ def _permissions(s_admin):
     C.post(s_admin, BASE, '/admin/users/1/delete')
     check('权限', 'admin 删除自身被拒', q1(DB, 'SELECT COUNT(*) FROM users WHERE id=1') == 1)
     C.post(s_admin, BASE, '/projects/%d/delete' % pid_d)
-    check('权限', 'admin 删除项目允许', q1(DB, 'SELECT COUNT(*) FROM projects WHERE id=?', (pid_d,)) == 0)
+    conn = sqlite3.connect(DB)
+    pcols = [r[1] for r in conn.execute('PRAGMA table_info(projects)')]
+    conn.close()
+    visible = 'QA-待管理员删除项目' in s_admin.get(BASE + '/projects').text
+    check('权限', 'admin 删除项目改为软删除（列表不可见、数据保留）',
+          q1(DB, 'SELECT COUNT(*) FROM projects WHERE id=?', (pid_d,)) == 1
+          and ('deleted_at' in pcols) and not visible,
+          '物理删除或仍在列表', xfail='P1-01')
     return pid_a, pid_c, ct1
 
 
@@ -285,30 +294,36 @@ def _upload_security(s_admin):
     page = s_admin.get(BASE + '/projects/%d' % pid_x).text
     check('上传', '项目名称对脚本转义', '&lt;script&gt;' in page and "<script>alert('qa-name')" not in page)
 
-    # 上传大小：README 20MB vs 代码 16MB
-    big = b'A' * (17 * 1024 * 1024)
+    # 上传大小：用 21MB 必超限文件验证 413（避免 17MB 进入文本解析造成长耗时）
+    big = b'A' * (21 * 1024 * 1024)
     r_big = C.post(s_admin, BASE, '/contracts/upload', files={'file': ('big.txt', big, 'text/plain')})
-    check('上传', '17MB 应在上限内（README 20MB）被接收', r_big.status_code == 302 and '/confirm' in r_big.headers.get('Location', ''),
-          'code=%s（实际上限 16MB）' % r_big.status_code, xfail='P2-01')
+    check('上传', '超过上限的文件应返回 413',
+          r_big.status_code == 413, 'code=%s' % r_big.status_code)
     r_after = s_admin.get(BASE + '/projects')
     check('上传', '超限请求后服务仍可用', r_after.status_code == 200)
     check('上传', '服务端上传上限与 README 标注一致（20MB）',
           APP.config.get('MAX_CONTENT_LENGTH') == 20 * 1024 * 1024,
-          '实际 %s' % APP.config.get('MAX_CONTENT_LENGTH'), xfail='P2-01')
+          '实际 %s' % APP.config.get('MAX_CONTENT_LENGTH'))
 
-    # 图片 OCR（本机沙箱可能不可用）
-    try:
-        from PIL import Image, ImageDraw
-        png = os.path.join(os.environ.get('TEMP', '.'), 'qa_ocr_probe.png')
-        im = Image.new('RGB', (900, 300), 'white')
-        ImageDraw.Draw(im).text((30, 60), '合同总金额 165000 元 税率 13%', fill='black')
-        im.save(png)
-        r_img = C.post(s_admin, BASE, '/contracts/upload', files={'file': ('ocr_probe.png', open(png, 'rb'), 'image/png')})
-        img_row = q(DB, 'SELECT status,error_msg FROM contract_files ORDER BY id DESC LIMIT 1')[0]
-        check('上传', '图片合同 OCR 可识别并进入确认页', r_img.status_code == 302 and '/confirm' in r_img.headers.get('Location', ''),
-              'status=%s error=%s（目标机需复测）' % (img_row[0], img_row[1]), xfail='P2-08')
-    except ImportError:
-        check('上传', '图片合同 OCR 用例（Pillow 未安装跳过）', True)
+    # 图片 OCR（本机沙箱 WinRT 文件访问受限，默认跳过实际 OCR，避免子进程卡死）
+    if os.environ.get('QA_ENABLE_OCR', '0') != '1':
+        check('上传', '图片合同 OCR 可识别并进入确认页（默认跳过：本机沙箱不可用，需目标机实测）',
+              False, '设置 QA_ENABLE_OCR=1 可在目标机启用该用例', xfail='P2-08')
+    else:
+        try:
+            from PIL import Image, ImageDraw
+            png = os.path.join(os.environ.get('TEMP', '.'), 'qa_ocr_probe.png')
+            im = Image.new('RGB', (900, 300), 'white')
+            ImageDraw.Draw(im).text((30, 60), '合同总金额 165000 元 税率 13%', fill='black')
+            im.save(png)
+            with open(png, 'rb') as fh:
+                r_img = C.post(s_admin, BASE, '/contracts/upload', files={'file': ('ocr_probe.png', fh, 'image/png')})
+            img_row = q(DB, 'SELECT status,error_msg FROM contract_files ORDER BY id DESC LIMIT 1')[0]
+            check('上传', '图片合同 OCR 可识别并进入确认页',
+                  r_img.status_code == 302 and '/confirm' in r_img.headers.get('Location', ''),
+                  'status=%s error=%s（目标机需复测）' % (img_row[0], img_row[1]), xfail='P2-08')
+        except ImportError:
+            check('上传', '图片合同 OCR 用例（Pillow 未安装跳过）', True)
 
 
 def _state_and_money(s_admin, pid_a, pid_c):
@@ -849,7 +864,7 @@ def _security_baseline(s_admin):
     check('安全基线', '404 页面为中文友好页（含「页面不存在」）',
           r404.status_code == 404 and '页面不存在' in r404.text,
           '默认英文 404 页')
-    big = b'A' * (17 * 1024 * 1024)
+    big = b'A' * (21 * 1024 * 1024)
     r413 = C.post(s_admin, BASE, '/contracts/upload', files={'file': ('sec_big.txt', big, 'text/plain')})
     body413 = r413.text
     check('安全基线', '413 超限页为中文友好提示',
@@ -870,27 +885,31 @@ def _security_baseline(s_admin):
 
 def _audit_extras(s_admin):
     """批次 3 补充验收：停用登录、停用/启用审计、筛选分页、审计降级、updated_by 落值。"""
+    s_admin, _ = C.login(BASE, 'admin', 'admin123')
     # 1) 停用后登录被拒 + 停用/启用审计
     C.post(s_admin, BASE, '/admin/users/new',
            {'username': 'qa_dis_u', 'display_name': 'QA停用用户', 'password': 'Qa#123456', 'role': 'viewer'})
     uid = q1(DB, 'SELECT id FROM users WHERE username=?', ('qa_dis_u',))
     check('审计补充', '新建用户可登录', C.login(BASE, 'qa_dis_u', 'Qa#123456')[1].status_code == 302)
-    base = _audit_max_id()
-    C.post(s_admin, BASE, '/admin/users/%d/toggle' % uid)
-    _, r_fail = C.login(BASE, 'qa_dis_u', 'Qa#123456')
-    check('审计补充', '停用后登录被拒', r_fail.status_code == 200, 'code=%s' % r_fail.status_code)
-    rows = _audit_rows(base)
-    acts = [str(r.get('action', '')) for r in rows]
-    dis_rows = [r for r in rows if str(r.get('action')) == 'user.disable']
-    check('审计补充', '停用操作写审计（user.disable，含 is_active 前后值）',
-          bool(dis_rows) and not _empty_json(dis_rows[0].get('before_json'))
-          and not _empty_json(dis_rows[0].get('after_json')),
-          '动作=%s' % acts)
-    base = _audit_max_id()
-    C.post(s_admin, BASE, '/admin/users/%d/toggle' % uid)
-    check('审计补充', '启用后恢复登录', C.login(BASE, 'qa_dis_u', 'Qa#123456')[1].status_code == 302)
-    en_rows = [r for r in _audit_rows(base) if str(r.get('action')) == 'user.enable']
-    check('审计补充', '启用操作写审计（user.enable）', bool(en_rows), '动作=%s' % [r.get('action') for r in _audit_rows(base)])
+    if uid is None:
+        check('审计补充', '停用后登录被拒', False, '测试用户创建失败', xfail='P1-10')
+    else:
+        base = _audit_max_id()
+        C.post(s_admin, BASE, '/admin/users/%d/toggle' % uid)
+        _, r_fail = C.login(BASE, 'qa_dis_u', 'Qa#123456')
+        check('审计补充', '停用后登录被拒', r_fail.status_code == 200, 'code=%s' % r_fail.status_code)
+        rows = _audit_rows(base)
+        acts = [str(r.get('action', '')) for r in rows]
+        dis_rows = [r for r in rows if str(r.get('action')) == 'user.disable']
+        check('审计补充', '停用操作写审计（user.disable，含 is_active 前后值）',
+              bool(dis_rows) and not _empty_json(dis_rows[0].get('before_json'))
+              and not _empty_json(dis_rows[0].get('after_json')),
+              '动作=%s' % acts)
+        base = _audit_max_id()
+        C.post(s_admin, BASE, '/admin/users/%d/toggle' % uid)
+        check('审计补充', '启用后恢复登录', C.login(BASE, 'qa_dis_u', 'Qa#123456')[1].status_code == 302)
+        en_rows = [r for r in _audit_rows(base) if str(r.get('action')) == 'user.enable']
+        check('审计补充', '启用操作写审计（user.enable）', bool(en_rows), '动作=%s' % [r.get('action') for r in _audit_rows(base)])
 
     # 2) 审计筛选 + 分页（脚本注入 60 条合成记录；页面大小 50）
     conn = sqlite3.connect(DB, timeout=15)
@@ -941,6 +960,235 @@ def _audit_extras(s_admin):
           r.status_code == 302 and exists == 1, 'code=%s 项目存在=%s' % (r.status_code, exists))
 
 
+def _cfg_client(**cfg):
+    base = {'SECRET_KEY': C.DEFAULT_SECRET}
+    base.update(cfg)
+    return C.make_app(DB, **base).test_client()
+
+
+def _batch4b_security(s_admin):
+    """批次 4b 验收：改密/重置、强制改密、登录限速、会话失效、越权审计、上传上限配置化。"""
+    # 0) 新用户密码最小长度
+    uc0 = q1(DB, 'SELECT COUNT(*) FROM users')
+    C.post(s_admin, BASE, '/admin/users/new',
+           {'username': 'qa_short_pw', 'display_name': 'QA短密码', 'password': 'short', 'role': 'viewer'})
+    check('4b安全', '新建用户密码不足 8 位应被拒绝',
+          q1(DB, 'SELECT COUNT(*) FROM users WHERE username=?', ('qa_short_pw',)) == 0
+          and q1(DB, 'SELECT COUNT(*) FROM users') == uc0, '短密码用户被创建')
+
+    # 1) 自助改密 /change-password
+    C.post(s_admin, BASE, '/admin/users/new',
+           {'username': 'qa_pw_u', 'display_name': 'QA改密用户', 'password': 'Qa#123456', 'role': 'operator'})
+    uid = q1(DB, 'SELECT id FROM users WHERE username=?', ('qa_pw_u',))
+    check('4b安全', '新建用户使用 8 位以上密码可创建', uid is not None)
+    s1, _ = C.login(BASE, 'qa_pw_u', 'Qa#123456')
+    s2, _ = C.login(BASE, 'qa_pw_u', 'Qa#123456')
+    check('4b安全', '改密页面登录后可访问',
+          s1.get(BASE + '/change-password', allow_redirects=False).status_code == 200)
+    base_audit = _audit_max_id()
+    pw_data = {'current_password': 'Qa#123456', 'old_password': 'Qa#123456',
+               'new_password': 'New#123456', 'confirm_password': 'New#123456',
+               'new_password_confirm': 'New#123456'}
+    r = C.post(s1, BASE, '/change-password', pw_data)
+    check('4b安全', '改密成功（当前密码正确、新密码≥8、确认一致）', r.status_code == 302,
+          'code=%s' % r.status_code)
+    check('4b安全', '改密后旧密码失效', C.login(BASE, 'qa_pw_u', 'Qa#123456')[1].status_code == 200,
+          '旧密码仍可登录')
+    check('4b安全', '改密后新密码可登录', C.login(BASE, 'qa_pw_u', 'New#123456')[1].status_code == 302,
+          '新密码不可登录')
+    check('4b安全', '改密后其它旧会话失效',
+          s2.get(BASE + '/projects', allow_redirects=False).status_code == 302)
+    check('4b安全', '改密写审计 user.change_password',
+          any('change_password' in str(x.get('action', '')) for x in _audit_rows(base_audit)),
+          '未找到改密审计')
+
+    # 2) 管理员重置密码 /admin/users/<id>/reset-password
+    C.post(s_admin, BASE, '/admin/users/new',
+           {'username': 'qa_rst_u', 'display_name': 'QA重置用户', 'password': 'Qa#123456', 'role': 'viewer'})
+    uid_r = q1(DB, 'SELECT id FROM users WHERE username=?', ('qa_rst_u',))
+    s_old, _ = C.login(BASE, 'qa_rst_u', 'Qa#123456')
+    base_audit = _audit_max_id()
+    r = C.post(s_admin, BASE, '/admin/users/%d/reset-password' % uid_r,
+               {'password': 'Rst#123456', 'new_password': 'Rst#123456'})
+    check('4b安全', '管理员重置密码成功', r.status_code == 302, 'code=%s' % r.status_code)
+    check('4b安全', '重置后旧会话失效',
+          s_old.get(BASE + '/projects', allow_redirects=False).status_code == 302)
+    r_new = C.login(BASE, 'qa_rst_u', 'Rst#123456')[1]
+    check('4b安全', '重置后强制改密（登录跳转 /change-password）',
+          r_new.status_code == 302 and '/change-password' in r_new.headers.get('Location', ''),
+          'loc=%s' % r_new.headers.get('Location'))
+    check('4b安全', '重置密码写审计 user.reset_password',
+          any('reset_password' in str(x.get('action', '')) for x in _audit_rows(base_audit)),
+          '未找到重置审计')
+
+    # 3) 强制改密：默认口令登录跳转改密页
+    tc = _cfg_client(FORCE_DEFAULT_PASSWORD_CHANGE=True)
+    r = tc.post('/login', data={'username': 'admin', 'password': 'admin123'}, follow_redirects=False)
+    check('4b安全', '强制改密：默认口令登录跳转 /change-password',
+          r.status_code == 302 and '/change-password' in r.headers.get('Location', ''),
+          'loc=%s' % r.headers.get('Location'))
+
+    # 4) 登录限速/锁定
+    C.post(s_admin, BASE, '/admin/users/new',
+           {'username': 'qa_lock_u', 'display_name': 'QA限速用户', 'password': 'Qa#123456', 'role': 'viewer'})
+    tc = _cfg_client(LOGIN_THROTTLE_ENABLED=True)
+    for _ in range(5):
+        tc.post('/login', data={'username': 'qa_lock_u', 'password': 'wrong'}, follow_redirects=False)
+    base_audit = _audit_max_id()
+    r = tc.post('/login', data={'username': 'qa_lock_u', 'password': 'Qa#123456'}, follow_redirects=False)
+    body = r.get_data(as_text=True)
+    check('4b安全', '连续 5 次失败后登录被锁定（200+中文提示）',
+          r.status_code == 200 and any(k in body for k in ('锁定', '稍后', '尝试')),
+          'code=%s' % r.status_code)
+    acts = [str(x.get('action', '')) for x in _audit_rows(0)]
+    check('4b安全', '登录失败/锁定写审计（auth.login.failed/locked）',
+          sum(1 for a in acts if 'login.failed' in a) >= 5
+          and any('login.locked' in a for a in acts), '动作=%s' % acts[-5:])
+
+    # 5) 越权尝试写审计 auth.denied
+    _, pid_deny = create_project(s_admin, 'QA-DENY', 'QA越权审计', [('科目', '100', '0')])
+    s_op, _ = C.login(BASE, 'jbr', '123456')
+    base_audit = _audit_max_id()
+    s_op.post(BASE + '/projects/%d/delete' % pid_deny, allow_redirects=False)
+    denied = [x for x in _audit_rows(base_audit)
+              if 'denied' in str(x.get('action', '')).lower() or str(x.get('result')) == 'denied']
+    check('4b安全', '越权尝试写审计 auth.denied', bool(denied),
+          '未找到越权审计')
+
+    # 6) 上传上限配置化（MAX_UPLOAD_MB，默认 20MB 与 README 对齐）
+    env = os.environ.copy()
+    env['SECRET_KEY'] = 'qa-upload-cfg-secret'
+    env['MAX_UPLOAD_MB'] = '20'
+    out_file = os.path.join(os.path.dirname(DB), 'upload_cfg.txt')
+    code = ('from app import create_app; a = create_app(); '
+            'print(a.config["MAX_CONTENT_LENGTH"])')
+    with open(out_file, 'w', encoding='utf-8') as f:
+        r = subprocess.run([sys.executable, '-c', code], cwd=C.PROJECT_ROOT,
+                           env=env, stdout=f, stderr=subprocess.STDOUT, timeout=120)
+    val = ''
+    try:
+        val = open(out_file, encoding='utf-8').read().strip()
+    except Exception:
+        pass
+    nums = [ln.strip() for ln in val.splitlines() if ln.strip().isdigit()]
+    check('4b安全', 'MAX_UPLOAD_MB 可配置且默认 20MB（与 README 对齐）',
+          r.returncode == 0 and bool(nums) and int(nums[-1]) == 20 * 1024 * 1024,
+          'returncode=%s output=%s' % (r.returncode, val[:120]))
+
+
+
+def _tx_semantics(s_admin):
+    """事务语义：业务回滚不落审计；关键审计失败业务失败；非关键降级见审计补充。"""
+    s_admin, _ = C.login(BASE, 'admin', 'admin123')
+    _, pid = create_project(s_admin, 'QA-TX', 'QA事务语义', [('科目', '1000', '0')])
+    nid = node_ids(pid, 'first')[0]
+    C.post(s_admin, BASE, '/nodes/%d/update' % nid, {'action': 'apply', 'apply_amount': '300'})
+    base = _audit_max_id()
+    r = C.post(s_admin, BASE, '/nodes/%d/update' % nid, {'action': 'pay', 'paid_amount': '99999'})
+    rows = [x for x in _audit_rows(base) if 'node.pay' in str(x.get('action', ''))]
+    check('事务语义', '业务校验失败回滚时不落审计',
+          not rows and r.status_code in (200, 302), '新增 node.pay 审计=%d' % len(rows))
+
+    conn = sqlite3.connect(DB, timeout=15)
+    conn.execute('ALTER TABLE audit_logs RENAME TO audit_logs_bak')
+    conn.commit()
+    conn.close()
+    try:
+        st_before = q1(DB, 'SELECT status FROM payment_nodes WHERE id=?', (nid,))
+        r = C.post(s_admin, BASE, '/nodes/%d/update' % nid,
+                   {'action': 'invoice', 'invoice_amount': '10', 'invoice_no': 'FP-TX'})
+        st_after = q1(DB, 'SELECT status FROM payment_nodes WHERE id=?', (nid,))
+        check('事务语义', '关键动作审计写失败时业务失败并回滚',
+              r.status_code >= 500 and st_after == st_before,
+              'code=%s status=%s→%s' % (r.status_code, st_before, st_after))
+    finally:
+        conn = sqlite3.connect(DB, timeout=15)
+        conn.execute('ALTER TABLE audit_logs_bak RENAME TO audit_logs')
+        conn.commit()
+        conn.close()
+
+
+def _session_invalidation_cases(s_admin):
+    """4b 会话失效补充：登出、停用后旧 Cookie 失效。"""
+    s_admin, _ = C.login(BASE, 'admin', 'admin123')
+    s1, _ = C.login(BASE, 'viewer', '123456')
+    s1.post(BASE + '/logout', allow_redirects=False)
+    check('会话失效', '登出后旧 Cookie 失效',
+          s1.get(BASE + '/projects', allow_redirects=False).status_code == 302)
+    C.post(s_admin, BASE, '/admin/users/new',
+           {'username': 'qa_sess_u', 'display_name': 'QA会话用户', 'password': 'Qa#123456', 'role': 'viewer'})
+    uid = q1(DB, 'SELECT id FROM users WHERE username=?', ('qa_sess_u',))
+    if uid is not None:
+        s2, _ = C.login(BASE, 'qa_sess_u', 'Qa#123456')
+        C.post(s_admin, BASE, '/admin/users/%d/toggle' % uid)
+        check('会话失效', '停用后旧会话失效',
+              s2.get(BASE + '/projects', allow_redirects=False).status_code == 302)
+    else:
+        check('会话失效', '停用后旧会话失效', False, '测试用户创建失败')
+
+
+def _soft_delete_cases(s_admin):
+    """项目软删除 + 时间口径（批次 4c 验收，未实现部分 xfail）。"""
+    s_admin, _ = C.login(BASE, 'admin', 'admin123')
+    _, pid = create_project(s_admin, 'QA-SOFT', 'QA软删项目', [('科目', '1000', '0')])
+    if pid is not None:
+        nodes_before = q1(DB, 'SELECT COUNT(*) FROM payment_nodes WHERE project_id=?', (pid,))
+        C.post(s_admin, BASE, '/projects/%d/delete' % pid)
+        conn = sqlite3.connect(DB)
+        cols = [r[1] for r in conn.execute('PRAGMA table_info(projects)')]
+        conn.close()
+        exists = q1(DB, 'SELECT COUNT(*) FROM projects WHERE id=?', (pid,))
+        deleted_at = q1(DB, 'SELECT deleted_at FROM projects WHERE id=?', (pid,)) if 'deleted_at' in cols else None
+        nodes_after = q1(DB, 'SELECT COUNT(*) FROM payment_nodes WHERE project_id=?', (pid,))
+        page = s_admin.get(BASE + '/projects').text
+        check('软删除', '删除后列表不可见且数据保留（软删）',
+              exists == 1 and deleted_at is not None and 'QA软删项目' not in page
+              and nodes_before == nodes_after,
+              'exists=%s deleted_at=%s nodes=%s→%s' % (exists, deleted_at, nodes_before, nodes_after),
+              xfail='P1-01')
+        page = s_admin.get(BASE + '/reports').text
+        check('软删除', '删除后报表不可见', 'QA软删项目' not in page, '报表仍可见')
+        trash = s_admin.get(BASE + '/projects?deleted=1', allow_redirects=False)
+        check('软删除', 'admin 可通过 /projects?deleted=1 查看回收站',
+              trash.status_code == 200 and 'QA软删项目' in trash.text,
+              'code=%s' % trash.status_code)
+        base = _audit_max_id()
+        r = s_admin.post(BASE + '/projects/%d/restore' % pid, allow_redirects=False)
+        acts = [str(x.get('action', '')) for x in _audit_rows(base)]
+        check('软删除', '恢复后列表可见并写 project.restore 审计',
+              r.status_code == 302 and 'QA软删项目' in s_admin.get(BASE + '/projects').text
+              and any('project.restore' in a for a in acts), '动作=%s' % acts)
+
+    _, pid_arch = create_project(s_admin, 'QA-ARCH', 'QA归档项目', [('科目', '1000', '0')])
+    if pid_arch is not None:
+        C.post(s_admin, BASE, '/projects/%d/status' % pid_arch, {'status': '已归档'})
+        page = s_admin.get(BASE + '/projects?status=已归档').text
+        check('软删除', '归档≠删除：归档项目仍在库且可按状态查询',
+              q1(DB, 'SELECT COUNT(*) FROM projects WHERE id=?', (pid_arch,)) == 1
+              and 'QA归档项目' in page)
+
+    # 时间口径：存储统一 UTC；审计 ts 与业务 created_at 差值 <5 分钟
+    from datetime import datetime
+    conn = sqlite3.connect(DB)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute('SELECT ts FROM audit_logs ORDER BY id DESC LIMIT 1').fetchone()
+        ts = row['ts'] if row else None
+    except sqlite3.Error:
+        ts = None
+    conn.close()
+    created = q1(DB, 'SELECT created_at FROM projects ORDER BY id DESC LIMIT 1')
+    diff_ok = False
+    try:
+        t1 = datetime.strptime(str(ts)[:19], '%Y-%m-%d %H:%M:%S')
+        t2 = datetime.strptime(str(created)[:19], '%Y-%m-%d %H:%M:%S')
+        diff_ok = abs((t1 - t2).total_seconds()) < 300
+    except Exception:
+        pass
+    check('时间口径', '审计 ts 与业务 created_at 存储时区一致（UTC，差值<5 分钟）',
+          diff_ok, 'audit=%s created=%s' % (ts, created))
+
+
 def run(server):
     global DB, BASE, APP, UPLOAD_DIR
     DB, BASE, APP, UPLOAD_DIR = server.db_path, server.base, server.app, server.upload_dir
@@ -966,4 +1214,8 @@ def run(server):
         section('########## 8. 审计与配置 ##########', lambda: _audit_and_config(s_admin, pid_a, ct1))
     section('########## 9. 审计留痕（批次 3 验收） ##########', lambda: _audit_trails(s_admin))
     section('########## 10. 安全基线（批次 4a 验收） ##########', lambda: _security_baseline(s_admin))
-    section('########## 11. 审计补充（批次 3 补测，末项会删临时库 audit_logs） ##########', lambda: _audit_extras(s_admin))
+    section('########## 11. 密码与登录限速（批次 4b 验收） ##########', lambda: _batch4b_security(s_admin))
+    section('########## 11a. 会话失效补充（4b） ##########', lambda: _session_invalidation_cases(s_admin))
+    section('########## 11b. 事务语义（审计与业务同事务） ##########', lambda: _tx_semantics(s_admin))
+    section('########## 11c. 软删除与时间口径（下一批次验收） ##########', lambda: _soft_delete_cases(s_admin))
+    section('########## 12. 审计补充（批次 3 补测，末项会删临时库 audit_logs） ##########', lambda: _audit_extras(s_admin))

@@ -22,7 +22,7 @@ class User(db.Model):
     is_active = db.Column(db.Boolean, nullable=False, default=True)    # 停用后不能登录
     must_change_password = db.Column(db.Boolean, nullable=False, default=False)  # 首次/重置后强制改密
     password_updated_at = db.Column(db.DateTime, nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.now)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)      # 存储 UTC，展示转本地时
 
     def set_password(self, raw):
         self.password_hash = generate_password_hash(raw)
@@ -50,9 +50,12 @@ class Project(db.Model):
     warranty_due_date = db.Column(db.Date, nullable=True)   # 质保到期日期 = 验收日期+3年
     remark = db.Column(db.Text, nullable=True)
     created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.now)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)      # 存储 UTC，展示转本地时
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     updated_by = db.Column(db.Integer, nullable=True)   # 最后修改人（不建外键，避免删用户受阻）
+    # 软删除（批次 4c）：删除=回收站，仍可看/恢复；归档是业务结束，仍可见
+    deleted_at = db.Column(db.DateTime, nullable=True)
+    deleted_by = db.Column(db.Integer, nullable=True)
 
     items = db.relationship('ProjectItem', backref='project', cascade='all, delete-orphan', lazy='selectin')
     nodes = db.relationship('PaymentNode', backref='project', cascade='all, delete-orphan', lazy='selectin')
@@ -193,7 +196,7 @@ class PaymentApplication(db.Model):
     status = db.Column(db.String(16), nullable=False, default='未开票已申请')  # 未开票已申请/已申请/已付款
     applicant_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     applicant_name = db.Column(db.String(64), nullable=True)
-    apply_time = db.Column(db.DateTime, default=datetime.now)
+    apply_time = db.Column(db.DateTime, default=datetime.utcnow)   # UTC
 
     records = db.relationship('PaymentRecord', backref='application', cascade='all, delete-orphan', lazy='selectin')
 
@@ -220,7 +223,7 @@ class PaymentRecord(db.Model):
     voucher_no = db.Column(db.String(128), nullable=True)
     operator_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     operator_name = db.Column(db.String(64), nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.now)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)   # UTC
 
     def to_dict(self):
         return {
@@ -249,7 +252,7 @@ class ContractFile(db.Model):
     raw_text = db.Column(db.Text, nullable=True)                # 提取的合同全文
     error_msg = db.Column(db.String(512), nullable=True)
     created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.now)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)   # UTC
     confirmed_by = db.Column(db.Integer, nullable=True)      # 最后一次确认/回改人
     confirmed_at = db.Column(db.DateTime, nullable=True)     # 最后一次确认/回改时间（UTC）
 
@@ -274,7 +277,7 @@ class AcceptanceRecord(db.Model):
     conclusion = db.Column(db.String(256), nullable=True)   # 验收结论
     acceptor = db.Column(db.String(64), nullable=True)      # 验收人
     remark = db.Column(db.Text, nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.now)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)   # UTC
 
     def to_dict(self):
         return {

@@ -6,7 +6,7 @@
 <div class="card">
   <div class="card-title">
     操作日志（只读）
-    <span class="sub">共 {{ total }} 条 · 时间为 UTC · 日志不可编辑/删除</span>
+    <span class="sub">共 {{ total }} 条 · 时间为本地时（{{ config.APP_TIMEZONE }}） · 日志不可编辑/删除</span>
   </div>
 
   {% if errors %}
@@ -39,11 +39,11 @@
       </select>
     </div>
     <div>
-      <label class="field-label">开始日期（UTC）</label>
+      <label class="field-label">开始日期</label>
       <input type="date" name="date_from" value="{{ filters.get('date_from', '') }}">
     </div>
     <div>
-      <label class="field-label">结束日期（UTC）</label>
+      <label class="field-label">结束日期</label>
       <input type="date" name="date_to" value="{{ filters.get('date_to', '') }}">
     </div>
     <div class="flex" style="gap:8px;">
@@ -58,7 +58,7 @@
     <table class="table">
       <thead>
         <tr>
-          <th style="white-space:nowrap;">时间（UTC）</th>
+          <th style="white-space:nowrap;">时间</th>
           <th>操作人</th>
           <th>动作</th>
           <th>对象</th>
@@ -71,7 +71,7 @@
       <tbody>
         {% for row in rows %}
         <tr>
-          <td style="white-space:nowrap;font-size:12px;">{{ row.ts.strftime('%Y-%m-%d %H:%M:%S') if row.ts else '—' }}</td>
+          <td style="white-space:nowrap;font-size:12px;">{{ row.ts|localtime('%Y-%m-%d %H:%M:%S') }}</td>
           <td>{{ row.actor_name or ('ID:' ~ row.actor_id if row.actor_id else '—') }}</td>
           <td><span class="badge badge-blue">{{ row.action }}</span></td>
           <td>{{ row.object_type or '—' }}{% if row.object_id %} #{{ row.object_id }}{% endif %}</td>

@@ -65,6 +65,7 @@ def create_app(config=None):
         SESSION_COOKIE_SAMESITE='Lax',
         SESSION_COOKIE_SECURE=os.environ.get('SESSION_COOKIE_SECURE', '0').strip() == '1',
         PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
+        APP_TIMEZONE=os.environ.get('APP_TIMEZONE', 'Asia/Shanghai'),
         CSRF_ENABLED=True,
         DEBUG=False,
         TESTING=False,

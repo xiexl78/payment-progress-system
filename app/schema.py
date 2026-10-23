@@ -27,6 +27,8 @@ _COLUMN_PATCHES = {
     'projects': {
         'updated_at': 'DATETIME',
         'updated_by': 'INTEGER',
+        'deleted_at': 'DATETIME',
+        'deleted_by': 'INTEGER',
     },
     'project_items': {
         'updated_at': 'DATETIME',

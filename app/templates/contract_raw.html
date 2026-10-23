@@ -13,7 +13,7 @@
     </div>
   </div>
   <div class="src-text mb-8">
-    识别引擎：{{ '大模型' if contract.engine == 'llm' else '本地规则' }} · 上传时间：{{ contract.created_at.strftime('%Y-%m-%d %H:%M') if contract.created_at else '—' }} ·
+    识别引擎：{{ '大模型' if contract.engine == 'llm' else '本地规则' }} · 上传时间：{{ contract.created_at|localtime('%Y-%m-%d %H:%M') }} ·
     状态：
     {% if contract.status == 'recognized' %}<span class="badge badge-orange">待确认</span>
     {% elif contract.status == 'confirmed' %}<span class="badge badge-green">已生成项目</span>

@@ -38,6 +38,13 @@
       {% endif %}
     </form>
     <div class="right">
+      {% if current_user.role == 'admin' %}
+        {% if deleted_view %}
+        <a href="{{ url_for('main.projects') }}" class="btn btn-ghost">← 返回项目列表</a>
+        {% else %}
+        <a href="{{ url_for('main.projects', deleted=1) }}" class="btn btn-ghost">回收站</a>
+        {% endif %}
+      {% endif %}
       {% if current_user.role in ('admin', 'operator') %}
       <a href="{{ url_for('main.project_new') }}" class="btn btn-primary">+ 新建项目</a>
       {% endif %}
@@ -48,7 +55,9 @@
     {% for p in projects %}
     <div class="project-row" style="border-bottom:1px solid #edf2f7; padding:14px 0; {{ 'border-bottom:none;' if loop.last }}">
       <div class="info">
-        <div class="name">{{ p.name }}</div>
+        <div class="name">{{ p.name }}
+          {% if p.deleted_at %}<span class="badge badge-gray">已删除</span>{% endif %}
+        </div>
         <div class="meta">
           {{ p.project_no }}
           · 试运行：{{ p.trial_date.strftime('%Y-%m-%d') if p.trial_date else '未登记' }}
@@ -79,16 +88,23 @@
       <div class="actions">
         <a href="{{ url_for('main.project_detail', project_id=p.id) }}" class="btn btn-outline btn-sm">查看详情</a>
         {% if current_user.role == 'admin' %}
-        <form method="post" action="{{ url_for('main.project_delete', project_id=p.id) }}" style="display:inline;" onsubmit="return confirm('确定删除「{{ p.name }}」？关联数据将全部清除，不可恢复。');">
+          {% if p.deleted_at %}
+          <form method="post" action="{{ url_for('main.project_restore', project_id=p.id) }}" style="display:inline;" onsubmit="return confirm('确定恢复项目「{{ p.name }}」？');">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-          <button type="submit" class="btn btn-ghost btn-sm text-danger">删除</button>
-        </form>
+            <button type="submit" class="btn btn-success btn-sm">恢复</button>
+          </form>
+          {% else %}
+          <form method="post" action="{{ url_for('main.project_delete', project_id=p.id) }}" style="display:inline;" onsubmit="return confirm('确定删除「{{ p.name }}」？删除后进入回收站，可由管理员恢复。');">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="btn btn-ghost btn-sm text-danger">删除</button>
+          </form>
+          {% endif %}
         {% endif %}
       </div>
     </div>
     {% endfor %}
   {% else %}
-    <div class="empty">暂无项目，点击右上角「新建项目」开始登记</div>
+    <div class="empty">{{ '回收站为空' if deleted_view else '暂无项目，点击右上角「新建项目」开始登记' }}</div>
   {% endif %}
 </div>
 

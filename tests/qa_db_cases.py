@@ -3,6 +3,8 @@
 import os
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 
 from sqlalchemy import text
@@ -124,7 +126,7 @@ def _case_backup(tmp):
     src_code = open(os.path.join(PROJECT_ROOT, 'scripts', 'init_db.py'), encoding='utf-8').read()
     has_confirm = any(k in src_code for k in ('input(', 'confirm', '确认'))
     check('备份', 'init_db --force 删库前应二次确认/自动备份',
-          has_confirm, '直接 os.remove 删库重建', xfail='P0-03')
+          has_confirm, '直接 os.remove 删库重建')
 
 
 def _case_wal(tmp):
@@ -179,6 +181,133 @@ def _case_cwd(tmp):
         _dispose(app)
 
 
+def _case_initdb():
+    print('\n########## 6. init_db 删库保护与备份恢复（批次 5 验收） ##########')
+    tmp = tempfile.mkdtemp(prefix='payment_qa_initdb_')
+    dst = os.path.join(tmp, 'proj')
+    shutil.copytree(PROJECT_ROOT, dst,
+                    ignore=shutil.ignore_patterns('instance', '__pycache__', 'tests',
+                                                  'docs', 'backups', '*.pyc'))
+    env = os.environ.copy()
+    env['SECRET_KEY'] = 'qa-initdb-secret-not-default'
+    env['PAYMENT_BACKUP_DIR'] = os.path.join(tmp, 'backups')
+    env.pop('MAX_UPLOAD_MB', None)
+    dbp = os.path.join(dst, 'instance', 'payment_progress.db')
+    log = os.path.join(tmp, 'initdb.log')
+
+    def run(args):
+        with open(log, 'a', encoding='utf-8') as f:
+            r = subprocess.run([sys.executable, 'scripts/init_db.py'] + args,
+                               cwd=dst, env=env, stdin=subprocess.DEVNULL,
+                               stdout=f, stderr=subprocess.STDOUT, timeout=180)
+        return r.returncode
+
+    def marker():
+        if not os.path.exists(dbp):
+            return -1
+        conn = sqlite3.connect(dbp)
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM projects WHERE project_no='QA-INITDB-MARKER'").fetchone()[0]
+        except sqlite3.Error:
+            return -2
+        finally:
+            conn.close()
+
+    try:
+        check('初始化', '首次初始化成功',
+              run([]) == 0 and os.path.exists(dbp), '详见 %s' % log)
+        conn = sqlite3.connect(dbp)
+        conn.execute("INSERT INTO projects (project_no, name, status, remark, created_at) "
+                     "VALUES ('QA-INITDB-MARKER', '备份标记项目', '进行中', '', datetime('now'))")
+        conn.commit()
+        conn.close()
+        check('初始化', '--force 无确认应中止且库不丢',
+              run(['--force']) != 0 and marker() == 1, '库被删或未中止')
+        check('初始化', '--no-backup 未与 --yes 同用应中止',
+              run(['--force', '--no-backup']) != 0 and marker() == 1, '非法组合未中止')
+
+        rc = run(['--force', '--yes'])
+        check('初始化', '--force --yes 成功并重建种子库',
+              rc == 0 and marker() == 0, 'returncode=%s' % rc)
+        backups = []
+        for root, _, files in os.walk(tmp):
+            for fn in files:
+                p = os.path.join(root, fn)
+                if fn.endswith('.db') and os.path.abspath(p) != os.path.abspath(dbp):
+                    backups.append(p)
+        check('初始化', '--force --yes 生成备份产物', bool(backups),
+              '未找到备份文件，日志见 %s' % log)
+        if backups:
+            src = max(backups, key=os.path.getmtime)
+            for suffix in ('-wal', '-shm'):
+                if os.path.exists(dbp + suffix):
+                    os.remove(dbp + suffix)
+            shutil.copy2(src, dbp)
+            check('初始化', '备份产物可恢复且数据完整（含标记项目）',
+                  marker() == 1, '备份=%s' % src)
+        # --no-backup 与 --yes 同用应允许，但本次不校验「无备份」细节
+        check('初始化', '--force --yes --no-backup 组合可成功',
+              run(['--force', '--yes', '--no-backup']) == 0)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+
+def _case_schema_upgrade(tmp):
+    print('\n########## 7. 旧库缺列自动升级（幂等、数据不丢） ##########')
+    dbp = os.path.join(tmp, 'old_schema.db')
+    seed_db(dbp)
+    conn = sqlite3.connect(dbp)
+    conn.execute("INSERT INTO projects (project_no, name, status, remark, created_at) "
+                 "VALUES ('QA-OLD-MARKER', '旧库标记项目', '进行中', '', datetime('now'))")
+    conn.commit()
+    drops = [('users', 'is_active'), ('users', 'must_change_password'), ('users', 'password_updated_at'),
+             ('projects', 'updated_at'), ('projects', 'updated_by'),
+             ('project_items', 'updated_at'), ('project_items', 'updated_by'),
+             ('payment_nodes', 'updated_at'), ('payment_nodes', 'updated_by'),
+             ('contract_files', 'confirmed_by'), ('contract_files', 'confirmed_at')]
+    dropped = 0
+    for table, col in drops:
+        try:
+            conn.execute('ALTER TABLE %s DROP COLUMN %s' % (table, col))
+            dropped += 1
+        except sqlite3.Error:
+            pass
+    for tbl in ('audit_logs', 'user_sessions'):
+        try:
+            conn.execute('DROP TABLE %s' % tbl)
+        except sqlite3.Error:
+            pass
+    conn.commit()
+    conn.close()
+    try:
+        app = make_app(dbp)
+        client, _ = _login_client(app)
+        page = client.get('/projects').get_data(as_text=True)
+        check('升级', '旧库缺列启动时自动补齐且应用可用',
+              dropped >= 6 and 'QA-OLD-MARKER' in page and 'PJ-2025-DSJ' in page,
+              '补列前删除列数=%d' % dropped)
+        conn = sqlite3.connect(dbp)
+        users_cols = {r[1] for r in conn.execute('PRAGMA table_info(users)')}
+        nodes_cols = {r[1] for r in conn.execute('PRAGMA table_info(payment_nodes)')}
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        conn.close()
+        check('升级', '升级后补齐 is_active/updated_at 且重建 audit_logs',
+              'is_active' in users_cols and 'updated_at' in nodes_cols and 'audit_logs' in tables,
+              'users=%s nodes=%s' % (sorted(users_cols), sorted(nodes_cols)))
+        _dispose(app)
+        try:
+            app2 = make_app(dbp)
+            st = q1(dbp, "SELECT COUNT(*) FROM projects WHERE project_no='QA-OLD-MARKER'")
+            _dispose(app2)
+            check('升级', '升级幂等（重复启动不报错、数据仍在）', st == 1, 'marker=%s' % st)
+        except Exception as e:
+            check('升级', '升级幂等（重复启动不报错、数据仍在）', False, repr(e))
+    finally:
+        pass
+
+
 def run():
     tmp = tempfile.mkdtemp(prefix='payment_qa_db_')
     print('数据库专项临时目录: %s' % tmp)
@@ -188,5 +317,7 @@ def run():
         _case_backup(tmp)
         _case_wal(tmp)
         _case_cwd(tmp)
+        _case_initdb()
+        _case_schema_upgrade(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

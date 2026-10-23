@@ -3,15 +3,28 @@
 {% block page_title %}{{ project.name }}{% endblock %}
 {% block content %}
 
+{% if project.deleted_at %}
+<div class="flash danger" style="margin-bottom:12px;">
+  <b>该项目已删除（在回收站中）</b>：{{
+  project.deleted_at|localtime('%Y-%m-%d %H:%M') }} 由管理员删除。当前仅可查看，恢复后才能继续操作。
+  {% if current_user.role == 'admin' %}
+  <form method="post" action="{{ url_for('main.project_restore', project_id=project.id) }}" style="display:inline;margin-left:10px;" onsubmit="return confirm('确定恢复该项目？');">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button type="submit" class="btn btn-success btn-sm">恢复项目</button>
+  </form>
+  {% endif %}
+</div>
+{% endif %}
+
 <div class="card">
   <div class="card-title">
     项目信息
     <div class="flex">
       <span class="badge {{ 'badge-green' if project.status == '已完成' else 'badge-blue' if project.status == '进行中' else 'badge-gray' }}">{{ project.status }}</span>
-      {% if current_user.role in ('admin', 'operator') %}
+      {% if not project.deleted_at and current_user.role in ('admin', 'operator') %}
       <a href="{{ url_for('main.project_edit', project_id=project.id) }}" class="btn btn-outline btn-sm">编辑项目</a>
       {% endif %}
-      {% if current_user.role == 'admin' and project.status != '已归档' %}
+      {% if not project.deleted_at and current_user.role == 'admin' and project.status != '已归档' %}
       <form method="post" action="{{ url_for('main.project_status', project_id=project.id) }}" class="op-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <select name="status">
@@ -22,8 +35,8 @@
         <button type="submit" class="btn btn-ghost btn-sm">更新状态</button>
       </form>
       {% endif %}
-      {% if current_user.role == 'admin' %}
-      <form method="post" action="{{ url_for('main.project_delete', project_id=project.id) }}" class="op-form" onsubmit="return confirm('确定删除该项目？关联的付款节点、申请、发票、付款记录将全部清除，不可恢复。');">
+      {% if not project.deleted_at and current_user.role == 'admin' %}
+      <form method="post" action="{{ url_for('main.project_delete', project_id=project.id) }}" class="op-form" onsubmit="return confirm('确定删除该项目？删除后进入回收站，可由管理员恢复。');">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button type="submit" class="btn btn-ghost btn-sm text-danger">删除项目</button>
       </form>

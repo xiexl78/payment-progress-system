@@ -12,7 +12,7 @@ from flask import (Blueprint, render_template, request, redirect, url_for, sessi
                    flash, jsonify, abort, current_app)
 from sqlalchemy import or_, update
 
-from . import NODE_TEMPLATES, FLOW_STATUS, login_guard, session_guard
+from . import NODE_TEMPLATES, FLOW_STATUS, login_guard, session_guard, timeutil
 from .audit import action_options, record as audit_record, snapshot as audit_snapshot
 from .contract_engine import extract_text, recognize_contract
 from .models import (db, User, Project, ProjectItem, PaymentNode, PaymentApplication,
@@ -143,7 +143,42 @@ def fmt_money(v):
 
 
 def make_apply_no():
-    return 'AP' + datetime.now().strftime('%Y%m%d%H%M%S') + str(datetime.now().microsecond % 1000)
+    now = timeutil.utcnow()
+    return 'AP' + now.strftime('%Y%m%d%H%M%S') + str(now.microsecond % 1000)
+
+
+@bp.app_template_filter('localtime')
+def _localtime_filter(value, fmt='%Y-%m-%d %H:%M'):
+    """模板时间展示：UTC 存储 → APP_TIMEZONE 本地时。"""
+    try:
+        local = timeutil.to_local(value)
+        return local.strftime(fmt) if local else '—'
+    except Exception:
+        return '—'
+
+
+def _is_admin():
+    user = current_user()
+    return bool(user and user.role == 'admin')
+
+
+def _get_project(project_id, *, include_deleted=False):
+    """取项目；已删除项目仅 admin 在 include_deleted 时可取（其它一律 404）。"""
+    project = db.session.get(Project, project_id)
+    if project is None:
+        abort(404)
+    if project.deleted_at is not None:
+        if not (include_deleted and _is_admin()):
+            abort(404)
+    return project
+
+
+def _guard_active_project(project):
+    """已删除项目禁止业务变更；返回重定向响应或 None。"""
+    if project is not None and project.deleted_at is not None:
+        flash('该项目已删除（在回收站中），请先恢复后再操作', 'danger')
+        return redirect(url_for('main.project_detail', project_id=project.id))
+    return None
 
 
 def sync_project_dates(project, collect=False):
@@ -408,7 +443,12 @@ def index():
 def projects():
     keyword = (request.args.get('keyword') or '').strip()
     status = (request.args.get('status') or '').strip()
+    deleted_view = _is_admin() and (request.args.get('deleted') or '') == '1'
     q = Project.query
+    if deleted_view:
+        q = q.filter(Project.deleted_at.isnot(None))
+    else:
+        q = q.filter(Project.deleted_at.is_(None))
     if keyword:
         q = q.filter(or_(Project.name.contains(keyword), Project.project_no.contains(keyword)))
     if status:
@@ -418,10 +458,10 @@ def projects():
         'total': len(project_list),
         'ongoing': sum(1 for p in project_list if p.status == '进行中'),
         'done': sum(1 for p in project_list if p.status == '已完成'),
-        'amount': sum(p.total_amount() for p in project_list),
+        'amount': sum((p.total_amount() for p in project_list), ZERO),
     }
     return render_template('projects.html', projects=project_list, stats=stats,
-                           keyword=keyword, status=status)
+                           keyword=keyword, status=status, deleted_view=deleted_view)
 
 
 @bp.route('/projects/new', methods=['GET', 'POST'])
@@ -485,7 +525,7 @@ def project_new():
 @bp.route('/projects/<int:project_id>')
 @login_required
 def project_detail(project_id):
-    project = db.session.get(Project, project_id)
+    project = _get_project(project_id, include_deleted=True)
     if not project:
         abort(404)
     # 按节点类型聚合展示，便于跨科目合计（Decimal 口径）
@@ -510,7 +550,7 @@ def project_detail(project_id):
 @login_required
 @role_required('admin', 'operator')
 def project_edit(project_id):
-    project = db.session.get(Project, project_id)
+    project = _get_project(project_id)
     if not project:
         abort(404)
     if request.method == 'POST':
@@ -550,7 +590,7 @@ def project_edit(project_id):
 @login_required
 @role_required('admin', 'operator')
 def item_add(project_id):
-    project = db.session.get(Project, project_id)
+    project = _get_project(project_id)
     if not project:
         abort(404)
     item_name = (request.form.get('item_name') or '').strip()
@@ -596,28 +636,47 @@ def item_add(project_id):
 @login_required
 @role_required('admin')
 def project_delete(project_id):
+    project = _get_project(project_id)
+    if not project:
+        abort(404)
+    if project.deleted_at is not None:
+        flash('项目已在回收站中', 'info')
+        return redirect(url_for('main.projects'))
+    before_snapshot = _project_snapshot(project)
+    # 软删除（批次 4c）：只打标记，不删节点/申请/付款/验收，不解绑合同
+    project.deleted_at = timeutil.utcnow()
+    project.deleted_by = current_user().id
+    audit_record('project.delete', 'project', project.id, project.id,
+                 before=before_snapshot,
+                 after={'deleted_at': _date_str(project.deleted_at),
+                        'deleted_by': project.deleted_by},
+                 result='ok')
+    db.session.commit()
+    flash('项目已移入回收站（管理员可在「回收站」中查看/恢复）', 'success')
+    return redirect(url_for('main.projects'))
+
+
+@bp.route('/projects/<int:project_id>/restore', methods=['POST'])
+@login_required
+@role_required('admin')
+def project_restore(project_id):
+    """从回收站恢复项目（admin）。"""
     project = db.session.get(Project, project_id)
     if not project:
         abort(404)
-    before_snapshot = _project_snapshot(project)
-    audit_record('project.delete', 'project', project.id, project.id,
-                 before=before_snapshot, result='ok')
-    # 级联清理关联数据（bulk delete 不触发 ORM cascade，按依赖顺序手动清理）
-    node_ids = [n.id for n in PaymentNode.query.filter_by(project_id=project.id).all()]
-    if node_ids:
-        PaymentRecord.query.filter(PaymentRecord.node_id.in_(node_ids)).delete(synchronize_session=False)
-        PaymentApplication.query.filter(PaymentApplication.node_id.in_(node_ids)).delete(synchronize_session=False)
-    PaymentNode.query.filter_by(project_id=project.id).delete(synchronize_session=False)
-    ProjectItem.query.filter_by(project_id=project.id).delete(synchronize_session=False)
-    AcceptanceRecord.query.filter_by(project_id=project.id).delete(synchronize_session=False)
-    # 解除合同文件的 project_id 绑定
-    for cf in ContractFile.query.filter_by(project_id=project.id).all():
-        cf.project_id = None
-        cf.status = 'recognized'
-    db.session.delete(project)
+    if project.deleted_at is None:
+        flash('项目未删除，无需恢复', 'info')
+        return redirect(url_for('main.project_detail', project_id=project.id))
+    before = {'deleted_at': _date_str(project.deleted_at),
+              'deleted_by': project.deleted_by}
+    project.deleted_at = None
+    project.deleted_by = None
+    project.updated_by = current_user().id
+    audit_record('project.restore', 'project', project.id, project.id,
+                 before=before, after={'deleted_at': None, 'deleted_by': None})
     db.session.commit()
-    flash('项目「%s」已删除' % project.name, 'success')
-    return redirect(url_for('main.projects'))
+    flash('项目「%s」已恢复' % project.name, 'success')
+    return redirect(url_for('main.project_detail', project_id=project.id))
 
 
 @bp.route('/nodes/<int:node_id>/update', methods=['POST'])
@@ -627,6 +686,9 @@ def node_update(node_id):
     node = db.session.get(PaymentNode, node_id)
     if not node:
         abort(404)
+    guard = _guard_active_project(node.project)
+    if guard:
+        return guard
     detail_url = url_for('main.project_detail', project_id=node.project_id)
     actor = current_user()
     action = request.form.get('action')
@@ -712,7 +774,7 @@ def node_update(node_id):
 
         elif action == 'pay':
             parsed = validate_node_action(node, 'pay', request.form)
-            pay_date = parse_date(request.form.get('pay_date'), field='付款日期') or date.today()
+            pay_date = parse_date(request.form.get('pay_date'), field='付款日期') or timeutil.local_today()
             pay_method = (request.form.get('pay_method') or '').strip()
             voucher = (request.form.get('voucher_no') or '').strip()
             # 原子累加已付金额：数据库端条件保证累计不超应付、状态前置为已申请
@@ -770,7 +832,7 @@ def node_update(node_id):
 @login_required
 @role_required('admin', 'operator')
 def acceptance_add(project_id):
-    project = db.session.get(Project, project_id)
+    project = _get_project(project_id)
     if not project:
         abort(404)
     try:
@@ -809,7 +871,7 @@ def acceptance_add(project_id):
 @login_required
 @role_required('admin', 'operator')
 def trial_set(project_id):
-    project = db.session.get(Project, project_id)
+    project = _get_project(project_id)
     if not project:
         abort(404)
     try:
@@ -835,7 +897,7 @@ def trial_set(project_id):
 @login_required
 @role_required('admin')
 def project_status(project_id):
-    project = db.session.get(Project, project_id)
+    project = _get_project(project_id)
     if not project:
         abort(404)
     status = request.form.get('status')
@@ -1242,6 +1304,10 @@ def contract_confirm(contract_id):
     if contract.status == 'confirmed' and project is None:
         flash('该合同已确认但关联项目不存在，请重新识别或重新上传合同', 'danger')
         return redirect(url_for('main.contracts'))
+    guard = _guard_active_project(project)
+    if guard:
+        flash('关联项目已删除，请先在回收站恢复后再修改合同', 'danger')
+        return redirect(url_for('main.contracts'))
     if is_update:
         values = _project_contract_values(project)
         blockers = _contract_blockers(project)
@@ -1283,6 +1349,9 @@ def contract_confirm_submit(contract_id):
         project = db.session.get(Project, contract.project_id)
         if not project:
             flash('关联项目已不存在，请重新确认', 'danger')
+            return redirect(url_for('main.contracts'))
+        if project.deleted_at is not None:
+            flash('关联项目已删除，请先在回收站恢复后再修改合同', 'danger')
             return redirect(url_for('main.contracts'))
         current = _project_contract_values(project)
         diff = _diff_contract_values(current, submission)
@@ -1430,7 +1499,8 @@ def contract_raw(contract_id):
 @bp.route('/reports')
 @login_required
 def reports():
-    projects = Project.query.order_by(Project.created_at.desc()).all()
+    projects = (Project.query.filter(Project.deleted_at.is_(None))
+                .order_by(Project.created_at.desc()).all())
     rows = []
     for p in projects:
         due = sum_money(n.due_amount for n in p.nodes)
@@ -1447,7 +1517,7 @@ def reports():
     total_paid = sum_money(r['paid'] for r in rows)
     total_unpaid = sum_money(r['unpaid'] for r in rows)
     # 待办提醒：质保到期、已申请待付款、已付款节点
-    today = date.today()
+    today = timeutil.local_today()
     reminders = []
     for p in projects:
         if p.warranty_due_date:
@@ -1626,10 +1696,9 @@ def audit_logs():
     if action:
         query = query.filter(AuditLog.action == action)
     if date_from:
-        query = query.filter(AuditLog.ts >= datetime.combine(date_from, datetime.min.time()))
+        query = query.filter(AuditLog.ts >= timeutil.local_date_start_utc(date_from))
     if date_to:
-        query = query.filter(AuditLog.ts <
-                             datetime.combine(date_to + timedelta(days=1), datetime.min.time()))
+        query = query.filter(AuditLog.ts < timeutil.local_date_end_utc(date_to))
 
     total = query.count()
     page = max(1, request.args.get('page', 1, type=int) or 1)
