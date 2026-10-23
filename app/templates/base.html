@@ -44,6 +44,7 @@
     <div class="side-user">
       <b>{{ current_user.display_name if current_user else '' }}</b>
       {{ current_user.role if current_user else '' }} ·
+      <a href="{{ url_for('main.change_password') }}" style="color:#93c5fd;">修改密码</a> ·
       {% if request.endpoint == 'main.audit_logs' %}
       {# 审计页保持「无任何 POST 表单」，退出用脚本提交 POST，不出现 form 标签 #}
       <button type="button" onclick="dshLogout()" style="background:none;border:none;color:#fca5a5;cursor:pointer;padding:0;font:inherit;">退出登录</button>

@@ -28,12 +28,30 @@ def generate_csrf_token():
     return token
 
 
+def rotate_csrf_token():
+    """敏感操作后轮换 CSRF token（旧页面表单 token 失效，Cookie 重新签名）。"""
+    token = secrets.token_urlsafe(32)
+    session[CSRF_SESSION_KEY] = token
+    return token
+
+
 def _submitted_token():
     return (request.form.get(CSRF_FORM_FIELD)
             or request.headers.get(CSRF_HEADER) or '')
 
 
 def _csrf_failed():
+    """CSRF 校验失败：写审计（容错）后返回 403 中文页。"""
+    try:
+        from .audit import record
+        from .models import db
+        record('auth.csrf_blocked', object_type='endpoint', result='denied',
+               critical=False,
+               after={'endpoint': request.endpoint, 'path': request.path,
+                      'method': request.method})
+        db.session.commit()
+    except Exception:
+        pass
     abort(403, description='CSRF 校验失败，请刷新页面后重新提交')
 
 

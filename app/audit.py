@@ -28,6 +28,7 @@ __all__ = ['record', 'snapshot', 'action_options', 'KNOWN_ACTIONS']
 #: 系统内已知动作（审计页筛选下拉使用固定集合，避免被任意数据/合成记录污染）
 KNOWN_ACTIONS = (
     'auth.login.success', 'auth.login.failed', 'auth.logout', 'auth.denied',
+    'auth.login.locked', 'auth.login.force_change', 'auth.csrf_blocked',
     'project.create', 'project.edit', 'project.status', 'project.delete',
     'project.trial', 'item.create',
     'node.apply', 'node.invoice', 'node.pay',

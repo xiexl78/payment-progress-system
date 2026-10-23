@@ -193,7 +193,7 @@ def extract_payment_method(text):
         m = re.search(re.escape(kw) + r'\s*[:：]?\s*([^。；;\n]{2,60})', text)
         if m and not re.match(r'^[，。、]', m.group(1)):
             return m.group(1).strip(), (m.group(0).strip()[:160])
-    for m in re.finditer(r'[^。；;\n]*(?:分期支付|一次性付清|按月支付|按进度支付|预付)[^。；;\n]{0,40}', text):
+    for m in re.finditer(r'[^。；;\n]{0,80}(?:分期支付|一次性付清|按月支付|按进度支付|预付)[^。；;\n]{0,40}', text):
         seg = m.group(0).strip()
         if seg:
             return seg[:80], seg[:160]

@@ -20,6 +20,8 @@ class User(db.Model):
     display_name = db.Column(db.String(64), nullable=False)
     role = db.Column(db.String(16), nullable=False, default='viewer')  # admin / operator / viewer
     is_active = db.Column(db.Boolean, nullable=False, default=True)    # 停用后不能登录
+    must_change_password = db.Column(db.Boolean, nullable=False, default=False)  # 首次/重置后强制改密
+    password_updated_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.now)
 
     def set_password(self, raw):
@@ -282,6 +284,18 @@ class AcceptanceRecord(db.Model):
             'remark': self.remark,
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M') if self.created_at else None,
         }
+
+
+class UserSession(db.Model):
+    """服务端会话：登出/改密/重置后旧 Cookie 立即失效；敏感操作可轮换当前会话。"""
+    __tablename__ = 'user_sessions'
+    id = db.Column(db.Integer, primary_key=True)
+    token = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    user_id = db.Column(db.Integer, nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    ip = db.Column(db.String(45), nullable=True)
+    ua = db.Column(db.String(256), nullable=True)
 
 
 class AuditLog(db.Model):

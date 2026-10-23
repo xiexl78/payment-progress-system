@@ -21,6 +21,8 @@ from .models import AuditLog, db
 _COLUMN_PATCHES = {
     'users': {
         'is_active': 'BOOLEAN NOT NULL DEFAULT 1',
+        'must_change_password': 'BOOLEAN NOT NULL DEFAULT 0',
+        'password_updated_at': 'DATETIME',
     },
     'projects': {
         'updated_at': 'DATETIME',
@@ -85,6 +87,11 @@ def upgrade_schema(app):
             if 'audit_logs' not in tables:
                 AuditLog.__table__.create(bind=db.engine, checkfirst=True)
                 applied.append('audit_logs(create)')
+            # 其余缺失表（user_sessions 等）按模型补建
+            for table in db.metadata.sorted_tables:
+                if table.name not in tables:
+                    table.create(bind=db.engine, checkfirst=True)
+                    applied.append('%s(create)' % table.name)
             for index in AuditLog.__table__.indexes:
                 index.create(bind=db.engine, checkfirst=True)
         except Exception as exc:

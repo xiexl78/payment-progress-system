@@ -45,6 +45,7 @@
           <td>
             {% if u.is_active %}<span class="badge badge-green">启用</span>
             {% else %}<span class="badge badge-gray">已停用</span>{% endif %}
+            {% if u.must_change_password %}<span class="badge badge-orange">待改密</span>{% endif %}
           </td>
           <td>{{ u.created_at.strftime('%Y-%m-%d %H:%M') if u.created_at else '—' }}</td>
           <td>
@@ -52,6 +53,12 @@
             <form method="post" action="{{ url_for('main.user_toggle', user_id=u.id) }}" class="op-form" style="display:inline;">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
               <button type="submit" class="btn btn-ghost btn-sm">{{ '停用' if u.is_active else '启用' }}</button>
+            </form>
+            <form method="post" action="{{ url_for('main.user_reset_password', user_id=u.id) }}" class="op-form" style="display:inline;"
+                  onsubmit="return confirm('确定重置「{{ u.display_name }}」的密码？该用户下次登录需先改密。');">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <input type="password" name="password" class="small" placeholder="新密码(≥8位)" required minlength="8" style="width:120px;">
+              <button type="submit" class="btn btn-outline btn-sm">重置密码</button>
             </form>
             <form method="post" action="{{ url_for('main.user_delete', user_id=u.id) }}" class="op-form" style="display:inline;" onsubmit="return confirm('确定删除用户「{{ u.display_name }}」？');">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

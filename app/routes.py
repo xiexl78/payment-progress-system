@@ -8,41 +8,62 @@ from datetime import date, timedelta, datetime
 from decimal import Decimal, ROUND_HALF_UP
 from functools import wraps
 
-from flask import Blueprint, render_template, request, redirect, url_for, session, flash, jsonify, abort
+from flask import (Blueprint, render_template, request, redirect, url_for, session,
+                   flash, jsonify, abort, current_app)
 from sqlalchemy import or_, update
 
-from . import NODE_TEMPLATES, FLOW_STATUS
+from . import NODE_TEMPLATES, FLOW_STATUS, login_guard, session_guard
 from .audit import action_options, record as audit_record, snapshot as audit_snapshot
 from .contract_engine import extract_text, recognize_contract
 from .models import (db, User, Project, ProjectItem, PaymentNode, PaymentApplication,
                      PaymentRecord, AcceptanceRecord, ContractFile, AuditLog)
 from .money import CENT, MAX_MONEY, ZERO, fmt_money as money_fmt, mul_ratio, sum_money
-from .validation import (PROJECT_STATUSES, NODE_TYPES, NODE_LABELS, TAX_RATES,
-                         ValidationError, parse_amount, parse_date,
-                         validate_contract_submission, validate_node_action,
-                         validate_project_dates, validate_project_item_rows,
-                         validate_text)
+from .validation import (DEFAULT_ACCOUNT_PASSWORDS, PROJECT_STATUSES, NODE_TYPES,
+                         NODE_LABELS, TAX_RATES, ValidationError, parse_amount,
+                         parse_date, validate_contract_submission, validate_node_action,
+                         validate_password, validate_project_dates,
+                         validate_project_item_rows, validate_text)
 
 bp = Blueprint('main', __name__)
 
 #: 质保期天数：与原始 Excel 公式 `N3+365*3` 保持一致（P1 口径待业务确认）
 WARRANTY_DAYS = 365 * 3
+#: 识别只处理前 5 万字符（合同正文远小于此；避免超大文本/异常文本触发正则退化）
+MAX_RECOGNIZE_CHARS = 50000
 
 
 # ---------- 工具函数 ----------
 
 def current_user():
+    """当前登录用户：服务端会话校验（登出/改密/过期后旧 Cookie 立即失效）。"""
     uid = session.get('user_id')
-    if not uid:
+    token = session.get(session_guard.SESSION_KEY)
+    if not uid or not token:
         return None
-    return db.session.get(User, uid)
+    try:
+        row = session_guard.load_valid_session(token, user_id=uid)
+    except Exception:
+        return None
+    if row is None:
+        session.clear()
+        return None
+    user = db.session.get(User, uid)
+    if user is None or not user.is_active:
+        session.clear()
+        return None
+    return user
 
 
 def login_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
-        if not current_user():
+        user = current_user()
+        if not user:
             return redirect(url_for('main.login'))
+        if (user.must_change_password or session.get('force_pw_change')) and \
+                request.endpoint not in ('main.change_password', 'main.logout', 'main.login'):
+            flash('请先修改初始密码后再继续操作', 'warning')
+            return redirect(url_for('main.change_password'))
         return f(*args, **kwargs)
     return wrapper
 
@@ -79,8 +100,10 @@ def error_method_not_allowed(error):
 
 @bp.app_errorhandler(413)
 def error_payload_too_large(error):
+    limit_mb = max(1, int(current_app.config.get('MAX_CONTENT_LENGTH', 20 * 1024 * 1024))
+                   // (1024 * 1024))
     return render_template('error.html', code=413, title='上传文件过大',
-                           message='上传文件超过 16MB 限制，请压缩或拆分后重试。'), 413
+                           message='上传文件超过 %dMB 限制，请压缩或拆分后重试。' % limit_mb), 413
 
 
 @bp.app_errorhandler(500)
@@ -218,6 +241,41 @@ def _operator_id():
 
 # ---------- 认证 ----------
 
+def _login_throttle_config():
+    cfg = current_app.config
+    return {
+        'enabled': bool(cfg.get('LOGIN_THROTTLE_ENABLED', True)),
+        'max_failures': max(1, int(cfg.get('LOGIN_MAX_FAILURES', 5) or 5)),
+        'window_seconds': max(1, int(float(cfg.get('LOGIN_FAILURE_WINDOW_MINUTES', 5) or 5) * 60)),
+        'lock_seconds': max(1, int(float(cfg.get('LOGIN_LOCK_MINUTES', 15) or 15) * 60)),
+    }
+
+
+def _refresh_session_after_sensitive():
+    """敏感操作（改金额/合同）后刷新当前会话：轮换 CSRF token，响应重新签名 Cookie。
+
+    注意：不做服务端会话行轮换——同一会话并发请求下会互相失效（QA 并发用例暴露）。
+    账号级敏感操作（改密/重置/停用/登出）才撤销服务端会话。
+    """
+    try:
+        if not current_user():
+            return
+        from .security import rotate_csrf_token
+        rotate_csrf_token()
+    except Exception:
+        current_app.logger.exception('敏感操作后刷新会话失败')
+
+
+def _must_change_password(user):
+    """是否要求先改密：账号标记，或仍在使用默认口令（生产模式）。"""
+    if user.must_change_password:
+        return True
+    if not current_app.config.get('FORCE_DEFAULT_PASSWORD_CHANGE', True):
+        return False
+    default_password = DEFAULT_ACCOUNT_PASSWORDS.get(user.username)
+    return bool(default_password) and user.check_password(default_password)
+
+
 @bp.route('/login', methods=['GET', 'POST'])
 def login():
     if current_user():
@@ -225,25 +283,67 @@ def login():
     if request.method == 'POST':
         username = (request.form.get('username') or '').strip()
         password = request.form.get('password') or ''
+        ip = request.remote_addr
+        throttle = _login_throttle_config()
+        if throttle['enabled'] and login_guard.is_locked(
+                username, ip, window_seconds=throttle['window_seconds'],
+                lock_seconds=throttle['lock_seconds']):
+            audit_record('auth.login.locked', 'user', result='denied',
+                         after={'username': username, 'ip': ip})
+            db.session.commit()
+            flash('登录失败次数过多，账号已临时锁定，请 %d 分钟后再试'
+                  % max(1, throttle['lock_seconds'] // 60), 'danger')
+            return render_template('login.html')
+
         user = User.query.filter_by(username=username).first()
         if user and user.check_password(password):
             if not user.is_active:
+                if throttle['enabled']:
+                    login_guard.register_failure(
+                        username, ip, window_seconds=throttle['window_seconds'],
+                        max_failures=throttle['max_failures'],
+                        lock_seconds=throttle['lock_seconds'])
                 audit_record('auth.login.failed', 'user', user.id, result='failed',
                              after={'username': username, 'reason': '账号已停用'})
                 db.session.commit()
                 flash('账号已停用，请联系管理员', 'danger')
                 return render_template('login.html')
-            session['user_id'] = user.id
-            session.permanent = True
+
+            login_guard.reset(username, ip)
+            session_guard.create_session(user)
             audit_record('auth.login.success', 'user', user.id,
                          after={'username': username})
             db.session.commit()
+
+            if _must_change_password(user):
+                # 只在当前会话标记强制改密，不写库（避免影响该用户其它有效会话）
+                session['force_pw_change'] = True
+                audit_record('auth.login.force_change', 'user', user.id,
+                             after={'username': username,
+                                    'reason': '初始/默认口令需修改'})
+                db.session.commit()
+                flash('检测到您正在使用初始/默认口令，请先修改密码', 'warning')
+                return redirect(url_for('main.change_password'))
             flash(f'欢迎回来，{user.display_name}', 'success')
             return redirect(url_for('main.projects'))
+
+        locked_now = False
+        if throttle['enabled']:
+            locked_now = login_guard.register_failure(
+                username, ip, window_seconds=throttle['window_seconds'],
+                max_failures=throttle['max_failures'],
+                lock_seconds=throttle['lock_seconds'])
         audit_record('auth.login.failed', 'user', user.id if user else None,
                      result='failed', after={'username': username})
         db.session.commit()
-        flash('用户名或密码错误', 'danger')
+        if locked_now:
+            audit_record('auth.login.locked', 'user', user.id if user else None,
+                         result='denied', after={'username': username, 'ip': ip})
+            db.session.commit()
+            flash('登录失败次数过多，账号已临时锁定，请 %d 分钟后再试'
+                  % max(1, throttle['lock_seconds'] // 60), 'danger')
+        else:
+            flash('用户名或密码错误', 'danger')
     return render_template('login.html')
 
 
@@ -253,9 +353,46 @@ def logout():
     if user:
         audit_record('auth.logout', 'user', user.id, after={'username': user.username})
         db.session.commit()
-    session.clear()
+    session_guard.revoke_current()
+    db.session.commit()
     flash('已退出登录', 'info')
     return redirect(url_for('main.login'))
+
+
+@bp.route('/change-password', methods=['GET', 'POST'])
+@login_required
+def change_password():
+    """修改本人密码：≥8 位、不得与用户名/旧密码相同、不得为默认口令；改后旧会话全部失效。"""
+    user = current_user()
+    if request.method == 'POST':
+        try:
+            current_password = request.form.get('current_password') or ''
+            new_password = validate_password(
+                request.form.get('new_password'), username=user.username,
+                field='新密码',
+                min_length=int(current_app.config.get('PASSWORD_MIN_LENGTH', 8) or 8))
+            confirm_password = request.form.get('confirm_password') or ''
+            if new_password != confirm_password:
+                raise ValidationError('两次输入的新密码不一致')
+            if not user.check_password(current_password):
+                raise ValidationError('当前密码不正确')
+            if user.check_password(new_password):
+                raise ValidationError('新密码不能与当前密码相同')
+        except ValidationError as exc:
+            for msg in exc.errors:
+                flash(msg, 'danger')
+            return render_template('change_password.html', must_change=user.must_change_password)
+        user.set_password(new_password)
+        user.must_change_password = False
+        user.password_updated_at = datetime.utcnow()
+        session_guard.revoke_user(user.id)
+        audit_record('user.change_password', 'user', user.id, result='ok',
+                     after={'username': user.username})
+        db.session.commit()
+        session.clear()
+        flash('密码已修改，请使用新密码重新登录', 'success')
+        return redirect(url_for('main.login'))
+    return render_template('change_password.html', must_change=user.must_change_password)
 
 
 # ---------- 项目管理 ----------
@@ -450,6 +587,7 @@ def item_add(project_id):
     audit_record('item.create', 'item', item.id, project.id,
                  after=_item_snapshot(item), critical=False)
     db.session.commit()
+    _refresh_session_after_sensitive()
     flash(f'科目「{item_name}」已添加，节点已生成', 'success')
     return redirect(url_for('main.project_detail', project_id=project.id))
 
@@ -531,6 +669,7 @@ def node_update(node_id):
                                     apply_no=app_obj.apply_no,
                                     apply_amount=app_obj.apply_amount))
             db.session.commit()
+            _refresh_session_after_sensitive()
             flash('%s 已发起付款申请（%s）' % (node.node_name, app_obj.apply_no), 'success')
 
         elif action == 'invoice':
@@ -568,6 +707,7 @@ def node_update(node_id):
                                     invoice_no=invoice_no,
                                     invoice_amount_delta=parsed['invoice_amount']))
             db.session.commit()
+            _refresh_session_after_sensitive()
             flash('%s 发票信息已登记' % node.node_name, 'success')
 
         elif action == 'pay':
@@ -617,6 +757,7 @@ def node_update(node_id):
                                     pay_date=_date_str(rec.pay_date),
                                     pay_method=rec.pay_method))
             db.session.commit()
+            _refresh_session_after_sensitive()
             flash('%s 已登记实际付款 %s 元' % (node.node_name, fmt_money(parsed['paid_amount'])), 'success')
     except ValidationError as exc:
         db.session.rollback()
@@ -815,7 +956,7 @@ def contract_upload():
         flash('文本提取失败：%s' % (extract_msg or '未知错误'), 'danger')
         return redirect(url_for('main.contracts'))
 
-    result, rec_msg = recognize_contract(text, file.filename)
+    result, rec_msg = recognize_contract(text[:MAX_RECOGNIZE_CHARS], file.filename)
     contract.raw_text = text
     contract.result_json = json.dumps(result, ensure_ascii=False)
     contract.engine = result.get('engine', 'rules')
@@ -1190,6 +1331,7 @@ def contract_confirm_submit(contract_id):
                                              for k, v in submission.node_amounts.items()},
                             'diff': diff})
         db.session.commit()
+        _refresh_session_after_sensitive()
         for msg in submission.warnings:
             flash(msg, 'warning')
         flash('合同「%s」已更新（就地更新，付款节点与记录保持不变）'
@@ -1254,7 +1396,7 @@ def contract_rerun(contract_id):
         return redirect(url_for('main.contracts'))
     was_confirmed = contract.status == 'confirmed'
     before = {'status': contract.status, 'engine': contract.engine}
-    result, rec_msg = recognize_contract(text, contract.file_name)
+    result, rec_msg = recognize_contract(text[:MAX_RECOGNIZE_CHARS], contract.file_name)
     contract.raw_text = text
     contract.result_json = json.dumps(result, ensure_ascii=False)
     contract.engine = result.get('engine', 'rules')
@@ -1346,15 +1488,52 @@ def user_new():
         return redirect(url_for('main.users'))
     if role not in ('admin', 'operator', 'viewer'):
         role = 'viewer'
-    user = User(username=username, display_name=display_name, role=role)
+    try:
+        password = validate_password(
+            password, username=username, field='初始密码',
+            min_length=int(current_app.config.get('PASSWORD_MIN_LENGTH', 8) or 8))
+    except ValidationError as exc:
+        for msg in exc.errors:
+            flash(msg, 'danger')
+        return redirect(url_for('main.users'))
+    user = User(username=username, display_name=display_name, role=role,
+                must_change_password=True)
     user.set_password(password)
     db.session.add(user)
     db.session.flush()
     audit_record('user.create', 'user', user.id,
                  after={'username': user.username, 'display_name': user.display_name,
-                        'role': user.role, 'is_active': True})
+                        'role': user.role, 'is_active': True,
+                        'must_change_password': True})
     db.session.commit()
-    flash(f'用户「{display_name}」已创建', 'success')
+    flash(f'用户「{display_name}」已创建（首次登录需修改密码）', 'success')
+    return redirect(url_for('main.users'))
+
+
+@bp.route('/admin/users/<int:user_id>/reset-password', methods=['POST'])
+@login_required
+@role_required('admin')
+def user_reset_password(user_id):
+    """管理员重置密码：需 ≥8 位、非默认口令；该用户下次登录强制改密。"""
+    user = db.session.get(User, user_id)
+    if not user:
+        abort(404)
+    try:
+        new_password = validate_password(
+            request.form.get('password'), username=user.username, field='新密码',
+            min_length=int(current_app.config.get('PASSWORD_MIN_LENGTH', 8) or 8))
+    except ValidationError as exc:
+        for msg in exc.errors:
+            flash(msg, 'danger')
+        return redirect(url_for('main.users'))
+    user.set_password(new_password)
+    user.must_change_password = True
+    user.password_updated_at = datetime.utcnow()
+    session_guard.revoke_user(user.id)
+    audit_record('user.reset_password', 'user', user.id,
+                 after={'username': user.username, 'must_change_password': True})
+    db.session.commit()
+    flash('已重置「%s」的密码；该用户下次登录需先修改密码' % user.display_name, 'success')
     return redirect(url_for('main.users'))
 
 
@@ -1376,6 +1555,8 @@ def user_toggle(user_id):
             return redirect(url_for('main.users'))
     before = {'is_active': bool(user.is_active)}
     user.is_active = not bool(user.is_active)
+    if not user.is_active:
+        session_guard.revoke_user(user.id)   # 停用后该用户旧会话立即失效
     audit_record('user.enable' if user.is_active else 'user.disable',
                  'user', user.id, before=before,
                  after={'is_active': user.is_active, 'username': user.username})
@@ -1401,6 +1582,7 @@ def user_delete(user_id):
     audit_record('user.delete', 'user', user.id,
                  before={'username': user.username, 'display_name': user.display_name,
                          'role': user.role, 'is_active': user.is_active})
+    session_guard.revoke_user(user.id)
     db.session.delete(user)
     db.session.commit()
     flash(f'用户「{user.display_name}」已删除', 'success')

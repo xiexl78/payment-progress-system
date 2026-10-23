@@ -60,7 +60,7 @@ def create_app(config=None):
     app.config.from_mapping(
         SQLALCHEMY_DATABASE_URI='sqlite:///' + os.path.join(base_dir, 'instance', 'payment_progress.db'),
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
-        MAX_CONTENT_LENGTH=16 * 1024 * 1024,
+        MAX_CONTENT_LENGTH=int(os.environ.get('MAX_UPLOAD_MB', '20')) * 1024 * 1024,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE='Lax',
         SESSION_COOKIE_SECURE=os.environ.get('SESSION_COOKIE_SECURE', '0').strip() == '1',
@@ -68,6 +68,13 @@ def create_app(config=None):
         CSRF_ENABLED=True,
         DEBUG=False,
         TESTING=False,
+        # 批次 4b：密码与登录限速
+        PASSWORD_MIN_LENGTH=8,
+        LOGIN_MAX_FAILURES=5,
+        LOGIN_FAILURE_WINDOW_MINUTES=5,
+        LOGIN_LOCK_MINUTES=15,
+        LOGIN_THROTTLE_ENABLED=True,
+        FORCE_DEFAULT_PASSWORD_CHANGE=True,
     )
     if explicit_config:
         app.config.update(config)
@@ -79,6 +86,11 @@ def create_app(config=None):
         if app.config['SECRET_KEY'] == DEFAULT_SECRET_KEY:
             app.logger.warning('使用历史默认 SECRET_KEY（仅限测试/本地），CSRF_ENABLED=%s',
                                app.config['CSRF_ENABLED'])
+            # 测试/本地模式默认关闭「默认口令强制改密」与「登录限速」，避免打挂基线
+            if 'FORCE_DEFAULT_PASSWORD_CHANGE' not in config:
+                app.config['FORCE_DEFAULT_PASSWORD_CHANGE'] = False
+            if 'LOGIN_THROTTLE_ENABLED' not in config:
+                app.config['LOGIN_THROTTLE_ENABLED'] = False
     else:
         secret = (os.environ.get('SECRET_KEY') or '').strip()
         if not secret or secret == DEFAULT_SECRET_KEY:

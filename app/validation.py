@@ -382,3 +382,31 @@ def _money(value):
 def _plain_pct(value):
     text = format(value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP), 'f')
     return text.rstrip('0').rstrip('.') + '%'
+
+
+# ---------- 密码策略（批次 4b） ----------
+
+#: 系统已知默认口令：明文禁止继续使用
+DEFAULT_PASSWORDS = frozenset({
+    'admin123', '123456', '12345678', 'password', 'admin', 'qwerty123',
+})
+#: 种子示例账号 → 默认口令（登录时用于识别"仍在使用默认口令"）
+DEFAULT_ACCOUNT_PASSWORDS = {
+    'admin': 'admin123',
+    'jbr': '123456',
+    'viewer': '123456',
+}
+
+
+def validate_password(raw, *, username=None, field='密码', min_length=8):
+    """校验新密码：非空、长度 ≥ min_length、不得等于用户名、不得为已知默认口令。"""
+    if _is_blank(raw):
+        raise _err(field, '必填')
+    password = str(raw)
+    if len(password) < int(min_length):
+        raise _err(field, '长度至少 %d 位' % int(min_length))
+    if username and password.strip().lower() == str(username).strip().lower():
+        raise _err(field, '不能与用户名相同')
+    if password.strip() in DEFAULT_PASSWORDS:
+        raise _err(field, '不能使用系统默认口令，请设置更复杂的密码')
+    return password
