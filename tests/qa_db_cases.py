@@ -436,6 +436,53 @@ def _case_config_and_health(tmp):
     _dispose(app)
 
 
+def _case_cr04_draft_db(tmp):
+    """CR-04 草案库：payment_invoices 表已存在但缺 project_id（真实故障回归）。
+
+    早期草案建表不含 project_id，模型后来加了该列；旧库升级逻辑只补表不补列，
+    导致启动后 /projects 直接 503（no such column: payment_invoices.project_id）。
+    """
+    print('\n########## 7b. CR-04 草案库：已有 payment_invoices 但缺 project_id ##########')
+    dbp = os.path.join(tmp, 'cr04_draft.db')
+    seed_db(dbp)
+    conn = sqlite3.connect(dbp)
+    node_id, project_id = conn.execute(
+        'SELECT id, project_id FROM payment_nodes ORDER BY id LIMIT 1').fetchone()
+    conn.execute('DROP TABLE payment_invoices')
+    conn.execute('CREATE TABLE payment_invoices ('
+                 'id INTEGER NOT NULL, node_id INTEGER NOT NULL, '
+                 'invoice_no VARCHAR(128) NOT NULL, amount NUMERIC(14,2) NOT NULL, '
+                 'invoice_date DATE, remark VARCHAR(255), created_at DATETIME, '
+                 'created_by INTEGER, PRIMARY KEY (id))')
+    conn.execute("INSERT INTO payment_invoices (node_id, invoice_no, amount, created_at) "
+                 "VALUES (?, 'QA-DRAFT-INV-1', 100, datetime('now'))", (node_id,))
+    conn.commit()
+    conn.close()
+
+    app = make_app(dbp)
+    client, _ = _login_client(app)
+    page = client.get('/projects')
+    hz = client.get('/healthz')
+    check('升级', '草案库缺 project_id 时启动自动补列，/projects 不再 503',
+          page.status_code == 200 and 'PJ-2025-DSJ' in page.get_data(as_text=True),
+          'status=%s' % page.status_code)
+    check('升级', '补列后 /healthz 报数据库健康',
+          hz.status_code == 200 and '"ok":true' in hz.get_data(as_text=True).replace(' ', ''),
+          'code=%s body=%s' % (hz.status_code, hz.get_data(as_text=True)[:160]))
+    conn = sqlite3.connect(dbp)
+    cols = {r[1] for r in conn.execute('PRAGMA table_info(payment_invoices)')}
+    backfilled = conn.execute("SELECT project_id FROM payment_invoices "
+                              "WHERE invoice_no='QA-DRAFT-INV-1'").fetchone()
+    indexes = {r[1] for r in conn.execute("PRAGMA index_list(payment_invoices)")}
+    conn.close()
+    check('升级', '补列后按节点回填 project_id',
+          'project_id' in cols and backfilled is not None and backfilled[0] == project_id,
+          'cols=%s backfilled=%s expect=%s' % (sorted(cols), backfilled, project_id))
+    check('升级', '补列后补建 ix_payment_invoices_project_id 索引',
+          'ix_payment_invoices_project_id' in indexes, 'indexes=%s' % sorted(indexes))
+    _dispose(app)
+
+
 def run():
     tmp = tempfile.mkdtemp(prefix='payment_qa_db_')
     print('数据库专项临时目录: %s' % tmp)
@@ -447,6 +494,7 @@ def run():
         _case_cwd(tmp)
         _case_initdb()
         _case_schema_upgrade(tmp)
+        _case_cr04_draft_db(tmp)
         _case_config_and_health(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

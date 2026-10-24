@@ -45,6 +45,11 @@ _COLUMN_PATCHES = {
         'confirmed_by': 'INTEGER',
         'confirmed_at': 'DATETIME',
     },
+    # CR-04 草案库：早期 payment_invoices 不含 project_id（模型后加列），
+    # 旧库表已存在但缺列时初始化建表逻辑不会再处理，必须在此补列并回填。
+    'payment_invoices': {
+        'project_id': 'INTEGER',
+    },
     # 批次 6b 更新模式新增的计数列（旧库已有 import_batches 表时补列）
     'import_batches': {
         'projects_updated': 'INTEGER NOT NULL DEFAULT 0',
@@ -101,6 +106,13 @@ def upgrade_schema(app):
                             conn.execute(text('ALTER TABLE audit_logs ADD COLUMN %s %s'
                                               % (name, ddl)))
                             applied.append('audit_logs.%s' % name)
+                # CR-04 草案库补列后按所属节点回填项目号（保证明细表可按项目查询）
+                if 'payment_invoices' in tables and 'payment_nodes' in tables:
+                    conn.execute(text(
+                        'UPDATE payment_invoices SET project_id = ('
+                        'SELECT n.project_id FROM payment_nodes n '
+                        'WHERE n.id = payment_invoices.node_id) '
+                        'WHERE project_id IS NULL'))
 
             if 'audit_logs' not in tables:
                 AuditLog.__table__.create(bind=db.engine, checkfirst=True)
@@ -110,8 +122,13 @@ def upgrade_schema(app):
                 if table.name not in tables:
                     table.create(bind=db.engine, checkfirst=True)
                     applied.append('%s(create)' % table.name)
-            for index in AuditLog.__table__.indexes:
-                index.create(bind=db.engine, checkfirst=True)
+            # 已存在表的模型索引补建（旧库可能先建了表、后加的索引/唯一约束）
+            for table in db.metadata.sorted_tables:
+                for index in table.indexes:
+                    try:
+                        index.create(bind=db.engine, checkfirst=True)
+                    except Exception as exc:      # 历史脏数据导致唯一索引建不起来时不阻断启动
+                        app.logger.warning('索引补建跳过 %s：%s', index.name, exc)
         except Exception as exc:
             app.logger.error('数据库结构自动升级失败：%s', exc, exc_info=True)
             raise RuntimeError('数据库结构升级失败，请先备份数据库后手动迁移：%s' % exc)
