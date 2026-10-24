@@ -10,8 +10,10 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import uuid
 
 # ---------- OCR 文本清理 ----------
 
@@ -248,34 +250,111 @@ def _extract_pdf(path):
         return None, 'PDF 解析失败：%s' % e
 
 
+# ---------- Windows OCR（WinRT 只能读系统临时目录，先转存再识别） ----------
+
+_OCR_STAGING_SUBDIR = 'payment_ocr'
+
+
+def _ocr_staging_dir():
+    """OCR 暂存目录（WinRT 可访问、且进程可写）。
+
+    工作区/instance 路径在 WinRT ``StorageFile`` 下会报 0x80070005（拒绝访问）；
+    OCR 前统一把图片复制到这里，识别完立即清理。优先系统 TEMP（沙箱/普通
+    进程都可写），其次 %LOCALAPPDATA%\\Temp\\payment_ocr。
+    """
+    import tempfile
+    candidates = [os.path.join(tempfile.gettempdir(), _OCR_STAGING_SUBDIR)]
+    local = os.environ.get('LOCALAPPDATA')
+    if local:
+        candidates.append(os.path.join(local, 'Temp', _OCR_STAGING_SUBDIR))
+    last_error = None
+    for path in candidates:
+        try:
+            os.makedirs(path, exist_ok=True)
+            return path
+        except OSError as exc:
+            last_error = exc
+    raise OSError('无法创建 OCR 暂存目录：%s' % last_error)
+
+
+def _stage_image(source_path):
+    """把图片复制到 OCR 暂存目录（文件名唯一），返回暂存路径。"""
+    suffix = os.path.splitext(source_path)[1].lower() or '.png'
+    staged = os.path.join(_ocr_staging_dir(), 'ocr_%s%s' % (uuid.uuid4().hex, suffix))
+    shutil.copyfile(source_path, staged)
+    return staged
+
+
+def _remove_quietly(path):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+#: OCR 失败时用于区分「文件访问被拒」的标记（PS 脚本与 .NET 报错文本）
+_ACCESS_DENIED_MARKS = ('0x80070005', 'Access is denied', '拒绝访问',
+                        '__OCR_ACCESS_DENIED__')
+
+
+def _run_ocr(staged_path):
+    """对 WinRT 可访问的图片路径执行 OCR；返回 (text, error)。"""
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script = os.path.join(base, 'scripts', 'ocr_win.ps1')
+    if not os.path.exists(script):
+        return None, '未找到本地 OCR 脚本 ocr_win.ps1'
+    try:
+        proc = subprocess.run(
+            ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+             '-File', script, '-ImagePath', staged_path],
+            capture_output=True, text=True, encoding='utf-8',
+            errors='replace', timeout=120)
+    except subprocess.TimeoutExpired:
+        return None, '图片 OCR 超时'
+    except Exception as e:
+        return None, '图片 OCR 失败：%s' % e
+
+    out = (proc.stdout or '').strip()
+    combined = out + '\n' + ((proc.stderr or '').strip())
+    if '__NO_OCR_ENGINE__' in combined:
+        return None, ('系统未安装中文 OCR 语言包，无法识别图片合同；'
+                      '请上传文字版 PDF / Word / TXT')
+    if any(mark in combined for mark in _ACCESS_DENIED_MARKS):
+        return None, ('图片 OCR 无法读取文件（访问被拒 0x80070005）：'
+                      '图片路径对 Windows OCR 不可访问，请重试或上传文字版合同')
+    if proc.returncode != 0:
+        detail = (combined.strip().splitlines() or ['未知错误'])[-1]
+        return None, '图片 OCR 失败：%s' % detail[:300]
+    if not out:
+        return None, '图片 OCR 未能识别到文字，请上传清晰图片或文字版合同'
+    return _clean_ocr_text(out), None
+
+
 def _extract_scanned_pdf(path):
     """扫描件 PDF：用 PyMuPDF 渲染页面为图片，再调用 Windows OCR 识别"""
     try:
         import fitz
     except ImportError:
         return None, '扫描件 PDF 识别需要 PyMuPDF（pip install PyMuPDF）'
-    import tempfile
     try:
         doc = fitz.open(path)
         if doc.page_count == 0:
             return None, 'PDF 为空文件'
         ocr_parts = []
-        temp_dir = tempfile.gettempdir()
         for i in range(doc.page_count):
             page = doc.load_page(i)
             # 使用 200 DPI 保证清晰度
             mat = fitz.Matrix(200 / 72, 200 / 72)
             pix = page.get_pixmap(matrix=mat)
-            img_path = os.path.join(temp_dir, 'contract_scan_%d.png' % i)
+            # 直接渲染到 WinRT 可访问的暂存目录，识别后立即删除
+            img_path = os.path.join(_ocr_staging_dir(),
+                                    'scan_%s_%d.png' % (uuid.uuid4().hex, i))
             pix.save(img_path)
-            t, err = _extract_image(img_path)
+            t, err = _run_ocr(img_path)
             if t:
                 ocr_parts.append(t)
-            # 清理临时文件
-            try:
-                os.remove(img_path)
-            except Exception:
-                pass
+            _remove_quietly(img_path)
         doc.close()
         if not ocr_parts:
             return None, '扫描件 PDF 未能识别到文字，请上传清晰文件或文字版合同'
@@ -316,26 +395,22 @@ def _extract_txt(path):
 
 
 def _extract_image(path):
-    """调用 Windows 自带 OCR（scripts/ocr_win.ps1），全部本地处理"""
-    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    script = os.path.join(base, 'scripts', 'ocr_win.ps1')
-    if not os.path.exists(script):
-        return None, '未找到本地 OCR 脚本 ocr_win.ps1'
+    """调用 Windows 自带 OCR（scripts/ocr_win.ps1），全部本地处理。
+
+    先复制到 ``%LOCALAPPDATA%\\Temp\\payment_ocr`` 再识别：WinRT ``StorageFile``
+    访问工作区/instance 路径会报 0x80070005（拒绝访问），这就是
+    “同一张图放系统临时目录能识别”的根因。
+    """
+    if not os.path.exists(path):
+        return None, '图片文件不存在或已被清理'
+    staged = None
     try:
-        proc = subprocess.run(
-            ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-             '-File', script, '-ImagePath', path],
-            capture_output=True, text=True, timeout=120)
-        out = (proc.stdout or '').strip()
-        if proc.returncode != 0 or '__NO_OCR_ENGINE__' in out:
-            return None, '系统未安装中文 OCR 语言包，无法识别图片合同；请上传文字版 PDF / Word / TXT'
-        if not out:
-            return None, '图片 OCR 未能识别到文字，请上传清晰图片或文字版合同'
-        return _clean_ocr_text(out), None
-    except subprocess.TimeoutExpired:
-        return None, '图片 OCR 超时'
-    except Exception as e:
-        return None, '图片 OCR 失败：%s' % e
+        staged = _stage_image(path)
+        return _run_ocr(staged)
+    except OSError as e:
+        return None, '图片 OCR 暂存失败（无法复制到系统临时目录）：%s' % e
+    finally:
+        _remove_quietly(staged)
 
 
 # ---------- 大模型适配器（可配置） ----------
