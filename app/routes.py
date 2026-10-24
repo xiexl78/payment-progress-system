@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import secrets
 from datetime import date, timedelta, datetime
 from decimal import Decimal, ROUND_HALF_UP
 from functools import wraps
@@ -164,9 +165,62 @@ def fmt_money(v):
         return '0.00'
 
 
-def make_apply_no():
+_APPLY_NO_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'  # 去掉易混淆的 I/O/0/1
+_APPLY_NO_RETRIES = 4
+
+
+def make_apply_no(suffix=None):
+    """申请单号：AP + UTC 秒级时间 + '-' + 6 位随机后缀（并发下唯一）。"""
     now = timeutil.utcnow()
-    return 'AP' + now.strftime('%Y%m%d%H%M%S') + str(now.microsecond % 1000)
+    tail = suffix or ''.join(secrets.choice(_APPLY_NO_ALPHABET) for _ in range(6))
+    return 'AP' + now.strftime('%Y%m%d%H%M%S') + '-' + tail
+
+
+def _commit_application(node, amount, description, actor, before_snapshot):
+    """写入一笔申请单：CAS 累加 + 唯一单号冲突时有限次重试。
+
+    返回 (app_obj, exhausted)：CAS 失败（累计将超应付/并发改动）返回 (None, False)；
+    单号重试耗尽返回 (None, True)，由调用方给出中文错误。
+    """
+    for _ in range(_APPLY_NO_RETRIES):
+        result = db.session.execute(
+            update(PaymentNode)
+            .where(PaymentNode.id == node.id,
+                   PaymentNode.applied_amount + amount <= PaymentNode.due_amount)
+            .values(applied_amount=PaymentNode.applied_amount + amount,
+                    updated_at=_now_utc(), updated_by=actor.id))
+        if result.rowcount != 1:
+            db.session.rollback()
+            return None, False
+        db.session.refresh(node)
+        app_obj = PaymentApplication(
+            node_id=node.id, apply_no=make_apply_no(),
+            apply_amount=amount, invoice_amount=ZERO,
+            description=description or None, status='已申请',
+            applicant_id=actor.id, applicant_name=actor.display_name)
+        db.session.add(app_obj)
+        try:
+            db.session.flush()
+        except IntegrityError as exc:
+            db.session.rollback()
+            if 'apply_no' not in str(getattr(exc, 'orig', exc)):
+                raise
+            continue
+        node.status = derive_status(node.due_amount, node.applied_amount,
+                                    node.invoice_amount, node.paid_amount)
+        audit_record('node.apply', 'node', node.id, node.project_id,
+                     before=before_snapshot,
+                     after=dict(_node_snapshot(node), apply_no=app_obj.apply_no,
+                                apply_amount=format(amount, 'f')))
+        try:
+            db.session.commit()
+        except IntegrityError as exc:
+            db.session.rollback()
+            if 'apply_no' not in str(getattr(exc, 'orig', exc)):
+                raise
+            continue
+        return app_obj, False
+    return None, True
 
 
 @bp.app_template_filter('localtime')
@@ -840,31 +894,14 @@ def node_update(node_id):
 
         if action == 'apply':
             description = (request.form.get('description') or '').strip()
-            result = db.session.execute(
-                update(PaymentNode)
-                .where(PaymentNode.id == node.id,
-                       PaymentNode.applied_amount + amount <= PaymentNode.due_amount)
-                .values(applied_amount=PaymentNode.applied_amount + amount,
-                        updated_at=_now_utc(), updated_by=actor.id))
-            if result.rowcount != 1:
-                db.session.rollback()
+            app_obj, exhausted = _commit_application(node, amount, description,
+                                                     actor, before_snapshot)
+            if exhausted:
+                flash('申请单号生成冲突较多，请稍后重试（本次未登记）', 'danger')
+                return redirect(detail_url)
+            if app_obj is None:
                 flash('申请登记失败：累计申请将超过应付，或该节点已被他人修改，请刷新后重试', 'danger')
                 return redirect(detail_url)
-            db.session.refresh(node)
-            app_obj = PaymentApplication(
-                node_id=node.id, apply_no=make_apply_no(),
-                apply_amount=amount, invoice_amount=ZERO,
-                description=description or None, status='已申请',
-                applicant_id=actor.id, applicant_name=actor.display_name)
-            db.session.add(app_obj)
-            db.session.flush()
-            node.status = derive_status(node.due_amount, node.applied_amount,
-                                        node.invoice_amount, node.paid_amount)
-            audit_record('node.apply', 'node', node.id, node.project_id,
-                         before=before_snapshot,
-                         after=dict(_node_snapshot(node), apply_no=app_obj.apply_no,
-                                    apply_amount=format(amount, 'f')))
-            db.session.commit()
             _refresh_session_after_sensitive()
             flash('%s 已登记申请 %s 元（%s）'
                   % (node.node_name, fmt_money(amount), app_obj.apply_no), 'success')
