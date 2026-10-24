@@ -596,25 +596,32 @@ def _contracts(s_admin, ct1):
 
 
 def _concurrency(s_admin):
-    # 8 并发申请：三维并列后允许累计，成功数必须与累计申请额一致、且无 500
+    # 8 并发申请 × 40 轮（CR04-01 验收强度对齐开发口径）：
+    # 全部成功、无 500、单号全局唯一、累计申请=成功笔数
     _, pid = create_project(s_admin, 'QA-CONC-APPLY', 'QA并发申请', [('科目', '10000', '0')])
     nid = node_ids(pid, 'first')[0]
-    res = run_threads(8, lambda s, i, n=nid: C.post(s, BASE, '/nodes/%d/update' % n, {'action': 'apply', 'apply_amount': '100'}))
-    applied = q1(DB, 'SELECT applied_amount FROM payment_nodes WHERE id=?', (nid,))
+    codes = []
+    for _round in range(40):
+        res = run_threads(8, lambda s, i, n=nid: C.post(
+            s, BASE, '/nodes/%d/update' % n, {'action': 'apply', 'apply_amount': '1'}))
+        codes.extend(getattr(x, 'status_code', 'EXC') for x in res)
+    applied = float(q1(DB, 'SELECT applied_amount FROM payment_nodes WHERE id=?', (nid,)) or 0)
     apps = q1(DB, 'SELECT COUNT(*) FROM payment_applications WHERE node_id=?', (nid,))
-    bad = [x for x in res if getattr(x, 'status_code', None) == 500]
-    ok = [x for x in res if getattr(x, 'status_code', None) == 302]
-    check('并发', '8 并发申请后累计申请额与成功笔数一致（数据不串）',
-          abs(float(applied or 0) - 100 * len(ok)) < 0.005 and apps >= len(ok),
-          '成功=%s 累计申请=%s 申请单=%s 500数=%s' % (len(ok), applied, apps, len(bad)))
-    # CR04-01 根因（确定性复现）：申请单号 = AP+秒级时间+microsecond%1000，
-    # 同秒内约 1000 个取值，并发同节点申请时撞唯一键 payment_applications.apply_no。
+    uniq = q1(DB, 'SELECT COUNT(DISTINCT apply_no) FROM payment_applications WHERE node_id=?', (nid,))
+    dist = {}
+    for c in codes:
+        dist[c] = dist.get(c, 0) + 1
+    check('并发', '8 并发申请 × 40 轮全部成功、无 500',
+          len(codes) == 320 and all(c == 302 for c in codes), '状态分布=%s' % dist)
+    check('并发', '并发申请单号全局唯一且累计申请=成功笔数（CR04-01）',
+          apps == 320 and uniq == 320 and abs(applied - 320) < 0.005,
+          '申请单=%s 唯一单号=%s 累计申请=%s' % (apps, uniq, applied))
+
+    # 单号生成器本身：连续生成 5000 个必须唯一（防止回退到秒级时间碰撞）
     from app.routes import make_apply_no
     nos = [make_apply_no() for _ in range(5000)]
-    check('并发', '申请单号生成器不得产生重复（并发申请偶发 500 的根因）',
-          len(nos) == len(set(nos)),
-          '5000 次生成仅 %d 个唯一值；重复单号会撞 apply_no 唯一键 → 500 且本次申请丢失' % len(set(nos)),
-          xfail='CR04-01')
+    check('并发', '申请单号生成器连续 5000 次无重复',
+          len(nos) == len(set(nos)), '唯一值=%d/5000' % len(set(nos)))
 
     # 并发付款：节点已付金额必须等于付款流水合计（不丢更新）
     lost = []

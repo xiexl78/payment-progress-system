@@ -22,7 +22,7 @@ python tests/run_qa.py
 
 ## 三、当前基线（2026-10-24）
 
-`python tests/run_qa.py` → **261 项：260 PASS / 0 FAIL / 1 XFAIL / 0 XPASS，退出码 0**（CR-04 口径，连跑两遍一致；唯一 XFAIL 为待修缺陷 CR04-01，见第五节）。
+`python tests/run_qa.py` → **262 项：262 PASS / 0 FAIL / 0 XFAIL / 0 XPASS，退出码 0**（CR-04 口径，连跑两遍一致）。
 
 状态含义：
 
@@ -59,13 +59,9 @@ python tests/run_qa.py
 
 ## 五、当前 XFAIL（已知缺陷，按基线报告编号）
 
-**1 项：CR04-01 — 申请单号生成器重复 → 并发申请偶发 500**
+**0 项**——全部已知缺陷用例均已修复并摘掉 `xfail`，回归基线全绿。
 
-- 断言：`app/routes.py:167-169 make_apply_no()` 连续生成 5000 个单号必须唯一（确定性用例）。
-- 实测：5000 次仅约 16~17 个唯一值。单号 = `AP` + 秒级时间 + `microsecond % 1000`，同秒内只有约 1000 个取值；CR-04 允许同节点多次申请后，`payment_applications.apply_no` 唯一键在并发下被撞 → `sqlite3.IntegrityError` → HTTP 500，本次申请丢失（数据回滚一致）。
-- 并发证据：40 轮 × 8 线程并发申请，5 轮各 1 次 500，期望 320 笔仅成功 256 笔。
-- 复现：回归套件第 7 组「申请单号生成器不得产生重复」即确定性复现（`xfail='CR04-01'`）；并发侧可对同一节点多线程 POST `/nodes/<id>/update`（action=apply）复现 500。
-- 待开发修复（建议自增/序列或 UUID/随机后缀），修好后本用例转 PASS 并摘掉 `xfail`。
+已修复并保留为回归：**CR04-01 — 申请单号重复导致并发申请偶发 500**（`1b9d3bf`）。原 `make_apply_no()` = `AP`+秒级时间+`microsecond%1000`，同秒仅约 1000 取值，并发同节点申请撞 `payment_applications.apply_no` 唯一键 → 500 且本次申请丢失；现改为 `AP`+UTC 秒+`-`+6 位随机后缀，撞唯一键回滚重试最多 4 次、耗尽返回中文提示。用例强度：同节点 **8 并发 × 40 轮**全部 302、0 个 500、320 个唯一单号、累计申请 320；另加「生成器连续 5000 次无重复」防回退。
 
 最后一项 P2-08（图片 OCR）已随 `290273b` 修复：OCR 前先把图片转存系统临时目录，避开 WinRT 访问工作区被拒（0x80070005）；用例改为**默认启用**（测试图片改用系统中文字体 48px 渲染，识别率稳定），无 OCR 环境的机器可显式设 `QA_ENABLE_OCR=0` 跳过。
 
@@ -97,7 +93,7 @@ python tests/run_qa.py
 
 ## 六点六、CR-04（三本账并列）验收状态
 
-**当前：261 项 / 260 PASS / 0 FAIL / 1 XFAIL（CR04-01）/ 0 XPASS，退出码 0；连跑两遍一致。**
+**当前：262 项 / 262 PASS / 0 FAIL / 0 XFAIL / 0 XPASS，退出码 0；连跑两遍一致。**
 
 已按 `docs/change-request-04.md` v1.2 覆盖并通过：
 
@@ -108,7 +104,7 @@ python tests/run_qa.py
 5. 比例去默认：新建项目 4 个比例必填、合计 98% 与负比例拒绝、合计 100% 正常建点、合同变更留空科目总额被拒。
 6. 导出含三维列（已申请/已开票）；旧库缺 CR-04 列/表启动自动补齐且数据不丢；备份含 `payment_invoices` 与新列。
 
-待修：CR04-01（第五节，单号重复导致并发申请偶发 500）。
+CR04-01 已由 `1b9d3bf` 修复并转为回归（第五节）：8 并发 × 40 轮全部成功、0 个 500、320 个唯一单号。
 
 `scripts/backup.ps1`（临时数据目录）实测：退出码 0、`db_integrity=ok`、备份库含 `payment_invoices`（6 行）与 `applied_amount/change_note`；`scripts/verify_restored.py` 对备份库 9/9 通过。
 
