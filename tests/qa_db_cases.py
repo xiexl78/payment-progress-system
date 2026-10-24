@@ -102,6 +102,14 @@ def _case_backup(tmp):
         src.close()
         cnt_api = q1(api_backup, 'SELECT COUNT(*) FROM payment_records')
         check('备份', 'SQLite backup API 在线备份数据完整', cnt_api == live, 'API=%d 实时=%d' % (cnt_api, live))
+        bk = sqlite3.connect(api_backup)
+        bk_tables = {r[0] for r in bk.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        bk_cols = {r[1] for r in bk.execute('PRAGMA table_info(payment_nodes)')}
+        bk_audit = q1(api_backup, 'SELECT COUNT(*) FROM audit_logs')
+        bk.close()
+        check('备份', '备份含 CR-04 新表 payment_invoices 与 applied_amount 列',
+              'payment_invoices' in bk_tables and 'applied_amount' in bk_cols
+              and 'change_note' in bk_cols, 'tables=%s cols=%s' % (sorted(bk_tables)[:12], sorted(bk_cols)))
     _dispose(app)
     # 备份脚本必须走 SQLite Online Backup API，而非直接复制活动 .db
     try:
@@ -292,6 +300,7 @@ def _case_schema_upgrade(tmp):
              ('projects', 'updated_at'), ('projects', 'updated_by'),
              ('project_items', 'updated_at'), ('project_items', 'updated_by'),
              ('payment_nodes', 'updated_at'), ('payment_nodes', 'updated_by'),
+             ('payment_nodes', 'applied_amount'), ('payment_nodes', 'change_note'),
              ('contract_files', 'confirmed_by'), ('contract_files', 'confirmed_at')]
     dropped = 0
     for table, col in drops:
@@ -300,7 +309,7 @@ def _case_schema_upgrade(tmp):
             dropped += 1
         except sqlite3.Error:
             pass
-    for tbl in ('audit_logs', 'user_sessions'):
+    for tbl in ('audit_logs', 'user_sessions', 'payment_invoices'):
         try:
             conn.execute('DROP TABLE %s' % tbl)
         except sqlite3.Error:
@@ -322,6 +331,10 @@ def _case_schema_upgrade(tmp):
         check('升级', '升级后补齐 is_active/updated_at 且重建 audit_logs',
               'is_active' in users_cols and 'updated_at' in nodes_cols and 'audit_logs' in tables,
               'users=%s nodes=%s' % (sorted(users_cols), sorted(nodes_cols)))
+        check('升级', 'CR-04 旧库补齐 applied_amount/change_note 并建 payment_invoices 表',
+              'applied_amount' in nodes_cols and 'change_note' in nodes_cols
+              and 'payment_invoices' in tables,
+              'nodes=%s tables=%s' % (sorted(nodes_cols), sorted(tables)))
         _dispose(app)
         try:
             app2 = make_app(dbp)

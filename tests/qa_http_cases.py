@@ -31,12 +31,37 @@ def node_ids(pid, nt=None):
     return [row[0] for row in q(DB, 'SELECT id FROM payment_nodes WHERE project_id=? ORDER BY item_id,id', (pid,))]
 
 
-def create_project(sess, no, name, items, remark=''):
+def item_ids(pid):
+    return [r[0] for r in q(DB, 'SELECT id FROM project_items WHERE project_id=? ORDER BY id', (pid,))]
+
+
+CH_TOKEN_RE = re.compile(r'name="confirm_token" value="([^"]+)"')
+
+
+def contract_change(sess, pid, totals, confirm=True):
+    """逐科目合同变更（CR-04）：totals 为 ``{item_id: 新总额}``。
+
+    confirm=True 时自动从差异确认页取一次性 token 二次提交；
+    返回 (第一次响应, 二次响应或 None)。
+    """
+    data = {'item_total_%d' % iid: str(v) for iid, v in totals.items()}
+    r1 = C.post(sess, BASE, '/projects/%d/contract-change' % pid, data)
+    if not confirm:
+        return r1, None
+    m = CH_TOKEN_RE.search(r1.text or '')
+    if not m:
+        return r1, None
+    data['confirm_token'] = m.group(1)
+    return r1, C.post(sess, BASE, '/projects/%d/contract-change' % pid, data)
+
+
+def create_project(sess, no, name, items, remark='', ratios=None):
+    """新建项目（CR-04：4 个节点比例必填、无默认值）。"""
     data = {'project_no': no, 'name': name, 'remark': remark,
             'item_name': [i[0] for i in items],
             'tax_rate': [i[3] if len(i) > 3 else '6%' for i in items],
-            'original_amount': [i[1] for i in items],
-            'additional_amount': [i[2] for i in items]}
+            'original_amount': [i[1] for i in items]}
+    data.update(ratios or C.RATIO_FORM)
     r = C.post(sess, BASE, '/projects/new', data)
     loc = r.headers.get('Location', '')
     return r, (int(loc.rstrip('/').split('/')[-1]) if r.status_code == 302 and '/projects/' in loc else None)
@@ -196,15 +221,19 @@ def _permissions(s_admin):
     rr = s_op.get(BASE + '/admin/users', allow_redirects=False)
     check('权限', 'operator 访问用户管理被拒', rr.status_code == 302)
     ic0 = q1(DB, 'SELECT COUNT(*) FROM project_items WHERE project_id=?', (pid_a,))
-    C.post(s_op, BASE, '/projects/%d/items' % pid_a,
-           {'item_name': '经办添加科目', 'tax_rate': '6%', 'original_amount': '5000', 'additional_amount': '0'})
+    item_data = {'item_name': '经办添加科目', 'tax_rate': '6%', 'original_amount': '5000'}
+    item_data.update(C.RATIO_FORM)  # CR-04：新增科目也要填 4 个比例
+    C.post(s_op, BASE, '/projects/%d/items' % pid_a, item_data)
     check('权限', 'operator 添加科目允许', q1(DB, 'SELECT COUNT(*) FROM project_items WHERE project_id=?', (pid_a,)) == ic0 + 1)
     node_a_prog = node_ids(pid_a, 'progress')[0]
     C.post(s_op, BASE, '/nodes/%d/update' % node_a_prog, {'action': 'apply', 'apply_amount': '1000'})
     C.post(s_op, BASE, '/nodes/%d/update' % node_a_prog, {'action': 'invoice', 'invoice_amount': '1000', 'invoice_no': 'FP-QA-OP'})
     rr = C.post(s_op, BASE, '/nodes/%d/update' % node_a_prog, {'action': 'pay', 'paid_amount': '1000', 'pay_date': '2026-10-20'})
-    check('权限', 'operator 申请→发票→付款允许',
-          q1(DB, 'SELECT status FROM payment_nodes WHERE id=?', (node_a_prog,)) == '已付款')
+    check('权限', 'operator 申请→发票→付款允许（CR-04 三维，部分付款）',
+          q1(DB, 'SELECT status FROM payment_nodes WHERE id=?', (node_a_prog,)) == '部分付款'
+          and d2(q1(DB, 'SELECT applied_amount FROM payment_nodes WHERE id=?', (node_a_prog,))) == d2('1000')
+          and d2(q1(DB, 'SELECT invoice_amount FROM payment_nodes WHERE id=?', (node_a_prog,))) == d2('1000')
+          and d2(q1(DB, 'SELECT paid_amount FROM payment_nodes WHERE id=?', (node_a_prog,))) == d2('1000'))
     C.post(s_op, BASE, '/projects/%d/trial' % pid_a, {'trial_date': '2026-01-15'})
     C.post(s_op, BASE, '/projects/%d/acceptance' % pid_a, {'acceptance_date': '2026-03-10'})
     check('权限', 'operator 试运行/验收登记允许',
@@ -355,11 +384,13 @@ def _upload_security(s_admin):
 
 
 def _state_and_money(s_admin, pid_a, pid_c):
-    # 状态机
+    # CR-04 三本账：付款不再以申请/开票为前置（任意顺序、可多次累计）
     nid = node_ids(pid_c, 'first')[0]
     C.post(s_admin, BASE, '/nodes/%d/update' % nid, {'action': 'pay', 'paid_amount': '100'})
+    paid0 = float(q1(DB, 'SELECT paid_amount FROM payment_nodes WHERE id=?', (nid,)) or 0)
     st = q1(DB, 'SELECT status FROM payment_nodes WHERE id=?', (nid,))
-    check('状态', '未触发节点不应能直接登记付款', st != '已付款', 'status=%s' % st)
+    check('状态', '先付款后补申请/开票应被接受（三维并列）',
+          abs(paid0 - 100) < 0.005 and st == '部分付款', 'paid=%.2f status=%s' % (paid0, st))
     # 重复付款
     nid = node_ids(pid_c, 'progress')[0]
     C.post(s_admin, BASE, '/nodes/%d/update' % nid, {'action': 'apply', 'apply_amount': '5200'})
@@ -415,10 +446,15 @@ def _data_accuracy(s_admin):
     check('数据', '[不在上线范围] 种子演示项目进度款状态口径（仅演示数据，生产不初始化种子）', True,
           'seed_prog=%s' % (seed_prog,))
 
-    # 增补口径（口径统一：所有路径 4 节点按「原金额+增补金额」，首付也纳入）
-    _, pid_add = create_project(s_admin, 'QA-ADD', 'QA增补口径', [('增补科目', '100000', '20000')])
+    # 增补口径（CR-04：新建项目无增补，增补走合同变更；4 节点按新总额重算，首付也纳入）
+    _, pid_add = create_project(s_admin, 'QA-ADD', 'QA增补口径', [('增补科目', '100000', '0')])
+    iid_add = item_ids(pid_add)[0]
+    r1, r2 = contract_change(s_admin, pid_add, {iid_add: '120000'})
     nsum = {nt: float(q1(DB, 'SELECT SUM(due_amount) FROM payment_nodes WHERE project_id=? AND node_type=?', (pid_add, nt)) or 0)
             for nt in ('first', 'progress', 'acceptance', 'warranty')}
+    add_total = d2(q1(DB, 'SELECT SUM(original_amount+additional_amount) FROM project_items WHERE project_id=?', (pid_add,)))
+    check('数据', '合同变更增补：两段式提交应保存新总额 120,000',
+          add_total == d2('120000'), '总额=%s r1=%s r2=%s' % (add_total, r1.status_code, getattr(r2, 'status_code', None)))
     check('数据', '增补项目首付按新总额 36,000（含增补）',
           abs(nsum['first'] - 36000) < 0.005, nsum)
     check('数据', '增补项目进度款按总额 62,400', abs(nsum['progress'] - 62400) < 0.005, nsum)
@@ -427,12 +463,12 @@ def _data_accuracy(s_admin):
     check('数据', '增补项目节点合计应等于合同总额 120,000',
           abs(sum(nsum.values()) - 120000) < 0.005, '节点合计=%.2f' % sum(nsum.values()))
 
-    # 舍入（会计 HALF_UP，尾差按 质保金→验收→进度→首付 归集；首付也按「原金额+增补金额」）
-    items = [('甲', '100.05', '0'), ('乙', '333.33', '66.67'), ('丙', '0.05', '0'), ('丁', '123456.78', '0.22')]
+    # 舍入（会计 HALF_UP，尾差按 质保金→验收→进度→首付 归集；CR-04 新建无增补）
+    items = [('甲', '100.05', '0'), ('乙', '400.00', '0'), ('丙', '0.05', '0'), ('丁', '123457.00', '0')]
     _, pid_r = create_project(s_admin, 'QA-ROUND', 'QA舍入', items)
     mismatch = []
     for idx, it in enumerate(items):
-        base = d2(it[1]) + d2(it[2])
+        base = d2(it[1])
         expect = {nt: d2(base * C.RATIOS[nt]) for nt in ('first', 'progress', 'acceptance', 'warranty')}
         tail = base - sum(expect.values())
         if tail != 0:
@@ -482,16 +518,23 @@ def _contracts(s_admin, ct1):
     neg_due = q1(DB, "SELECT due_amount FROM payment_nodes WHERE project_id=? AND node_type='first'", (neg_pid,)) if neg_pid else None
     check('合同', '负比例应被拒绝', neg_pid is None or float(neg_due or 0) >= 0,
           '生成负数应付=%s' % neg_due)
-    # 增补合同逐项与合计
+    # 增补：确认页不再有增补输入（CR-04），增补只能走合同变更
     _, ct_add = upload(s_admin, SAMPLE_TXT, '增补合同.txt')
     confirm_ct(s_admin, ct_add, {'project_no': 'QA-CT-ADD', 'contract_name': '合同增补项目',
                                  'original_amount': '100000', 'additional_amount': '20000', 'tax_rate': '13%',
                                  'ratio_first': '30', 'ratio_progress': '52', 'ratio_acceptance': '15', 'ratio_warranty': '3'})
     pid_add = q1(DB, 'SELECT id FROM projects WHERE project_no=?', ('QA-CT-ADD',))
     if pid_add:
+        add_total = d2(q1(DB, 'SELECT SUM(original_amount+additional_amount) FROM project_items WHERE project_id=?', (pid_add,)))
         nsum = {nt: float(q1(DB, 'SELECT SUM(due_amount) FROM payment_nodes WHERE project_id=? AND node_type=?', (pid_add, nt)) or 0)
                 for nt in ('first', 'progress', 'acceptance', 'warranty')}
-        check('合同', '合同增补：4 节点按总额（首付 36000 / 进度 62400 / 合计 120000）',
+        check('合同', '确认页忽略增补输入：首次确认只落合同原金额 100,000',
+              add_total == d2('100000') and abs(sum(nsum.values()) - 100000) < 0.005,
+              '总额=%s 节点合计=%.2f' % (add_total, sum(nsum.values())))
+        r1, r2 = contract_change(s_admin, pid_add, {item_ids(pid_add)[0]: '120000'})
+        nsum = {nt: float(q1(DB, 'SELECT SUM(due_amount) FROM payment_nodes WHERE project_id=? AND node_type=?', (pid_add, nt)) or 0)
+                for nt in ('first', 'progress', 'acceptance', 'warranty')}
+        check('合同', '合同变更增补：4 节点按新总额（首付 36000 / 进度 62400 / 合计 120000）',
               abs(nsum['first'] - 36000) < 0.005 and abs(nsum['progress'] - 62400) < 0.005
               and abs(sum(nsum.values()) - 120000) < 0.005, nsum)
     # 合同确认路径的舍入（P1-07 另一条链路）
@@ -553,15 +596,25 @@ def _contracts(s_admin, ct1):
 
 
 def _concurrency(s_admin):
-    # 8 并发申请
+    # 8 并发申请：三维并列后允许累计，成功数必须与累计申请额一致、且无 500
     _, pid = create_project(s_admin, 'QA-CONC-APPLY', 'QA并发申请', [('科目', '10000', '0')])
     nid = node_ids(pid, 'first')[0]
     res = run_threads(8, lambda s, i, n=nid: C.post(s, BASE, '/nodes/%d/update' % n, {'action': 'apply', 'apply_amount': '100'}))
+    applied = q1(DB, 'SELECT applied_amount FROM payment_nodes WHERE id=?', (nid,))
     apps = q1(DB, 'SELECT COUNT(*) FROM payment_applications WHERE node_id=?', (nid,))
     bad = [x for x in res if getattr(x, 'status_code', None) == 500]
-    # 状态机要求「未触发 → 未开票已申请」只能发生一次：8 个并发请求应只有 1 个成功、且无 500
-    check('并发', '8 并发申请不应 500，且只生成一张申请单',
-          not bad and apps == 1, '申请单=%s 500数=%s' % (apps, len(bad)))
+    ok = [x for x in res if getattr(x, 'status_code', None) == 302]
+    check('并发', '8 并发申请后累计申请额与成功笔数一致（数据不串）',
+          abs(float(applied or 0) - 100 * len(ok)) < 0.005 and apps >= len(ok),
+          '成功=%s 累计申请=%s 申请单=%s 500数=%s' % (len(ok), applied, apps, len(bad)))
+    # CR04-01 根因（确定性复现）：申请单号 = AP+秒级时间+microsecond%1000，
+    # 同秒内约 1000 个取值，并发同节点申请时撞唯一键 payment_applications.apply_no。
+    from app.routes import make_apply_no
+    nos = [make_apply_no() for _ in range(5000)]
+    check('并发', '申请单号生成器不得产生重复（并发申请偶发 500 的根因）',
+          len(nos) == len(set(nos)),
+          '5000 次生成仅 %d 个唯一值；重复单号会撞 apply_no 唯一键 → 500 且本次申请丢失' % len(set(nos)),
+          xfail='CR04-01')
 
     # 并发付款：节点已付金额必须等于付款流水合计（不丢更新）
     lost = []
@@ -993,8 +1046,9 @@ def _audit_extras(s_admin):
         conn.commit()
     finally:
         conn.close()
-    r = C.post(s_admin, BASE, '/projects/new',
-               {'project_no': 'QA-DEGRADE', 'name': 'QA审计降级', 'item_name': ['科目'], 'original_amount': ['100']})
+    degrade = {'project_no': 'QA-DEGRADE', 'name': 'QA审计降级', 'item_name': ['科目'], 'original_amount': ['100']}
+    degrade.update(C.RATIO_FORM)
+    r = C.post(s_admin, BASE, '/projects/new', degrade)
     exists = q1(DB, 'SELECT COUNT(*) FROM projects WHERE project_no=?', ('QA-DEGRADE',))
     check('审计补充', '审计表缺失时业务降级（不 500、业务照常提交）',
           r.status_code == 302 and exists == 1, 'code=%s 项目存在=%s' % (r.status_code, exists))
@@ -1312,6 +1366,10 @@ def _batch6_export_import(s_admin):
         flat = ' '.join(str(c) for row in rows[:3] for c in row if c is not None)
         check('导出', '导出字段与页面一致（项目编号/项目名称/金额）',
               all(k in flat for k in ('项目编号', '项目名称')), flat[:120])
+        header = next((' '.join(str(c) for c in row if c is not None)
+                       for row in rows if any('项目编号' in str(c) for c in row if c is not None)), '')
+        check('导出', '导出含三本账列（已申请/已开票/已付款，CR-04）',
+              all(k in header for k in ('已申请', '已开票')), header[:160])
         check('导出', '导出金额为两位小数（Decimal 口径）',
               any(isinstance(c, (int, float)) and abs(round(float(c), 2) - float(c)) < 1e-9
                   for row in rows for c in row), '未发现两位小数金额')
@@ -1331,111 +1389,242 @@ def _batch6_export_import(s_admin):
 
 
 
+
+
+def _node_vals(nid):
+    row = q(DB, 'SELECT due_amount,applied_amount,invoice_amount,paid_amount,status FROM payment_nodes WHERE id=?', (nid,))[0]
+    return dict(due=d2(row[0]), applied=d2(row[1]), invoice=d2(row[2]),
+                paid=d2(row[3]), status=row[4])
+
+
 def _batch8_change_cases(s_admin):
-    """批次 8：合同变更（增补可正可负、按新总额重算、已付保留、超付标记）。"""
-    s_admin, _ = C.login(BASE, 'admin', 'admin123')
+    """CR-04 合同变更：冻结已付节点、差额按未付节点原应付比例分摊、尾差归集、两段确认、审计。"""
     _, pid = create_project(s_admin, 'QA-CHG', 'QA变更项目', [('合同价款', '165000', '0')])
     if pid is None:
         check('变更', '合同变更入口可用', False, '测试项目创建失败')
         return
+    iid = item_ids(pid)[0]
     nid = node_ids(pid, 'first')[0]
-    # 先发生一笔已付款（首付 30% = 49500）
-    C.post(s_admin, BASE, '/nodes/%d/update' % nid,
-           {'action': 'apply', 'apply_amount': '49500'})
+    # 先让首付节点发生完整业务（申请→开票→付款），作为冻结节点
+    C.post(s_admin, BASE, '/nodes/%d/update' % nid, {'action': 'apply', 'apply_amount': '49500'})
     C.post(s_admin, BASE, '/nodes/%d/update' % nid,
            {'action': 'invoice', 'invoice_amount': '49500', 'invoice_no': 'FP-CHG'})
     C.post(s_admin, BASE, '/nodes/%d/update' % nid,
            {'action': 'pay', 'paid_amount': '49500', 'pay_date': '2026-10-23'})
-    paid_before = q1(DB, 'SELECT paid_amount FROM payment_nodes WHERE id=?', (nid,))
-    invoice_before = q1(DB, 'SELECT invoice_amount FROM payment_nodes WHERE id=?', (nid,))
+    before = _node_vals(nid)
     records_before = q1(DB, 'SELECT COUNT(*) FROM payment_records WHERE node_id=?', (nid,))
-
-    # 入口探测用 GET（避免 POST 探测本身写库）
-    candidates = ['/projects/%d/contract-change' % pid, '/projects/%d/change' % pid,
-                  '/projects/%d/adjust' % pid]
-    path = None
-    for cand in candidates:
-        if s_admin.get(BASE + cand, allow_redirects=False).status_code == 200:
-            path = cand
-            break
-    check('变更', '提供合同变更入口（增补调整）', path is not None,
-          '候选均不可用：%s' % candidates)
-    if path is None:
-        return
-
-    def change(amount):
-        return s_admin.post(BASE + path, data={'additional_amount': str(amount)},
-                            allow_redirects=False)
+    due_before = {nt: _node_vals(node_ids(pid, nt)[0])['due']
+                  for nt in ('first', 'progress', 'acceptance', 'warranty')}
 
     def node_sum():
-        return float(q1(DB, 'SELECT SUM(due_amount) FROM payment_nodes WHERE project_id=?', (pid,)) or 0)
+        return d2(q1(DB, 'SELECT SUM(due_amount) FROM payment_nodes WHERE project_id=?', (pid,)) or 0)
 
     def node_due(nt):
-        return float(q1(DB, 'SELECT due_amount FROM payment_nodes WHERE project_id=? AND node_type=?', (pid, nt)) or 0)
+        return _node_vals(node_ids(pid, nt)[0])['due']
 
-    # 1) 变更增加：+20000 → 合同总额 185000，4 节点按新总额重算（首付也纳入）
-    change(20000)
-    total = node_sum()
-    check('变更', '变更增加：节点应付合计=新总额', abs(total - 185000) < 0.01, '合计=%.2f' % total)
-    check('变更', '变更增加：首付按新总额重算（55500）', abs(node_due('first') - 55500) < 0.01,
-          '首付=%.2f' % node_due('first'))
-    check('变更', '变更增加：已付金额/开票/流水不变',
-          q1(DB, 'SELECT paid_amount FROM payment_nodes WHERE id=?', (nid,)) == paid_before
-          and q1(DB, 'SELECT invoice_amount FROM payment_nodes WHERE id=?', (nid,)) == invoice_before
-          and q1(DB, 'SELECT COUNT(*) FROM payment_records WHERE node_id=?', (nid,)) == records_before)
-    check('变更', '变更增加：差额体现为未付',
-          abs(float(q1(DB, 'SELECT SUM(due_amount - paid_amount) FROM payment_nodes WHERE project_id=?', (pid,))) - (185000 - 49500)) < 0.01)
+    # 1) 变更增加 165000 → 185000：冻结已付节点，其余按原应付比例分摊
+    r1, r2 = contract_change(s_admin, pid, {iid: '185000'})
+    check('变更', '变更需两段确认（先出差异清单，第二次才落库）',
+          r1.status_code == 200 and r2 is not None and r2.status_code == 302
+          and abs(node_sum() - 185000) < 0.01,
+          'r1=%s r2=%s 合计=%.2f' % (r1.status_code, getattr(r2, 'status_code', None), node_sum()))
+    after_frozen = _node_vals(nid)
+    check('变更', '变更增加：已付节点应付/已付/开票/状态全部冻结',
+          after_frozen['due'] == before['due'] and after_frozen['paid'] == before['paid']
+          and after_frozen['invoice'] == before['invoice'] and after_frozen['status'] == before['status']
+          and q1(DB, 'SELECT COUNT(*) FROM payment_records WHERE node_id=?', (nid,)) == records_before,
+          'before=%s after=%s' % (before, after_frozen))
+    check('变更', '变更增加：节点应付合计=新总额 185,000', abs(node_sum() - 185000) < 0.01,
+          '合计=%.2f' % node_sum())
+    spread = [node_due(nt) for nt in ('progress', 'acceptance', 'warranty')]
+    weight_sum = due_before['progress'] + due_before['acceptance'] + due_before['warranty']
+    rem = d2('135500')
+    expected = [d2(rem * due_before[nt] / weight_sum)
+                for nt in ('progress', 'acceptance', 'warranty')]
+    check('变更', '变更增加：未付节点按原应付比例分摊（85800:24750:4950）',
+          all(abs(a - b) < 0.02 for a, b in zip(spread, expected))
+          and abs(sum(spread) - rem) < 0.01, '%s 期望≈%s' % (spread, expected))
+    check('变更', '变更增加：差额体现为未付（合计-已付=135,500）',
+          abs(d2(q1(DB, 'SELECT SUM(due_amount-paid_amount) FROM payment_nodes WHERE project_id=?', (pid,))) - 135500) < 0.01)
+    check('变更', '变更增加：合同总额=原金额+增补=185,000',
+          d2(q1(DB, 'SELECT SUM(original_amount+additional_amount) FROM project_items WHERE project_id=?', (pid,))) == d2('185000'))
 
-    # 2) 变更减少：-65000 → 120000；首付应付 36000 < 已付 49500 → 超付待处理
-    change(-65000)
-    total2 = node_sum()
-    check('变更', '变更减少：应付下降且已付保留',
-          abs(total2 - 120000) < 0.01
-          and q1(DB, 'SELECT paid_amount FROM payment_nodes WHERE id=?', (nid,)) == paid_before,
-          '合计=%.2f 已付=%s' % (total2, q1(DB, 'SELECT paid_amount FROM payment_nodes WHERE id=?', (nid,))))
-    over = q(DB, 'SELECT id,paid_amount,due_amount,status FROM payment_nodes WHERE project_id=?', (pid,))
-    over_nodes = [x for x in over if float(x[1] or 0) > float(x[2] or 0)]
-    check('变更', '变更减少：paid>due 节点标记超付',
-          bool(over_nodes) and all('超付' in str(x[3]) for x in over_nodes)
-          and abs(float(over_nodes[0][1]) - float(over_nodes[0][2]) - 13500) < 0.01,
-          over_nodes[:2])
-    over_nid = over_nodes[0][0] if over_nodes else nid
-    paid_keep = q1(DB, 'SELECT paid_amount FROM payment_nodes WHERE id=?', (over_nid,))
-    C.post(s_admin, BASE, '/nodes/%d/update' % over_nid,
-           {'action': 'pay', 'paid_amount': '1', 'pay_date': '2026-10-23'})
-    check('变更', '超付节点不能再发起付款',
-          q1(DB, 'SELECT paid_amount FROM payment_nodes WHERE id=?', (over_nid,)) == paid_keep)
+    # 2) 变更减少：→ 100000（> 已付应付 49500，允许；增补为负 -65000）
+    r1, r2 = contract_change(s_admin, pid, {iid: '100000'})
+    check('变更', '变更减少：应付下降且已付保留（增补为负被接受）',
+          abs(node_sum() - 100000) < 0.01
+          and _node_vals(nid)['paid'] == before['paid'],
+          '合计=%.2f 已付=%s' % (node_sum(), _node_vals(nid)['paid']))
+    check('变更', '变更减少：增补金额记为负数 -65,000',
+          d2(q1(DB, 'SELECT additional_amount FROM project_items WHERE id=?', (iid,))) == d2('-65000'),
+          'additional=%s' % q1(DB, 'SELECT additional_amount FROM project_items WHERE id=?', (iid,)))
+    rem_sum = sum(node_due(nt) for nt in ('progress', 'acceptance', 'warranty'))
+    check('变更', '变更减少：未付节点合计=新总额-冻结合计（50,500）',
+          abs(rem_sum - 50500) < 0.01, '未付合计=%.2f' % rem_sum)
 
-    # 3) 审计：project.contract_change 且有 before/after
+    # 3) 变更后总额 < 已付应付 → 阻断，库不变
+    sum_before = node_sum()
+    r1, r2 = contract_change(s_admin, pid, {iid: '40000'})
+    check('变更', '新总额小于已付节点应付合计时阻断（库不变）',
+          r2 is None and abs(node_sum() - sum_before) < 0.01,
+          'r1=%s r2=%s 合计=%.2f' % (r1.status_code, getattr(r2, 'status_code', None), node_sum()))
+
+    # 4) 总额≤0 被拒绝，库不变
+    r1, r2 = contract_change(s_admin, pid, {iid: '0'})
+    check('变更', '总额≤0 的变更被拒绝且库不变',
+          r2 is None and abs(node_sum() - sum_before) < 0.01,
+          'r1=%s r2=%s 合计=%.2f' % (r1.status_code, getattr(r2, 'status_code', None), node_sum()))
+
+    # 5) 尾差归质保金：100000.05 → 节点合计恰等于合同总额
+    contract_change(s_admin, pid, {iid: '100000.05'})
+    total3 = node_sum()
+    contract_total = d2(q1(DB, 'SELECT SUM(original_amount+additional_amount) FROM project_items WHERE project_id=?', (pid,)))
+    first3, prog3, acc3 = (node_due(nt) for nt in ('first', 'progress', 'acceptance'))
+    warr3 = node_due('warranty')
+    check('变更', '尾差归质保金后节点合计=合同总额',
+          total3 == contract_total and abs(warr3 - (contract_total - first3 - prog3 - acc3)) < 0.005,
+          '合计=%s 合同总额=%s 质保金=%.2f' % (total3, contract_total, warr3))
+
+    # 6) 审计：project.contract_change 且有 before/after 与冻结标记
     chg_rows = [x for x in _audit_rows(0)
                 if 'contract_change' in str(x.get('action', ''))]
-    check('变更', '变更写审计且含 before/after',
+    check('变更', '变更写审计 project.contract_change 且含 before/after',
           bool(chg_rows) and any(not _empty_json(x.get('before_json'))
                                  and not _empty_json(x.get('after_json')) for x in chg_rows),
           '动作=%s' % [x.get('action') for x in chg_rows][:3])
 
-    # 4) 增补为负被接受（总额>0）：再 -20000 → 100000
-    r_neg = change(-20000)
-    check('变更', '增补为负被接受（总额>0）',
-          r_neg.status_code in (200, 301, 302, 303) and abs(node_sum() - 100000) < 0.01,
-          'status=%s 合计=%.2f' % (r_neg.status_code, node_sum()))
+    # 7) 已开票 > 变更后应付 → 阻断
+    _, pid2 = create_project(s_admin, 'QA-CHG-INV', 'QA变更开票阻断', [('合同价款', '10000', '0')])
+    if pid2:
+        iid2 = item_ids(pid2)[0]
+        n_first, n_prog = node_ids(pid2, 'first')[0], node_ids(pid2, 'progress')[0]
+        C.post(s_admin, BASE, '/nodes/%d/update' % n_first, {'action': 'pay', 'paid_amount': '3000', 'pay_date': '2026-10-23'})
+        C.post(s_admin, BASE, '/nodes/%d/update' % n_prog,
+               {'action': 'invoice', 'invoice_amount': '5200', 'invoice_no': 'FP-CHG-INV'})
+        r1, r2 = contract_change(s_admin, pid2, {iid2: '6000'})
+        check('变更', '已开票大于变更后应付时阻断', r2 is None,
+              'r1=%s r2=%s' % (r1.status_code, getattr(r2, 'status_code', None)))
+        check('变更', '阻断时节点金额保持不变',
+              _node_vals(n_prog)['due'] == d2('5200') and _node_vals(n_prog)['invoice'] == d2('5200'),
+              _node_vals(n_prog))
 
-    # 5) 总额≤0 被拒绝，库不变
-    total_before_bad = node_sum()
-    r_bad = change(-999999)
-    check('变更', '总额≤0 的变更被拒绝',
-          abs(node_sum() - total_before_bad) < 0.01,
-          'status=%s 合计=%.2f' % (r_bad.status_code, node_sum()))
 
-    # 6) 尾差归质保金：总额 100000.05 时逐节点舍入合计=100000.06，尾差 -0.01 应落到质保金
-    change(0.05)
-    total3 = node_sum()
-    contract_total = float(q1(DB, 'SELECT SUM(original_amount+additional_amount) FROM project_items WHERE project_id=?', (pid,)))
-    parts = [node_due(nt) for nt in ('first', 'progress', 'acceptance')]
-    warranty = node_due('warranty')
-    check('变更', '尾差归质保金后节点合计=合同总额',
-          abs(total3 - contract_total) < 0.005 and abs(warranty - (contract_total - sum(parts))) < 0.005,
-          '合计=%.2f 合同总额=%.2f 质保金=%.2f' % (total3, contract_total, warranty))
+def _three_books_cases(s_admin):
+    """CR-04 三本账：6 种操作顺序、同维多次累计、超累计拒绝、一次性 token。"""
+    from itertools import permutations
+    AMT = '100'
+    for idx, order in enumerate(permutations(('apply', 'invoice', 'pay'))):
+        no = 'QA-TB-%d' % idx
+        _, pid = create_project(s_admin, no, 'QA三本账%d' % idx, [('科目', '1000', '0')])
+        if pid is None:
+            check('三本账', '%s 顺序：项目创建成功' % '-'.join(order), False, '创建失败')
+            continue
+        nid = node_ids(pid, 'first')[0]
+        codes = []
+        for action in order:
+            data = {'action': action}
+            if action == 'apply':
+                data['apply_amount'] = AMT
+            elif action == 'invoice':
+                data.update({'invoice_amount': AMT, 'invoice_no': 'FP-TB-%d-%s' % (idx, action)})
+            else:
+                data.update({'paid_amount': AMT, 'pay_date': '2026-10-23'})
+            codes.append(C.post(s_admin, BASE, '/nodes/%d/update' % nid, data).status_code)
+        vals = _node_vals(nid)
+        check('三本账', '任意顺序均可登记：%s' % '→'.join(order),
+              vals['applied'] == d2(AMT) and vals['invoice'] == d2(AMT)
+              and vals['paid'] == d2(AMT) and 500 not in codes and vals['status'] == '部分付款',
+              'codes=%s vals=%s' % (codes, vals))
+
+    # 同一维度多次部分累计（首付节点应付 3000 = 10000×30%）
+    _, pid = create_project(s_admin, 'QA-TB-MULTI', 'QA多次累计', [('科目', '10000', '0')])
+    nid = node_ids(pid, 'first')[0]
+    for _ in range(3):
+        C.post(s_admin, BASE, '/nodes/%d/update' % nid, {'action': 'apply', 'apply_amount': '500'})
+    for _ in range(2):
+        C.post(s_admin, BASE, '/nodes/%d/update' % nid, {'action': 'invoice', 'invoice_amount': '500', 'invoice_no': 'FP-MULTI'})
+    for _ in range(4):
+        C.post(s_admin, BASE, '/nodes/%d/update' % nid, {'action': 'pay', 'paid_amount': '250', 'pay_date': '2026-10-23'})
+    vals = _node_vals(nid)
+    check('三本账', '同一维度可多次部分累计（申请 1500 / 开票 1000 / 付款 1000）',
+          vals['applied'] == d2(1500) and vals['invoice'] == d2(1000) and vals['paid'] == d2(1000),
+          vals)
+
+    # 超累计拒绝（最后一笔恰好到应付可以，再多 1 分拒绝）
+    C.post(s_admin, BASE, '/nodes/%d/update' % nid, {'action': 'apply', 'apply_amount': '1500'})
+    ok_exact = _node_vals(nid)['applied'] == d2(3000)  # 1500 + 1500 = 应付 3000
+    C.post(s_admin, BASE, '/nodes/%d/update' % nid, {'action': 'apply', 'apply_amount': '0.01'})
+    over = _node_vals(nid)['applied']
+    check('三本账', '累计申请恰好补到应付时可成功', ok_exact, ok_exact)
+    check('三本账', '累计申请超过应付时拒绝（库不变）', over == d2(3000), 'applied=%s' % over)
+    # 再多 1 分拒绝（已到应付）
+    C.post(s_admin, BASE, '/nodes/%d/update' % nid, {'action': 'apply', 'apply_amount': '0.01'})
+    check('三本账', '累计已等于应付时再多 1 分拒绝',
+          _node_vals(nid)['applied'] == d2(3000), 'applied=%s' % _node_vals(nid)['applied'])
+
+    # 一次性 token：同一 token 重复提交只成功一次
+    _, pid3 = create_project(s_admin, 'QA-TB-TOKEN', 'QA重复提交', [('科目', '10000', '0')])
+    nid3 = node_ids(pid3, 'first')[0]
+    tok = C.node_tokens(s_admin, BASE, pid3)[(nid3, 'pay')]
+    r_a = s_admin.post(BASE + '/nodes/%d/update' % nid3,
+                       data={'action': 'pay', 'paid_amount': '100', 'confirm_token': tok},
+                       allow_redirects=False)
+    paid_1 = _node_vals(nid3)['paid']
+    r_b = s_admin.post(BASE + '/nodes/%d/update' % nid3,
+                       data={'action': 'pay', 'paid_amount': '100', 'confirm_token': tok},
+                       allow_redirects=False)
+    recs = q1(DB, 'SELECT COUNT(*) FROM payment_records WHERE node_id=?', (nid3,))
+    check('三本账', '重复提交同一 token 只成功一次（无重复流水）',
+          paid_1 == d2(100) and _node_vals(nid3)['paid'] == d2(100) and recs == 1,
+          'r_a=%s r_b=%s paid=%s recs=%s' % (r_a.status_code, r_b.status_code, _node_vals(nid3)['paid'], recs))
+    # 无 token 直接 POST 被拒
+    C.post(s_admin, BASE, '/nodes/%d/update' % nid3, {'action': 'pay', 'paid_amount': '100', 'confirm_token': ''})
+    check('三本账', '缺少一次性 token 的节点动作被拒绝', _node_vals(nid3)['paid'] == d2(100))
+
+
+def _ratio_required_cases(s_admin):
+    """CR-04：新建项目 4 个比例必填、无默认值、合计须 100%（容差 ±0.01%）。"""
+
+    def new_form(no):
+        data = {'project_no': no, 'name': 'QA比例必填',
+                'item_name': ['科目'], 'original_amount': ['100000'], 'tax_rate': ['6%']}
+        return data
+
+    r = C.post(s_admin, BASE, '/projects/new', new_form('QA-RATIO-NONE'))
+    check('比例', '未填比例时新建项目被拒绝（无默认值）',
+          q1(DB, 'SELECT id FROM projects WHERE project_no=?', ('QA-RATIO-NONE',)) is None,
+          'code=%s 项目已生成' % r.status_code)
+
+    bad = new_form('QA-RATIO-98')
+    bad.update({'ratio_first': '30', 'ratio_progress': '50', 'ratio_acceptance': '15', 'ratio_warranty': '3'})
+    C.post(s_admin, BASE, '/projects/new', bad)
+    check('比例', '比例合计 98% 时拒绝',
+          q1(DB, 'SELECT id FROM projects WHERE project_no=?', ('QA-RATIO-98',)) is None)
+
+    neg = new_form('QA-RATIO-NEG')
+    neg.update({'ratio_first': '-10', 'ratio_progress': '92', 'ratio_acceptance': '15', 'ratio_warranty': '3'})
+    C.post(s_admin, BASE, '/projects/new', neg)
+    neg_pid = q1(DB, 'SELECT id FROM projects WHERE project_no=?', ('QA-RATIO-NEG',))
+    neg_due = q1(DB, "SELECT due_amount FROM payment_nodes WHERE project_id=? AND node_type='first'", (neg_pid,)) if neg_pid else None
+    check('比例', '负比例被拒绝', neg_pid is None or float(neg_due or 0) >= 0,
+          '生成负数应付=%s' % neg_due)
+
+    good = new_form('QA-RATIO-OK')
+    good.update(C.RATIO_FORM)
+    r_ok = C.post(s_admin, BASE, '/projects/new', good)
+    pid = q1(DB, 'SELECT id FROM projects WHERE project_no=?', ('QA-RATIO-OK',))
+    nsum = d2(q1(DB, 'SELECT SUM(due_amount) FROM payment_nodes WHERE project_id=?', (pid,))) if pid else None
+    check('比例', '填全 30/52/15/3 后可创建且节点合计=100,000',
+          r_ok.status_code == 302 and nsum == d2('100000'), 'code=%s nsum=%s' % (r_ok.status_code, nsum))
+    # 合同变更逐科目输入：某科目留空 → 拒绝且库不变
+    if pid:
+        iid = item_ids(pid)[0]
+        before_total = d2(q1(DB, 'SELECT SUM(original_amount+additional_amount) FROM project_items WHERE project_id=?', (pid,)))
+        r_bad = C.post(s_admin, BASE, '/projects/%d/contract-change' % pid, {'item_total_%d' % iid: ''})
+        after_total = d2(q1(DB, 'SELECT SUM(original_amount+additional_amount) FROM project_items WHERE project_id=?', (pid,)))
+        check('比例', '合同变更未填科目新总额时拒绝且库不变',
+              r_bad.status_code == 200 and before_total == after_total == d2('100000'),
+              'code=%s before=%s after=%s' % (r_bad.status_code, before_total, after_total))
 
 
 def run(server):
@@ -1468,6 +1657,8 @@ def run(server):
     section('########## 11b. 事务语义（审计与业务同事务） ##########', lambda: _tx_semantics(s_admin))
     section('########## 11c. 软删除与时间口径（下一批次验收） ##########', lambda: _soft_delete_cases(s_admin))
     section('########## 11d. 归档只读（批次 5） ##########', lambda: _archived_readonly_cases(s_admin))
-    section('########## 11e. 合同变更（批次 8） ##########', lambda: _batch8_change_cases(s_admin))
+    section('########## 11e. 合同变更（CR-04） ##########', lambda: _batch8_change_cases(s_admin))
+    section('########## 11f. 三本账并列（CR-04） ##########', lambda: _three_books_cases(s_admin))
+    section('########## 11g. 比例必填（CR-04） ##########', lambda: _ratio_required_cases(s_admin))
     section('########## 12. 导出（批次 6a） ##########', lambda: _batch6_export_import(s_admin))
     section('########## 12. 审计补充（批次 3 补测，末项会删临时库 audit_logs） ##########', lambda: _audit_extras(s_admin))

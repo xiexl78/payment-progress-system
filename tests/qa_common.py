@@ -7,6 +7,7 @@
 """
 import importlib.util
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -36,6 +37,13 @@ COUNTS = {'PASS': 0, 'FAIL': 0, 'XFAIL': 0, 'XPASS': 0}
 
 RATIOS = {'first': Decimal('0.30'), 'progress': Decimal('0.52'),
           'acceptance': Decimal('0.15'), 'warranty': Decimal('0.03')}
+
+#: 新建项目表单的 4 个比例（百分数，CR-04 起必填、无默认值）
+RATIO_FORM = {'ratio_first': '30', 'ratio_progress': '52',
+              'ratio_acceptance': '15', 'ratio_warranty': '3'}
+
+#: 当前活动测试库路径（LiveServer 启动时写入，供 post() 取节点一次性 token）
+ACTIVE_DB = None
 
 
 def check(section, name, ok, detail='', xfail=None):
@@ -117,6 +125,8 @@ class LiveServer:
         os.makedirs(self.upload_dir)
         seed_db(self.db_path)
         assert os.path.abspath(self.db_path) != INSTANCE_DB
+        global ACTIVE_DB
+        ACTIVE_DB = self.db_path
         self.app = make_app(self.db_path, SECRET_KEY=DEFAULT_SECRET)
         self._orig_upload_dir = routes_module.contract_upload_dir
         routes_module.contract_upload_dir = lambda: self.upload_dir
@@ -158,7 +168,45 @@ def login(base, user, pwd):
     return sess, r
 
 
+#: 项目详情页里每个节点的三个表单：action 值 + 一次性 confirm_token
+NODE_FORM_RE = re.compile(
+    r'action="/nodes/(\d+)/update".*?name="action" value="([^"]+)"'
+    r'.*?name="confirm_token" value="([^"]+)"', re.S)
+
+
+def node_tokens(sess, base, project_id):
+    """GET 项目详情页并解析 ``{(node_id, action): token}``（CR-04 一次性凭据）。"""
+    html = sess.get(base + '/projects/%d' % project_id, timeout=60).text
+    return {(int(nid), action): token
+            for nid, action, token in NODE_FORM_RE.findall(html)}
+
+
+def _inject_node_token(sess, base, path, data):
+    """节点动作自动补齐详情页签发的 confirm_token。
+
+    CR-04 起 ``/nodes/<id>/update`` 需要一次性 token；用例不需要逐处手写。
+    显式传了 ``confirm_token``（含空串/伪造值）时不做补齐，便于测令牌语义。
+    """
+    match = re.match(r'^/nodes/(\d+)/update$', path or '')
+    if not match or not isinstance(data, dict) or 'confirm_token' in data:
+        return data
+    if not ACTIVE_DB:
+        return data
+    node_id = int(match.group(1))
+    project_id = q1(ACTIVE_DB, 'SELECT project_id FROM payment_nodes WHERE id=?',
+                    (node_id,))
+    if not project_id:
+        return data
+    tokens = node_tokens(sess, base, project_id)
+    token = tokens.get((node_id, (data.get('action') or '').strip()))
+    if token:
+        data = dict(data)
+        data['confirm_token'] = token
+    return data
+
+
 def post(sess, base, path, data=None, files=None):
+    data = _inject_node_token(sess, base, path, data)
     return sess.post(base + path, data=data, files=files,
                      allow_redirects=False, timeout=120)
 
