@@ -20,9 +20,9 @@ python tests/run_qa.py
 - **绝不读写项目内的 `instance/payment_progress.db`**，也不启动/占用 5001 端口；
 - 运行结束自动清理临时的库、上传文件与服务进程。
 
-## 三、当前基线（2026-10-23）
+## 三、当前基线（2026-10-24）
 
-`python tests/run_qa.py` → **235 项：234 PASS / 0 FAIL / 1 XFAIL / 0 XPASS，退出码 0**。
+`python tests/run_qa.py` → **235 项：235 PASS / 0 FAIL / 0 XFAIL / 0 XPASS，退出码 0**（全绿）。
 
 状态含义：
 
@@ -57,9 +57,9 @@ python tests/run_qa.py
 
 ## 五、当前 XFAIL（已知缺陷，按基线报告编号）
 
-| 编号 | 用例（简） | 数量 |
-| --- | --- | --- |
-| P2-08 | 图片 OCR 本机不可用（需目标机复测，`QA_ENABLE_OCR=1`） | 1 |
+**0 项**——全部已知缺陷用例均已修复并摘掉 `xfail`，回归基线全绿。
+
+最后一项 P2-08（图片 OCR）已随 `290273b` 修复：OCR 前先把图片转存系统临时目录，避开 WinRT 访问工作区被拒（0x80070005）；用例改为**默认启用**（测试图片改用系统中文字体 48px 渲染，识别率稳定），无 OCR 环境的机器可显式设 `QA_ENABLE_OCR=0` 跳过。
 
 > 口径统一（284a755 + 尾差归集）：所有路径（新建/科目添加/合同确认/回改/变更）首付都按「原金额+增补金额」，4 节点合计恒等于合同总额（尾差按 质保金→验收→进度→首付 归集），相关断言已全部转 PASS。
 > 批次 8 合同变更已通过（11e 共 11 项全 PASS）。
@@ -90,9 +90,9 @@ python tests/run_qa.py
 ## 七、脚本与文档的已知问题（不改业务代码，只记录）
 
 - `scripts/e2e_test.py`：非幂等——同一数据库第二次运行有 5 项失败（重复项目编号、重复付款、断言写死金额），必须先 `python scripts/init_db.py --force`；且会修改种子项目的试运行/验收日期。
-- `scripts/e2e_scan_pdf.py`：失败路径仅打印后 `return`，**退出码仍为 0 且无 PASS/FAIL 汇总**（P2-08 未修）；硬编码 5001 端口。依赖 Pillow 已随 `requirements.txt` 锁定补齐。
-- `README.md`：声称上传上限 20MB，实际代码 `MAX_CONTENT_LENGTH=16MB`。
-- 本机环境坑：WinRT OCR 在沙箱下无法访问工作区文件（0x80070005，临时目录可识别），扫描件/图片合同需在目标机复测；中文控制台需 `chcp 65001` + `PYTHONIOENCODING=utf-8`，否则输出乱码。
+- `scripts/e2e_scan_pdf.py`：已补 PASS/FAIL 汇总与非零退出码；仍硬编码 5001 端口，需先启动服务（`python app.py` 或等价）再跑，单独执行会 ConnectionError。依赖 Pillow 已随 `requirements.txt` 锁定补齐。
+- `README.md`：声称上传上限 20MB，实际代码 `MAX_CONTENT_LENGTH=16MB`（现为 20MB，已配置化）。
+- 本机环境坑：WinRT OCR 在本机已修复（`290273b`：先转存系统临时目录），OCR 用例默认启用；中文控制台需 `chcp 65001` + `PYTHONIOENCODING=utf-8`，否则输出乱码。
 
 ## 八、维护规则
 

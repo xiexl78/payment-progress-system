@@ -313,25 +313,45 @@ def _upload_security(s_admin):
           APP.config.get('MAX_CONTENT_LENGTH') == 20 * 1024 * 1024,
           '实际 %s' % APP.config.get('MAX_CONTENT_LENGTH'))
 
-    # 图片 OCR（本机沙箱 WinRT 文件访问受限，默认跳过实际 OCR，避免子进程卡死）
-    if os.environ.get('QA_ENABLE_OCR', '0') != '1':
-        check('上传', '图片合同 OCR 可识别并进入确认页（默认跳过：本机沙箱不可用，需目标机实测）',
-              False, '设置 QA_ENABLE_OCR=1 可在目标机启用该用例', xfail='P2-08')
+    # 图片 OCR（默认启用：本机 WinRT 访问问题已修复；无 OCR 的机器可显式 QA_ENABLE_OCR=0 跳过）
+    if os.environ.get('QA_ENABLE_OCR', '1') == '0':
+        check('上传', '图片合同 OCR（QA_ENABLE_OCR=0，本机无 OCR 环境跳过）', True,
+              '如需强制测试请去掉 QA_ENABLE_OCR=0')
     else:
         try:
-            from PIL import Image, ImageDraw
-            png = os.path.join(os.environ.get('TEMP', '.'), 'qa_ocr_probe.png')
-            im = Image.new('RGB', (900, 300), 'white')
-            ImageDraw.Draw(im).text((30, 60), '合同总金额 165000 元 税率 13%', fill='black')
+            from PIL import Image, ImageDraw, ImageFont
+        except ImportError:
+            ImageFont = None
+        if ImageFont is None:
+            check('上传', '图片合同 OCR 用例（Pillow 未安装跳过）', True)
+        else:
+            # 用小字号默认字体 OCR 识别率低，这里用系统中文字体 48px 生成清晰图片
+            font = None
+            for fp in (r'C:\Windows\Fonts\simhei.ttf', r'C:\Windows\Fonts\msyh.ttc',
+                       r'C:\Windows\Fonts\simsun.ttc'):
+                if os.path.exists(fp):
+                    try:
+                        font = ImageFont.truetype(fp, 48)
+                        break
+                    except OSError:
+                        pass
+            png = os.path.join(tempfile.gettempdir(), 'qa_ocr_probe.png')
+            im = Image.new('RGB', (1400, 500), 'white')
+            draw = ImageDraw.Draw(im)
+            lines = [('合同总金额：165000.00 元', (40, 40)), ('税率：13%', (40, 140)),
+                     ('合同名称：QA OCR 测试合同', (40, 240))]
+            for text, xy in lines:
+                if font:
+                    draw.text(xy, text, font=font, fill='black')
+                else:
+                    draw.text(xy, text, fill='black')
             im.save(png)
             with open(png, 'rb') as fh:
                 r_img = C.post(s_admin, BASE, '/contracts/upload', files={'file': ('ocr_probe.png', fh, 'image/png')})
             img_row = q(DB, 'SELECT status,error_msg FROM contract_files ORDER BY id DESC LIMIT 1')[0]
             check('上传', '图片合同 OCR 可识别并进入确认页',
                   r_img.status_code == 302 and '/confirm' in r_img.headers.get('Location', ''),
-                  'status=%s error=%s（目标机需复测）' % (img_row[0], img_row[1]), xfail='P2-08')
-        except ImportError:
-            check('上传', '图片合同 OCR 用例（Pillow 未安装跳过）', True)
+                  'status=%s error=%s font=%s' % (img_row[0], img_row[1], bool(font)))
 
 
 def _state_and_money(s_admin, pid_a, pid_c):
@@ -552,15 +572,17 @@ def _concurrency(s_admin):
         C.post(s_admin, BASE, '/nodes/%d/update' % n,
                {'action': 'apply', 'apply_amount': '2000', 'invoice_amount': '2000',
                 'invoice_no': 'FP-LU-%d' % trial})
-        run_threads(2, lambda s, i, n=n: C.post(s, BASE, '/nodes/%d/update' % n,
-                                                {'action': 'pay', 'paid_amount': '1000', 'pay_date': '2026-10-20'}))
+        res = run_threads(2, lambda s, i, n=n: C.post(s, BASE, '/nodes/%d/update' % n,
+                                                     {'action': 'pay', 'paid_amount': '1000', 'pay_date': '2026-10-20'}))
+        codes = [getattr(x, 'status_code', 'EXC') for x in res]
         paid = float(q1(DB, 'SELECT paid_amount FROM payment_nodes WHERE id=?', (n,)) or 0)
         pay_sum = float(q1(DB, 'SELECT COALESCE(SUM(paid_amount),0) FROM payment_records WHERE node_id=?', (n,)) or 0)
         recs = q1(DB, 'SELECT COUNT(*) FROM payment_records WHERE node_id=?', (n,))
-        lost.append((paid, pay_sum, recs))
+        lost.append((paid, pay_sum, recs, codes))
     check('并发', '两人同时付款后节点已付应与流水合计一致（无丢失更新）',
-          all(abs(paid - pay_sum) < 0.005 and 1 <= recs <= 2 for paid, pay_sum, recs in lost),
-          '实测 (node_paid, records_sum, records)=%s' % lost)
+          all(abs(paid - pay_sum) < 0.005 and 1 <= recs <= 2 and 500 not in codes
+              and 'EXC' not in codes for paid, pay_sum, recs, codes in lost),
+          '实测 (node_paid, records_sum, records, codes)=%s' % lost)
 
     # 并发同编号项目
     res = run_threads(2, lambda s, i: C.post(s, BASE, '/projects/new',

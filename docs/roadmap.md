@@ -83,7 +83,7 @@
 | --- | --- | --- |
 | 1 金额与校验 | 部分完成 | `app/money.py`、`app/validation.py` 已接入；比例合计/负比例/负金额、HALF_UP 舍入已验证生效；**并发原子更新已完成**（付款用条件 UPDATE，节点已付=流水合计；8 并发申请只生成 1 张单） |
 | 2 合同回改 | 部分完成 | 改为就地更新、差异清单 + `confirm_token` 二次确认；有付款记录时不再 500；确认页回填现值待复核 |
-| 3 审计留痕 | 已完成（验收通过） | `audit_logs`、`updated_at/by`、登录/节点/项目/删除留痕与 `/admin/audit` 查询页已落地，10 项验收全部 PASS；物理删除保留审计日志（软删另算）；字段名为 `ts/object_type/object_id/ua`，与设计文档命名不一致待对齐 |
+| 3 审计留痕 | 已完成（验收通过） | `audit_logs`、`updated_at/by`、登录/节点/项目/删除留痕与 `/admin/audit` 查询页已落地，10 项验收全部 PASS；物理删除保留审计日志（软删另算）；字段名 `ts/object_type/object_id/ua` 与设计文档命名不同，已按 Chief 定「以实现为准」在 `docs/review-audit.md` §5 记录，不改代码 |
 | 4 安全基线 | 已完成（验收通过） | CSRF 强制校验、SECRET_KEY fail-fast、登出 POST、Cookie SameSite/8h、403/404/405/413/500 中文错误页、经办人删项目/改状态越权收口均已落地并通过回归（P1-08/P1-09/P1-01/P1-02/P2-01 大部分转 PASS） |
 | 5 备份与部署 | 脚本完成 | `scripts/backup.ps1`、`restore.ps1`、`sqlite_tool.py`、`verify_restored.py` 已落；未接入计划任务与应用启动自检 |
 | 6 导入导出 | 导出已完成；导入移出上线范围 | 导出 `export_excel.py` 已通过（字段/两位小数/筛选/viewer/审计）；导入 `import_excel.py` 与 dry-run 已实现但经用户确认**不做历史导入**，不纳入上线范围 |
@@ -91,8 +91,8 @@
 | 8 合同变更 | 已完成（验收通过） | `/projects/<id>/contract-change`：增补可正可负、4 节点按新总额重算（首付也纳入）、已付/开票/流水保留、超付标 `超付待处理` 且禁止再付、审计 `project.contract_change` 含 before/after、尾差归质保金；11 项验收全部 PASS（含二次确认 preview + confirm_token） |
 | 8b 口径统一 | 已完成（验收通过） | 所有路径（新建/科目添加/合同确认/回改/变更/导入）首付都按「原金额+增补金额」、`calc_base` 全为 `total`；建点即做 `allocate_tail` 尾差归集，Σ4 节点=合同总额；新增 3 条 `--no-seed` 生产初始化用例（`init_db.py --no-seed`，`APP_ENV=production` 默认不种） |
 
-**QA 回归现状**：`python tests/run_qa.py` → 235 项，234 PASS / 0 FAIL / 1 XFAIL（已知缺陷，按 P0/P1/P2 编号列出），退出码 0。临时库 + 随机端口，不碰 `instance/`。批次 3 审计、4a 安全基线、4b 密码/会话/限速、4c 软删除、5 配置/健康检查、6a 导出、7 收尾、8 合同变更、8b 口径统一均已转 PASS；剩余唯一 XFAIL 为 P2-08 图片 OCR（本机 WinRT 沙箱不可用，需目标机 `QA_ENABLE_OCR=1` 复测）。
+**QA 回归现状**：`python tests/run_qa.py` → 235 项，**235 PASS / 0 FAIL / 0 XFAIL / 0 XPASS，退出码 0（全绿）**。临时库 + 随机端口，不碰 `instance/`。批次 3 审计、4a 安全基线、4b 密码/会话/限速、4c 软删除、5 配置/健康检查、6a 导出、7 收尾、8 合同变更、8b 口径统一均已转 PASS；最后一项 P2-08 图片 OCR 已随 `290273b` 修复（OCR 前转存系统临时目录），用例默认启用、不再依赖 `QA_ENABLE_OCR=1`。
 **口径已定**：种子演示项目仅演示数据，生产初始化不建（`--no-seed` 已实现且为生产默认）；导入不做，历史数据人工录入；重启后旧会话仍有效为正常预期。导入移出后无迁移方案，历史台账人工录入 + 双轨核对。
-**已知环境坑**：本机 WinRT 沙箱限制导致图片/扫描件 OCR 不可用（0x80070005），目标机需实测；`e2e_test.py` 非幂等；`e2e_scan_pdf.py` 失败也退出 0（已补 PASS/FAIL 汇总与非零退出码）。
+**已知环境坑**：WinRT OCR 本机沙箱限制已修复（`290273b` 先转存系统临时目录），OCR 用例默认启用，无 OCR 机器可 `QA_ENABLE_OCR=0` 跳过；`e2e_test.py` 非幂等；`e2e_scan_pdf.py` 已补 PASS/FAIL 汇总与非零退出码，但需 5001 端口的服务在跑。
 **计划外阻断**：2026-10-22 晚起团队模型额度耗尽（QUOTA 402），开发/测试/架构师暂时无法执行，代码与文档均已落盘。
 
