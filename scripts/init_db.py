@@ -36,17 +36,21 @@ import sqlite3
 import subprocess
 import sys
 from datetime import date, datetime
+from decimal import Decimal
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, PROJECT_ROOT)
 
 from app import create_app, NODE_TEMPLATES as TEMPLATES  # noqa: E402
-from app.models import db, User, Project, ProjectItem, PaymentNode  # noqa: E402
+from app.models import (db, User, Project, ProjectItem, PaymentNode,  # noqa: E402
+                        PaymentInvoice)
+from app.nodes import node_name as make_node_name  # noqa: E402
 
 DB_NAME = 'payment_progress.db'
 COUNT_TABLES = [
     'users', 'projects', 'project_items', 'payment_nodes',
-    'payment_applications', 'payment_records', 'contract_files', 'acceptance_records',
+    'payment_invoices', 'payment_applications', 'payment_records',
+    'contract_files', 'acceptance_records',
 ]
 
 SEED_USERS = [
@@ -283,6 +287,8 @@ def build_seed_project():
          'progress': {'invoice': 3120, 'paid': 3120, 'status': '已申请'}},
     ]
 
+    ratios = {'first': Decimal('0.30'), 'progress': Decimal('0.52'),
+              'acceptance': Decimal('0.15'), 'warranty': Decimal('0.03')}
     for it in seed_items:
         item = ProjectItem(project_id=project.id, item_name=it['item_name'],
                            tax_rate=it['tax_rate'], original_amount=it['original'],
@@ -290,17 +296,25 @@ def build_seed_project():
         db.session.add(item)
         db.session.flush()
         for t in TEMPLATES:
+            nt = t['node_type']
             node = PaymentNode(project_id=project.id, item_id=item.id,
-                               node_type=t['node_type'], node_name=t['node_name'],
-                               ratio=t['ratio'], calc_base=t['calc_base'], status='未触发')
+                               node_type=nt, node_name=make_node_name(nt, ratios[nt]),
+                               ratio=ratios[nt], calc_base=t['calc_base'], status='未触发')
             node.recalc()
-            key = t['node_type']
-            if key in it:
-                node.invoice_amount = it[key]['invoice']
-                node.paid_amount = it[key]['paid']
-                node.status = it[key]['status']
+            if nt in it:
+                node.invoice_amount = it[nt]['invoice']
+                node.paid_amount = it[nt]['paid']
+                node.status = it[nt]['status']
+                if it[nt]['status'] != '已付款':
+                    node.applied_amount = node.due_amount
                 node.trigger_date = None
-            elif t['node_type'] in ('acceptance',):
+                if Decimal(node.invoice_amount or 0) > 0:
+                    db.session.add(PaymentInvoice(
+                        node=node, project_id=project.id,
+                        invoice_no='SEED-%s-%s' % (item.id, nt),
+                        amount=Decimal(node.invoice_amount or 0),
+                        invoice_date=None, remark='种子数据'))
+            elif nt in ('acceptance',):
                 node.trigger_date = None
             db.session.add(node)
     return project

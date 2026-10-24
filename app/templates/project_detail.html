@@ -116,7 +116,10 @@
       <div><label class="field-label">科目名称 *</label><input type="text" name="item_name" class="mid" required></div>
       <div><label class="field-label">税率</label><select name="tax_rate"><option value="">—</option><option>13%</option><option>9%</option><option>6%</option><option>3%</option></select></div>
       <div><label class="field-label">原金额</label><input type="number" name="original_amount" class="mid" step="0.01" min="0" value="0"></div>
-      <div><label class="field-label">增补金额</label><input type="number" name="additional_amount" class="mid" step="0.01" min="0" value="0"></div>
+      <div><label class="field-label">首付%</label><input type="number" name="ratio_first" class="small" step="0.01" min="0" max="100" required></div>
+      <div><label class="field-label">进度%</label><input type="number" name="ratio_progress" class="small" step="0.01" min="0" max="100" required></div>
+      <div><label class="field-label">验收%</label><input type="number" name="ratio_acceptance" class="small" step="0.01" min="0" max="100" required></div>
+      <div><label class="field-label">质保%</label><input type="number" name="ratio_warranty" class="small" step="0.01" min="0" max="100" required></div>
       <button type="submit" class="btn btn-primary btn-sm">添加并生成节点</button>
     </form>
   </div>
@@ -138,89 +141,83 @@
   </div>
 </div>
 
-{# ---------- 付款节点分组 ---------- #}
+{# ---------- 付款节点分组：申请 / 开票 / 付款三本账并列 ---------- #}
 <div class="card">
-  <div class="card-title">付款节点管理 <span class="sub">每个科目自动生成 4 个节点：首付款30%、进度款52%、验收款15%、质保金3%（均按「原金额+增补金额」，科目内尾差归质保金）</span></div>
+  <div class="card-title">付款节点管理
+    <span class="sub">申请 / 开票 / 付款三本账并列，任意顺序、互不为前置；每本账各自累计不得超过应付。已付节点合同变更时冻结。</span>
+  </div>
 
   {% for node_type, g in node_groups.items() %}
   <div class="node-section">
     <div class="node-block">
       <div class="node-head">
         <div class="flex">
-          <span class="t">{{ g.meta.node_name }}</span>
-          <span class="badge {{ 'badge-green' if g.sum_paid >= g.sum_due and g.sum_due > 0 else 'badge-orange' if g.sum_invoice > 0 else 'badge-gray' }}">
-            {{ '已全部支付' if g.sum_paid >= g.sum_due and g.sum_due > 0 else '部分/待支付' if g.sum_paid > 0 or g.sum_invoice > 0 else '未发生' }}
+          <span class="t">{{ g.nodes[0].node_name if g.nodes else g.meta.node_type }}</span>
+          <span class="badge {{ 'badge-green' if g.sum_paid >= g.sum_due and g.sum_due > 0 else 'badge-orange' if g.sum_applied > 0 or g.sum_invoice > 0 or g.sum_paid > 0 else 'badge-gray' }}">
+            {{ '已全部支付' if g.sum_paid >= g.sum_due and g.sum_due > 0 else '部分/待支付' if g.sum_applied > 0 or g.sum_invoice > 0 or g.sum_paid > 0 else '未发生' }}
           </span>
         </div>
         <span class="hint">{{ g.meta.trigger }}</span>
-        <span class="sum">合计应付 <b>￥{{ '{:,.2f}'.format(g.sum_due) }}</b> · 已开票 <b>￥{{ '{:,.2f}'.format(g.sum_invoice) }}</b> · 已支付 <b>￥{{ '{:,.2f}'.format(g.sum_paid) }}</b></span>
+        <span class="sum">合计应付 <b>￥{{ '{:,.2f}'.format(g.sum_due) }}</b> · 已申请 <b>￥{{ '{:,.2f}'.format(g.sum_applied) }}</b> · 已开票 <b>￥{{ '{:,.2f}'.format(g.sum_invoice) }}</b> · 已支付 <b>￥{{ '{:,.2f}'.format(g.sum_paid) }}</b></span>
       </div>
       <div class="table-wrap">
         <table class="table">
           <thead>
             <tr>
               <th>科目</th>
-              <th class="num">应付（科目总额×{{ (g.meta.ratio * 100)|int }}%）</th>
-              <th class="num">已开票金额</th>
-              <th class="num">已支付金额</th>
-              <th>状态</th>
-              <th style="min-width:280px;">操作</th>
+              <th class="num">应付金额</th>
+              <th class="num">已申请</th>
+              <th class="num">已开票</th>
+              <th class="num">已付款</th>
+              <th>进度</th>
+              <th style="min-width:460px;">登记（申请 / 开票 / 付款）</th>
             </tr>
           </thead>
           <tbody>
             {% for n in g.nodes %}
+            {% set d = node_three[n.id] %}
             <tr>
               <td>{{ n.item_name }}</td>
-              <td class="num">￥{{ '{:,.2f}'.format(n.due_amount) }}</td>
-              <td class="num">{% if n.invoice_amount > 0 %}￥{{ '{:,.2f}'.format(n.invoice_amount) }}{% else %}—{% endif %}</td>
-              <td class="num">{% if n.paid_amount > 0 %}￥{{ '{:,.2f}'.format(n.paid_amount) }}{% else %}—{% endif %}
-                {% if n.paid_amount > n.due_amount %}
-                <div class="text-danger" style="font-size:12px;">超付 ￥{{ '{:,.2f}'.format(n.paid_amount - n.due_amount) }}（超付待处理，禁止再付款）</div>
-                {% endif %}
+              <td class="num">￥{{ '{:,.2f}'.format(n.due_amount) }}
+                {% if n.change_note %}<div class="text-muted" style="font-size:12px;">{{ n.change_note }}</div>{% endif %}
               </td>
+              <td class="num">{{ d.apply_label }}</td>
+              <td class="num">{{ d.invoice_label }}</td>
+              <td class="num">{{ d.pay_label }}</td>
+              <td><span class="badge {{ 'badge-green' if d.status == '已付款' else 'badge-blue' if d.status != '未触发' else 'badge-gray' }}">{{ status_labels.get(d.status, d.status) }}</span></td>
               <td>
-                {% if n.status == '超付待处理' %}<span class="badge badge-red">超付待处理</span>
-                {% elif n.status == '已付款' %}<span class="badge badge-green">已付款</span>
-                {% elif n.status == '已申请' %}<span class="badge badge-blue">已申请</span>
-                {% elif n.status == '未开票已申请' %}<span class="badge badge-orange">未开票已申请</span>
-                {% else %}<span class="badge badge-gray">未触发</span>{% endif %}
-              </td>
-              <td>
-                {% if current_user.role in ('admin', 'operator') %}
-                  {% if n.status == '超付待处理' %}
-                    <span class="text-danger" style="font-size:12px;">超付待处理：禁止再付款，需线下处理退款/抵扣</span>
-                  {% elif n.status == '未触发' %}
-                    <form method="post" action="{{ url_for('main.node_update', node_id=n.id) }}" class="op-form">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                      <input type="hidden" name="action" value="apply">
-                      <input type="number" name="apply_amount" class="small" step="0.01" min="0.01" value="{{ '%.2f'|format(n.due_amount) if n.due_amount else '' }}" placeholder="申请额">
-                      <input type="text" name="invoice_no" class="small" placeholder="发票号（可选）">
-                      <button type="submit" class="btn btn-outline btn-sm">发起申请</button>
-                    </form>
-                  {% elif n.status == '未开票已申请' %}
-                    <span class="text-muted" style="font-size:12px;margin-right:6px;">已申请，待补发票</span>
-                    <form method="post" action="{{ url_for('main.node_update', node_id=n.id) }}" class="op-form">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                      <input type="hidden" name="action" value="invoice">
-                      <input type="number" name="invoice_amount" class="small" step="0.01" min="0.01" value="{{ '%.2f'|format(n.due_amount) if n.due_amount else '' }}">
-                      <input type="text" name="invoice_no" class="small" placeholder="发票号">
-                      <button type="submit" class="btn btn-outline btn-sm">登记发票</button>
-                    </form>
-                  {% elif n.status == '已申请' %}
-                    <form method="post" action="{{ url_for('main.node_update', node_id=n.id) }}" class="op-form">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                      <input type="hidden" name="action" value="pay">
-                      <input type="number" name="paid_amount" class="small" step="0.01" min="0.01" value="{{ '%.2f'|format(n.due_amount - n.paid_amount) if (n.due_amount - n.paid_amount) > 0 else '' }}" placeholder="实付额">
-                      <input type="date" name="pay_date" class="small">
-                      <input type="text" name="pay_method" class="small" placeholder="付款方式">
-                      <input type="text" name="voucher_no" class="small" placeholder="凭证号">
-                      <button type="submit" class="btn btn-success btn-sm">登记付款</button>
-                    </form>
-                  {% else %}
-                    <span class="text-muted" style="font-size:12px;">已完成</span>
-                  {% endif %}
+                {% if current_user.role in ('admin', 'operator') and project.status != '已归档' and not project.deleted_at %}
+                <div class="flex" style="gap:8px;flex-wrap:wrap;">
+                  <form method="post" action="{{ url_for('main.node_update', node_id=n.id) }}" class="row" style="gap:4px;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <input type="hidden" name="action" value="apply">
+                    <input type="hidden" name="confirm_token" value="{{ node_tokens[n.id]['apply'] }}">
+                    <input type="number" name="apply_amount" class="small" step="0.01" min="0.01" style="width:92px;" placeholder="申请额">
+                    <input type="text" name="description" class="small" style="width:90px;" placeholder="说明">
+                    <button type="submit" class="btn btn-outline btn-sm">申请</button>
+                  </form>
+                  <form method="post" action="{{ url_for('main.node_update', node_id=n.id) }}" class="row" style="gap:4px;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <input type="hidden" name="action" value="invoice">
+                    <input type="hidden" name="confirm_token" value="{{ node_tokens[n.id]['invoice'] }}">
+                    <input type="number" name="invoice_amount" class="small" step="0.01" min="0.01" style="width:92px;" placeholder="开票额">
+                    <input type="text" name="invoice_no" class="small" style="width:100px;" placeholder="发票号 *" required>
+                    <input type="date" name="invoice_date" class="small">
+                    <button type="submit" class="btn btn-outline btn-sm">开票</button>
+                  </form>
+                  <form method="post" action="{{ url_for('main.node_update', node_id=n.id) }}" class="row" style="gap:4px;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <input type="hidden" name="action" value="pay">
+                    <input type="hidden" name="confirm_token" value="{{ node_tokens[n.id]['pay'] }}">
+                    <input type="number" name="paid_amount" class="small" step="0.01" min="0.01" style="width:92px;" placeholder="付款额">
+                    <input type="date" name="pay_date" class="small">
+                    <input type="text" name="pay_method" class="small" style="width:80px;" placeholder="方式">
+                    <input type="text" name="voucher_no" class="small" style="width:90px;" placeholder="凭证号">
+                    <button type="submit" class="btn btn-success btn-sm">付款</button>
+                  </form>
+                </div>
                 {% else %}
-                  <span class="text-muted" style="font-size:12px;">—</span>
+                <span class="text-muted" style="font-size:12px;">只读</span>
                 {% endif %}
               </td>
             </tr>

@@ -3,105 +3,117 @@
 {% block page_title %}合同变更 · {{ project.name }}{% endblock %}
 {% block content %}
 
-<div class="card" style="max-width:980px;">
+<div class="card" style="max-width:1080px;">
   <div class="card-title">
-    {% if stage == 'confirm' %}合同变更 · 二次确认{% else %}合同变更{% endif %}
+    {% if stage == 'confirm' %}合同变更 · 二次确认{% else %}合同变更（逐科目）{% endif %}
     <a href="{{ url_for('main.project_detail', project_id=project.id) }}" class="btn btn-ghost btn-sm">返回项目</a>
   </div>
 
   <div class="src-text" style="margin-bottom:12px;">
     项目编号 <b>{{ project.project_no }}</b> · 当前合同总额
     ￥{{ '{:,.2f}'.format(project.total_amount()) }}
-    （原金额合计 ￥{{ '{:,.2f}'.format(project.total_original()) }} + 增补 ￥{{ '{:,.2f}'.format(project.total_additional()) }}；共 {{ project.items|length }} 个费用科目）
+    （原金额合计 ￥{{ '{:,.2f}'.format(project.total_original()) }} + 增补 ￥{{ '{:,.2f}'.format(project.total_additional()) }}；共 {{ items|length }} 个费用科目）
   </div>
 
   {% if stage == 'confirm' %}
   <div class="flash info" style="margin-bottom:12px;">
-    请核对以下变更，确认后立即按新合同金额重算各节点应付（此操作会写审计，不可自动撤回）。
+    请核对以下变更，确认后立即按「科目新总额」重算未付节点应付；<b>已付款节点冻结不动</b>。此操作写审计，不可自动撤回。
   </div>
 
   <div class="table-wrap">
     <table class="table">
-      <thead><tr><th>字段</th><th class="num">变更前</th><th class="num">变更后</th><th class="num">差额</th></tr></thead>
+      <thead><tr><th>费用科目</th><th class="num">变更前总额</th><th class="num">变更后总额</th><th class="num">差额</th></tr></thead>
       <tbody>
-        {% for row in diff_rows %}
+        {% for ch in plan.item_changes %}
         <tr>
-          <td>{{ row.label }}</td>
-          <td class="num">￥{{ row.old }}</td>
-          <td class="num"><b>￥{{ row.new }}</b></td>
-          <td class="num {{ 'text-danger' if row.delta and row.delta[0] == '-' else 'text-success' }}">{{ row.delta }}</td>
+          <td>{{ ch.item.item_name }}</td>
+          <td class="num">￥{{ '{:,.2f}'.format(ch.old_total) }}</td>
+          <td class="num"><b>￥{{ '{:,.2f}'.format(ch.new_total) }}</b></td>
+          <td class="num {{ 'text-danger' if ch.new_total < ch.old_total else 'text-success' }}">
+            {{ '－' if ch.new_total < ch.old_total else '＋' }}￥{{ '{:,.2f}'.format((ch.old_total - ch.new_total)|abs if ch.new_total < ch.old_total else (ch.new_total - ch.old_total)) }}
+          </td>
         </tr>
-        {% else %}
-        <tr><td colspan="4" class="empty">金额未变化（确认后将按新总额重算节点，用于修正节点口径）</td></tr>
         {% endfor %}
+        <tr>
+          <td><b>合计</b></td>
+          <td class="num"><b>￥{{ '{:,.2f}'.format(project.total_amount()) }}</b></td>
+          <td class="num"><b>￥{{ '{:,.2f}'.format(plan.new_total) }}</b></td>
+          <td class="num"></td>
+        </tr>
       </tbody>
     </table>
   </div>
 
   <div class="mt-16">
-    <label class="field-label">节点应付重算（各科目 4 个节点全部按「科目新总额 × 现有比例」；首付款也改为总额基数；科目内尾差归质保金）</label>
+    <label class="field-label">节点应付差异（已付节点冻结，差额按未付节点原应付比例分摊；尾差按 质保金→验收→进度→首付 归集）</label>
     <div class="table-wrap">
       <table class="table">
-        <thead><tr><th>节点</th><th class="num">原应付</th><th class="num">新应付</th><th class="num">差额</th></tr></thead>
+        <thead><tr><th>节点</th><th class="num">原应付</th><th class="num">新应付</th><th class="num">差额</th><th>处理</th></tr></thead>
         <tbody>
-          {% for row in node_rows %}
+          {% for row in plan.node_rows %}
           <tr>
             <td>{{ row.label }}</td>
             <td class="num">￥{{ row.old }}</td>
             <td class="num"><b>￥{{ row.new }}</b></td>
             <td class="num {{ 'text-danger' if row.delta and row.delta[0] == '-' else 'text-success' }}">{{ row.delta }}</td>
+            <td>{% if row.frozen %}<span class="badge badge-blue">冻结</span>{% else %}重算{% endif %}</td>
           </tr>
+          {% else %}
+          <tr><td colspan="5" class="empty">节点金额无差异</td></tr>
           {% endfor %}
         </tbody>
       </table>
     </div>
+    <div class="src-text">已冻结节点 {{ plan.frozen_count }} 个，冻结节点差额不会计入未付节点分摊。</div>
   </div>
-
-  {% if overpaid %}
-  <div class="flash warning" style="background:var(--warning-bg,#fef3c7);color:var(--warning,#92400e);border-color:#fde68a;margin-top:12px;">
-    <b>注意：变更后以下节点已付金额大于新应付（超付待处理）：</b>
-    <ul style="margin:6px 0 0 18px;">
-      {% for row in overpaid %}
-      <li>{{ row.node.node_name }}：已付 ￥{{ '{:,.2f}'.format(row.paid) }}，新应付 ￥{{ '{:,.2f}'.format(row.due) }}，
-        <b class="text-danger">超付 ￥{{ '{:,.2f}'.format(row.over) }}</b>（禁止再付款，需线下处理退款/抵扣）</li>
-      {% endfor %}
-    </ul>
-  </div>
-  {% endif %}
 
   <form method="post" action="{{ url_for('main.project_contract_change', project_id=project.id) }}" class="mt-16">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <input type="hidden" name="original_amount" value="{{ values.original_amount }}">
-    <input type="hidden" name="additional_amount" value="{{ values.additional_amount }}">
     <input type="hidden" name="confirm_token" value="{{ confirm_token }}">
+    {% for item in items %}
+    <input type="hidden" name="item_total_{{ item.id }}" value="{{ values[item.id] }}">
+    {% endfor %}
     <div class="flex" style="gap:12px;">
-      <button type="submit" class="btn btn-primary">确认变更并重算节点</button>
+      <button type="submit" class="btn btn-primary">确认变更并保存</button>
       <a href="{{ url_for('main.project_contract_change', project_id=project.id) }}" class="btn btn-ghost">返回修改</a>
     </div>
   </form>
 
   {% else %}
-  <form method="post" action="{{ url_for('main.project_contract_change_preview', project_id=project.id) }}">
+  <form method="post" action="{{ url_for('main.project_contract_change', project_id=project.id) }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <div class="form-grid">
-      <div class="form-row">
-        <label class="field-label">变更后原金额（元，不能为负）*</label>
-        <input type="number" name="original_amount" value="{{ values.original_amount }}" step="0.01" min="0" style="width:100%;" required>
-      </div>
-      <div class="form-row">
-        <label class="field-label">变更后增补金额（元，可为负数表示减账）</label>
-        <input type="number" name="additional_amount" value="{{ values.additional_amount }}" step="0.01" style="width:100%;">
-        <div class="src-text">变更后合同总额 = 原金额 + 增补金额，必须大于 0。</div>
-      </div>
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr><th>费用科目</th><th class="num">原金额</th><th class="num">增补</th><th class="num">当前总额</th>
+            <th class="num">已付节点应付合计</th><th class="num">已开票合计</th><th class="num" style="width:180px;">变更后总额 *</th></tr>
+        </thead>
+        <tbody>
+          {% for item in items %}
+          {% set paid_due = item.nodes|selectattr('paid_amount', 'gt', 0)|map(attribute='due_amount')|sum %}
+          <tr>
+            <td>{{ item.item_name }}</td>
+            <td class="num">￥{{ '{:,.2f}'.format(item.original_amount) }}</td>
+            <td class="num">￥{{ '{:,.2f}'.format(item.additional_amount) }}</td>
+            <td class="num">￥{{ '{:,.2f}'.format(item.total_amount) }}</td>
+            <td class="num">{{ '{:,.2f}'.format(paid_due) }}</td>
+            <td class="num">{{ '{:,.2f}'.format(item.nodes|map(attribute='invoice_amount')|sum) }}</td>
+            <td class="num"><input type="number" name="item_total_{{ item.id }}" step="0.01" min="0.01"
+                                   value="{{ values[item.id] }}" style="width:150px;" required></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
     </div>
 
     <div class="flash info" style="margin-top:12px;">
-      <b>重算口径（本次变更核心）：</b>
+      <b>变更口径（CR-04）：</b>
       <ul style="margin:6px 0 0 18px;">
-        <li>各科目 4 个节点应付全部按「科目新总额 × 现有比例」重算，首付款也改为总额基数；科目内尾差归质保金，保证应付合计 = 变更后合同总额。</li>
-        <li>已开票金额、已付款金额与付款流水 <b>保留不动</b>，节点状态不变。</li>
-        <li>变更后若「已付 &gt; 新应付」，该节点标记「超付待处理」并禁止再付款，需线下处理。</li>
-        <li>提交后先出差异清单，二次确认才真正写库并记录审计。</li>
+        <li>逐科目填写变更后总额（= 新原金额 + 新增补金额），不必按统一比例。</li>
+        <li>已付款节点（已付 &gt; 0）的应付/已付/状态 <b>全部冻结</b>，不参与重算。</li>
+        <li>科目差额 = 新总额 − 已付节点应付合计，按该科目未付节点原应付比例分摊；尾差按 质保金→验收→进度→首付 归集。</li>
+        <li>新总额 &lt; 已付节点应付合计、或任一节点已开票 &gt; 新应付 → 阻断并逐项列出，不允许保存。</li>
+        <li>变更前后金额差异写入节点备注；提交后先出差异清单，二次确认才写库并记审计。</li>
       </ul>
     </div>
 

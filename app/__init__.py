@@ -16,8 +16,10 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 from .config import DEFAULT_SECRET_KEY, load_config
 from .models import db
+from .nodes import FLOW_STATUS, STATUS_LABELS
 
-__all__ = ['create_app', 'DEFAULT_SECRET_KEY', 'NODE_TEMPLATES', 'FLOW_STATUS']
+__all__ = ['create_app', 'DEFAULT_SECRET_KEY', 'NODE_TEMPLATES', 'FLOW_STATUS',
+           'STATUS_LABELS']
 
 #: 当前进程内由本模块挂上的文件日志 handler（多 app 实例时换目录要换 handler）
 _FILE_LOG_HANDLER = None
@@ -61,40 +63,31 @@ def _setup_file_logging(app):
     app.logger.setLevel(logging.INFO)
     _FILE_LOG_HANDLER = handler
 
-# 付款节点模板：node_type / 名称 / 比例 / 计算口径 / 触发条件
+# 付款节点模板：只保留静态元数据（类型 / 计算口径 / 触发条件）。
+# CR-04：比例与节点名称 100% 来自人工合同确认，系统不设任何默认比例。
 NODE_TEMPLATES = [
     {
         'node_type': 'first',
-        'node_name': '首付款30%',
-        'ratio': 0.30,
-        'calc_base': 'total',      # 统一口径：所有节点按原金额+增补金额（尾差归质保金）
+        'calc_base': 'total',      # 统一口径：所有节点按科目总额
         'trigger': '合同签订即触发',
     },
     {
         'node_type': 'progress',
-        'node_name': '进度款52%',
-        'ratio': 0.52,
-        'calc_base': 'total',      # 按总金额
+        'calc_base': 'total',
         'trigger': '试运行后触发',
     },
     {
         'node_type': 'acceptance',
-        'node_name': '验收款15%',
-        'ratio': 0.15,
         'calc_base': 'total',
         'trigger': '验收后触发',
     },
     {
         'node_type': 'warranty',
-        'node_name': '质保金3%',
-        'ratio': 0.03,
         'calc_base': 'total',
         'trigger': '质保到期后触发（验收日期+3年）',
     },
 ]
 
-# 付款流程状态
-FLOW_STATUS = ['未触发', '未开票已申请', '已申请', '已付款']
 
 
 def _ensure_writable_dir(path, *, label, errors):

@@ -617,8 +617,12 @@ def build_plan(parsed, errors, warnings):
 
     def add_auto_nodes(item):
         base_total = Decimal(item['original_amount']) + Decimal(item['additional_amount'])
+        # 历史 Excel 没有节点行时的兜底比例（CR-04 起比例不再由系统模板硬编码，
+        # 仅用于导入补全，页面新建项目仍需人工填写）。
+        auto_ratios = {'first': Decimal('0.30'), 'progress': Decimal('0.52'),
+                       'acceptance': Decimal('0.15'), 'warranty': Decimal('0.03')}
         raw_dues = {template['node_type']: mul_ratio(base_total,
-                                                     Decimal(str(template['ratio'])))
+                                                     auto_ratios[template['node_type']])
                     for template in NODE_TEMPLATES}
         try:
             dues = allocate_tail(raw_dues, base_total)
@@ -626,7 +630,7 @@ def build_plan(parsed, errors, warnings):
             dues = raw_dues
         for template in NODE_TEMPLATES:
             node_type = template['node_type']
-            ratio = Decimal(str(template['ratio']))
+            ratio = auto_ratios[node_type]
             node = {'project_no': item['project_no'], 'item_name': item['item_name'],
                     'node_type': node_type, 'ratio': ratio,
                     'due_amount': dues[node_type],

@@ -27,8 +27,10 @@ __all__ = [
     'parse_date',
     'validate_project_dates',
     'validate_project_item_rows',
+    'validate_project_ratios',
     'validate_contract_submission',
     'validate_node_action',
+    'validate_contract_change_items',
     'node_base_amount',
 ]
 
@@ -47,7 +49,7 @@ RATIO_SUM_TOLERANCE = Decimal('0.01')
 CONTRACT_TOTAL_STRICT = True
 #: TODO(业务确认)：是否允许某类节点比例为 0（如无质保金合同）。
 #: 当前按「0 < 比例 ≤ 100」执行；业务确认允许 0 后改为 True。
-ALLOW_ZERO_RATIO = False
+ALLOW_ZERO_RATIO = True   # CR-04：比例允许 0%（例如某节点本期不付款）
 #: 尾差归集顺序：质保金优先
 TAIL_ORDER = ('warranty', 'acceptance', 'progress', 'first')
 #: 日期合法范围
@@ -158,8 +160,37 @@ def validate_text(raw, *, field, required=False, max_len=None, allowed=None):
     return text
 
 
+def validate_project_ratios(form):
+    """校验新建项目的 4 个节点比例（百分数，必填、无默认值）。
+
+    Returns: ``{node_type: Decimal(百分数)}``；Raises ``ValidationError``。
+    """
+    errors = []
+    ratios = {}
+    form_keys = {'first': 'ratio_first', 'progress': 'ratio_progress',
+                 'acceptance': 'ratio_acceptance', 'warranty': 'ratio_warranty'}
+    for nt in NODE_TYPES:
+        raw = form.get(form_keys[nt])
+        try:
+            ratios[nt] = parse_ratio_pct(raw, field=NODE_LABELS[nt] + '比例')
+        except ValidationError as exc:
+            errors.extend(exc.errors)
+    if errors:
+        raise ValidationError(errors)
+    total = sum(ratios.values(), Decimal('0'))
+    if abs(total - Decimal('100')) > RATIO_SUM_TOLERANCE:
+        errors.append('4 个节点比例合计应为 100%%（容差 ±%.2f%%），当前为 %s'
+                      % (RATIO_SUM_TOLERANCE, _plain_pct(total)))
+    if errors:
+        raise ValidationError(errors)
+    return ratios
+
+
 def validate_project_item_rows(form):
     """校验「新建项目」的科目行（多科目动态表单）。
+
+    CR-04：新建项目不再有增补金额字段，``additional_amount`` 恒为 0；
+    比例不再由系统默认值给出，由 :func:`validate_project_ratios` 单独校验。
 
     Returns: ``[{'item_name','tax_rate','original_amount','additional_amount'}]``
     Raises: ``ValidationError``（收集所有错误一次返回）。
@@ -167,7 +198,6 @@ def validate_project_item_rows(form):
     names = form.getlist('item_name')
     taxes = form.getlist('tax_rate')
     originals = form.getlist('original_amount')
-    additionals = form.getlist('additional_amount')
     errors = []
     rows = []
     for idx in range(len(names)):
@@ -187,16 +217,10 @@ def validate_project_item_rows(form):
         except ValidationError as e:
             errors.extend(e.errors)
             original = ZERO
-        try:
-            additional = parse_amount(additionals[idx] if idx < len(additionals) else None,
-                                      field=row_no + '增补金额', required=False, allow_zero=True)
-        except ValidationError as e:
-            errors.extend(e.errors)
-            additional = ZERO
         if len(name) > MAX_TEXT['item_name']:
             errors.append('%s名称：长度不能超过 %d 个字符' % (row_no, MAX_TEXT['item_name']))
         rows.append({'item_name': name, 'tax_rate': tax,
-                     'original_amount': original, 'additional_amount': additional})
+                     'original_amount': original, 'additional_amount': ZERO})
     if not rows and not errors:
         errors.append('至少需要添加一个费用科目')
     if errors:
@@ -289,8 +313,13 @@ def build_contract_numbers(original_amount, additional_amount, ratios_pct):
     }
 
 
-def validate_contract_submission(form):
-    """校验合同确认/回改表单，返回规范化 ``ContractSubmission``。"""
+def validate_contract_submission(form, *, additional_amount=None):
+    """校验合同确认/回改表单，返回规范化 ``ContractSubmission``。
+
+    CR-04：页面不再有增补输入。新建项目 ``additional_amount=0``；回改已存在
+    项目时由调用方传入当前增补合计并原样保留（不因表单缺失被清零）。
+    比例必填，未识别到就必须人工填写，系统不回退任何默认值。
+    """
     errors = []
 
     def _try(fn, *args, **kwargs):
@@ -306,8 +335,8 @@ def validate_contract_submission(form):
                       field='project_no', required=False, max_len=64) or ''
     original = _try(parse_amount, form.get('original_amount'),
                     field='原金额', allow_zero=False)
-    additional = _try(parse_amount, form.get('additional_amount'),
-                      field='增补金额', required=False) or ZERO
+    additional = (ZERO if additional_amount is None
+                  else Decimal(additional_amount).quantize(CENT))
     tax_rate = _try(validate_text, form.get('tax_rate'),
                     field='tax_rate', required=False, max_len=32, allowed=TAX_RATES) or ''
     payment_method = _try(validate_text, form.get('payment_method'),
@@ -336,39 +365,92 @@ def validate_contract_submission(form):
 
 
 def validate_node_action(node, action, form):
-    """校验节点申请 / 开票 / 付款的金额与上限，返回解析后的金额字典。"""
-    due = Decimal(node.due_amount or 0)
-    paid = Decimal(node.paid_amount or 0)
-    invoice = Decimal(node.invoice_amount or 0)
+    """校验节点申请 / 开票 / 付款（CR-04：三本独立账，互不为前置）。
 
+    每个动作只校验自己这一维：金额 > 0、节点应付 > 0、该维累计 + 本次 ≤ 应付。
+    **不再读取 ``status``**，也不检查其它维度是否发生。
+    """
+    due = Decimal(node.due_amount or 0)
+    if due <= 0:
+        raise ValidationError('该节点应付为 0，无法登记任何金额')
     if action == 'apply':
         amount = parse_amount(form.get('apply_amount'), field='申请金额', allow_zero=False)
-        remaining = (due - paid).quantize(CENT)
-        if amount > remaining:
-            raise ValidationError('申请金额 %s 超过该节点未付应付 %s'
-                                  % (_money(amount), _money(remaining)))
-        inv = parse_amount(form.get('invoice_amount'), field='发票金额', required=False)
-        if inv > 0 and inv > due:
-            raise ValidationError('发票金额不能超过节点应付金额 %s' % _money(due))
-        return {'apply_amount': amount, 'invoice_amount': inv}
+        applied = Decimal(getattr(node, 'applied_amount', 0) or 0)
+        if applied + amount > due:
+            raise ValidationError('累计申请金额 %s 将超过节点应付 %s'
+                                  % (_money(applied + amount), _money(due)))
+        return {'amount': amount}
     if action == 'invoice':
-        amount = parse_amount(form.get('invoice_amount'), field='发票金额', allow_zero=False)
+        amount = parse_amount(form.get('invoice_amount'), field='开票金额', allow_zero=False)
+        invoice = Decimal(node.invoice_amount or 0)
         if invoice + amount > due:
-            raise ValidationError('累计开票金额 %s 将超过节点应付金额 %s'
+            raise ValidationError('累计开票金额 %s 将超过节点应付 %s'
                                   % (_money(invoice + amount), _money(due)))
-        return {'invoice_amount': amount}
+        return {'amount': amount}
     if action == 'pay':
         amount = parse_amount(form.get('paid_amount'), field='付款金额', allow_zero=False)
-        remaining = (due - paid).quantize(CENT)
-        if amount > remaining:
-            raise ValidationError('付款金额 %s 超过该节点未付应付 %s'
-                                  % (_money(amount), _money(remaining)))
-        return {'paid_amount': amount}
+        paid = Decimal(node.paid_amount or 0)
+        if paid + amount > due:
+            raise ValidationError('累计付款金额 %s 将超过节点应付 %s'
+                                  % (_money(paid + amount), _money(due)))
+        return {'amount': amount}
     raise ValidationError('未知操作：%s' % action)
 
 
 def _quantize(value):
     return value.quantize(CENT, rounding=ROUND_HALF_UP)
+
+
+def validate_contract_change_items(project, form):
+    """校验合同变更「逐科目变更后总额」输入（CR-04 §6.2）。
+
+    Returns: ``{item_id: Decimal(new_total)}``；Raises ``ValidationError``。
+    """
+    errors = []
+    totals = {}
+    items = list(project.items)
+    if not items:
+        raise ValidationError('项目没有费用科目，无法做合同变更')
+    all_same = True
+    for item in items:
+        field = 'item_total_%d' % item.id
+        label = '科目「%s」变更后总额' % item.item_name
+        raw = form.get(field)
+        if raw is None or not str(raw).strip():
+            errors.append('%s：必填' % label)
+            continue
+        try:
+            value = parse_amount(raw, field=label, allow_zero=True)
+        except ValidationError as exc:
+            errors.extend(exc.errors)
+            continue
+        current = (Decimal(item.original_amount or 0)
+                   + Decimal(item.additional_amount or 0)).quantize(CENT)
+        if value != current:
+            all_same = False
+        frozen = [n for n in item.nodes
+                  if Decimal(n.paid_amount or 0) > 0 or n.status == '已付款']
+        frozen_due = sum((Decimal(n.due_amount or 0) for n in frozen), ZERO).quantize(CENT)
+        if value < frozen_due:
+            errors.append('%s %s 小于已有付款节点应付合计 %s，无法在冻结已有付款节点的前提下变更'
+                          % (label, _money(value), _money(frozen_due)))
+        unfrozen = [n for n in item.nodes if n not in frozen]
+        if not unfrozen and value != frozen_due:
+            errors.append('%s 的科目已无未付节点，变更后总额必须等于已付款节点应付合计 %s'
+                          % (label, _money(frozen_due)))
+        for node in item.nodes:
+            if node.status == '超付待处理':
+                errors.append('科目「%s」存在历史超付节点「%s」，请先处理后再做合同变更'
+                              % (item.item_name, node.node_name))
+                break
+        totals[item.id] = value
+    if not errors and all_same:
+        errors.append('所有科目金额均未变化，无需提交合同变更')
+    if sum(totals.values(), ZERO) <= 0:
+        errors.append('变更后合同总额必须大于 0')
+    if errors:
+        raise ValidationError(errors)
+    return totals
 
 
 def _money(value):

@@ -53,7 +53,17 @@
 
     {% if not project %}
     <div class="form-row">
-      <label class="field-label mt-8">费用科目（每个科目将自动生成 首付款30% / 进度款52% / 验收款15% / 质保金3% 四个付款节点）</label>
+      <label class="field-label mt-8">付款节点比例（百分数，四项合计必须 = 100%，系统不提供默认值）*</label>
+      <div class="row">
+        <div><label class="field-label">首付款 %</label><input type="number" name="ratio_first" class="small" step="0.01" min="0" max="100" value="{{ form.get('ratio_first', '') if form else '' }}" required></div>
+        <div><label class="field-label">进度款 %</label><input type="number" name="ratio_progress" class="small" step="0.01" min="0" max="100" value="{{ form.get('ratio_progress', '') if form else '' }}" required></div>
+        <div><label class="field-label">验收款 %</label><input type="number" name="ratio_acceptance" class="small" step="0.01" min="0" max="100" value="{{ form.get('ratio_acceptance', '') if form else '' }}" required></div>
+        <div><label class="field-label">质保金 %</label><input type="number" name="ratio_warranty" class="small" step="0.01" min="0" max="100" value="{{ form.get('ratio_warranty', '') if form else '' }}" required></div>
+      </div>
+      <div class="src-text">比例允许 0%；尾差归质保金，保证节点应付合计 = 科目总额。已付款节点合同变更时冻结。</div>
+    </div>
+    <div class="form-row">
+      <label class="field-label mt-8">费用科目（每个科目按上面的比例生成 4 个付款节点）</label>
       <div id="items-container">
         <div class="item-row form-panel">
           <div class="row">

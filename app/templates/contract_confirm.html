@@ -139,8 +139,8 @@
       </div>
       <div class="form-row">
         <label class="field-label">增补金额（元）</label>
-        <input type="number" name="additional_amount" id="additional_amount" value="{{ values.additional_amount }}" step="0.01" min="0" style="width:100%;" oninput="recompute()">
-        <div class="src-text">4 个节点统一按「原金额+增补金额」计算，尾差归质保金（合计=合同总额）</div>
+        <input type="number" name="additional_amount" id="additional_amount" value="{{ values.additional_amount }}" step="0.01" min="0" style="width:100%;" readonly>
+        <div class="src-text">增补金额在「合同变更（逐科目）」中维护，这里只读；4 个节点统一按「原金额+增补金额」计算，尾差归质保金。</div>
       </div>
     </div>
 
@@ -190,7 +190,7 @@
               <td>
                 <input type="number" name="ratio_{{ nt }}" class="node-ratio" data-node-type="{{ nt }}"
                        value="{{ values.ratios_pct.get(nt, '') }}"
-                       step="0.01" min="0" max="100" style="width:100px;" oninput="recompute()">
+                       step="0.01" min="0" max="100" style="width:100px;" oninput="recompute()" required>
               </td>
               <td class="src-text">按总金额</td>
               <td class="num"><span class="node-amount amount-cell">0.00</span></td>
@@ -201,7 +201,7 @@
                 {% elif nd and nd.source_text %}
                 {{ nd.source_text }}
                 {% elif not is_update %}
-                <span class="warn-tag">模板默认比例，请核对合同</span>
+                <span class="warn-tag">原文未识别到比例，请按合同人工填写</span>
                 {% else %}
                 <span class="src-text">当前项目口径</span>
                 {% endif %}

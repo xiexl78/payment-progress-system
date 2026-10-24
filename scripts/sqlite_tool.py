@@ -28,7 +28,7 @@ from pathlib import Path
 
 # 业务表（用于行数比对；缺表不视为错误，值记为 null）
 TABLES = [
-    'users', 'projects', 'project_items', 'payment_nodes',
+    'users', 'projects', 'project_items', 'payment_nodes', 'payment_invoices',
     'payment_applications', 'payment_records', 'contract_files', 'acceptance_records',
 ]
 

@@ -164,13 +164,19 @@ NODE_PATTERNS = {
     ],
 }
 
-DEFAULT_RATIOS = {'first': 0.30, 'progress': 0.52, 'acceptance': 0.15, 'warranty': 0.03}
+#: CR-04：系统不再提供任何默认比例，未识别比例留空由人工填写。
 NODE_NAMES = {'first': '首付款', 'progress': '进度款', 'acceptance': '验收款', 'warranty': '质保金'}
 CALC_BASES = {'first': 'total', 'progress': 'total', 'acceptance': 'total', 'warranty': 'total'}
 
 
+def _rule_node_name(node_type, ratio):
+    """节点名称：类型 + 实际比例；比例未识别时只写类型名。"""
+    from .nodes import node_name as _node_name
+    return _node_name(node_type, ratio)
+
+
 def extract_ratios(text):
-    """提取各节点付款比例，返回 {node_type: (ratio浮点, 出处片段, 是否来自合同原文)}"""
+    """提取各节点付款比例，返回 {node_type: (ratio浮点|None, 出处片段, 是否来自合同原文)}"""
     result = {}
     for nt, pats in NODE_PATTERNS.items():
         found = False
@@ -185,7 +191,7 @@ def extract_ratios(text):
                 found = True
                 break
         if not found:
-            result[nt] = (DEFAULT_RATIOS[nt], None, False)
+            result[nt] = (None, None, False)
     return result
 
 
@@ -456,7 +462,8 @@ def recognize_with_llm(text, file_name=''):
             ' "payment_method": "原文片段", "first": "原文片段"}\n'
             '}\n'
             '节点类型仅用 first(首付/预付)/progress(进度款)/acceptance(验收款)/warranty(质保金)。\n'
-            '金额保留原始数值（合同总金额），比例按百分比转小数。\n\n合同文本：\n' + text[:8000]
+            '金额保留原始数值（合同总金额），比例按百分比转小数；原文没有明确比例时 ratio 输出 null，'
+            '不要推测或补默认值。\n\n合同文本：\n' + text[:8000]
         )
         payload = json.dumps({
             'model': cfg['model'],
@@ -494,8 +501,8 @@ def recognize_by_rules(text, file_name=''):
     for nt in ('first', 'progress', 'acceptance', 'warranty'):
         ratio, src, from_text = ratios[nt]
         base = total if CALC_BASES[nt] == 'total' else (amount or 0.0)
-        due = round(base * ratio, 2)
-        node_name = NODE_NAMES[nt] + ('%.0f%%' % (ratio * 100))
+        due = round(base * ratio, 2) if ratio is not None else None
+        node_name = _rule_node_name(nt, ratio)
         nodes.append({
             'node_type': nt,
             'node_name': node_name,
@@ -522,7 +529,8 @@ def recognize_by_rules(text, file_name=''):
     un_ratio = [NODE_NAMES[k] for k in ('first', 'progress', 'acceptance', 'warranty')
                 if not ratios[k][2]]
     if un_ratio:
-        warnings.append('未识别到%s比例，已采用模板默认值，请核对' % '/'.join(un_ratio))
+        warnings.append('未识别到%s比例，请在确认页按合同人工填写（系统不提供默认比例）'
+                        % '/'.join(un_ratio))
 
     return {
         'engine': 'rules',
@@ -545,24 +553,25 @@ def recognize_contract(text, file_name=''):
                 nt = nd.get('node_type')
                 if nt not in ('first', 'progress', 'acceptance', 'warranty'):
                     continue
-                ratio = float(nd.get('ratio', 0))
+                raw_ratio = nd.get('ratio')
+                ratio = None if raw_ratio in (None, '') else float(raw_ratio)
                 total = float(llm_result.get('contract_amount') or 0)
                 base = total if CALC_BASES.get(nt) == 'total' else total
                 nodes.append({
                     'node_type': nt,
-                    'node_name': nd.get('node_name') or (NODE_NAMES.get(nt, '') + ('%.0f%%' % (ratio * 100))),
+                    'node_name': nd.get('node_name') or _rule_node_name(nt, ratio),
                     'ratio': ratio,
                     'calc_base': CALC_BASES.get(nt, 'total'),
-                    'amount': round(base * ratio, 2),
+                    'amount': round(base * ratio, 2) if ratio is not None else None,
                     'source_text': (llm_result.get('source_texts') or {}).get(nt, ''),
-                    'from_text': True,
+                    'from_text': ratio is not None,
                 })
             return {
                 'engine': 'llm',
                 'contract_amount': float(llm_result.get('contract_amount') or 0) or None,
                 'tax_rate': llm_result.get('tax_rate'),
                 'payment_method': llm_result.get('payment_method'),
-                'nodes': nodes if nodes else _default_nodes(float(llm_result.get('contract_amount') or 0)),
+                'nodes': nodes,
                 'sources': llm_result.get('source_texts') or {},
                 'warnings': [llm_msg] if llm_msg else [],
             }, None
@@ -575,17 +584,5 @@ def recognize_contract(text, file_name=''):
 
 
 def _default_nodes(total):
-    nodes = []
-    for nt in ('first', 'progress', 'acceptance', 'warranty'):
-        ratio = DEFAULT_RATIOS[nt]
-        base = total if CALC_BASES[nt] == 'total' else total
-        nodes.append({
-            'node_type': nt,
-            'node_name': NODE_NAMES[nt] + ('%.0f%%' % (ratio * 100)),
-            'ratio': ratio,
-            'calc_base': CALC_BASES[nt],
-            'amount': round(base * ratio, 2),
-            'source_text': '',
-            'from_text': False,
-        })
-    return nodes
+    """兼容名称保留：不再生成默认比例节点（CR-04 删除全部默认值）。"""
+    return []

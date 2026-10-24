@@ -37,6 +37,9 @@ _COLUMN_PATCHES = {
     'payment_nodes': {
         'updated_at': 'DATETIME',
         'updated_by': 'INTEGER',
+        # CR-04：申请累计 / 合同变更备注
+        'applied_amount': 'NUMERIC(14,2) NOT NULL DEFAULT 0',
+        'change_note': 'VARCHAR(255)',
     },
     'contract_files': {
         'confirmed_by': 'INTEGER',

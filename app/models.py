@@ -127,13 +127,16 @@ class PaymentNode(db.Model):
     due_amount = db.Column(db.Numeric(14, 2), nullable=False, default=0)   # 应付
     due_date = db.Column(db.Date, nullable=True)           # 应付日期（质保金=验收日期+3年）
     trigger_date = db.Column(db.Date, nullable=True)       # 实际触发日期（试运行/验收日期等）
+    applied_amount = db.Column(db.Numeric(14, 2), nullable=False, default=0)  # 申请累计（CR-04）
     invoice_amount = db.Column(db.Numeric(14, 2), nullable=False, default=0)
     paid_amount = db.Column(db.Numeric(14, 2), nullable=False, default=0)
-    status = db.Column(db.String(16), nullable=False, default='未触发')  # 未触发/未开票已申请/已申请/已付款
+    status = db.Column(db.String(16), nullable=False, default='未触发')  # 兼容缓存，见 app/nodes.py
+    change_note = db.Column(db.String(255), nullable=True)  # 合同变更前后金额差异备注（CR-04）
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     updated_by = db.Column(db.Integer, nullable=True)
 
     applications = db.relationship('PaymentApplication', backref='node', cascade='all, delete-orphan', lazy='selectin')
+    invoices = db.relationship('PaymentInvoice', backref='node', cascade='all, delete-orphan', lazy='selectin')
 
     def recalc(self):
         """根据科目金额与配置重算应付金额（Decimal + ROUND_HALF_UP）"""
@@ -157,9 +160,11 @@ class PaymentNode(db.Model):
         合同回改时这类节点必须冻结，不允许被口径变更改写。
         """
         return (self.status != '未触发'
+                or Decimal(self.applied_amount or 0) > 0
                 or Decimal(self.invoice_amount or 0) > 0
                 or Decimal(self.paid_amount or 0) > 0
-                or len(self.applications) > 0)
+                or len(self.applications) > 0
+                or len(self.invoices) > 0)
 
     @property
     def has_occurred(self):
@@ -177,9 +182,36 @@ class PaymentNode(db.Model):
             'due_amount': float(self.due_amount or 0),
             'due_date': self.due_date.isoformat() if self.due_date else None,
             'trigger_date': self.trigger_date.isoformat() if self.trigger_date else None,
+            'applied_amount': float(self.applied_amount or 0),
             'invoice_amount': float(self.invoice_amount or 0),
             'paid_amount': float(self.paid_amount or 0),
             'status': self.status,
+        }
+
+
+class PaymentInvoice(db.Model):
+    """发票登记明细（CR-04）：与申请、付款完全并列，可无申请直接登记。"""
+    __tablename__ = 'payment_invoices'
+    id = db.Column(db.Integer, primary_key=True)
+    project_id = db.Column(db.Integer, db.ForeignKey('projects.id'), nullable=False)
+    node_id = db.Column(db.Integer, db.ForeignKey('payment_nodes.id'), nullable=False)
+    invoice_no = db.Column(db.String(128), nullable=False)
+    amount = db.Column(db.Numeric(14, 2), nullable=False, default=0)
+    invoice_date = db.Column(db.Date, nullable=True)
+    remark = db.Column(db.String(255), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)   # UTC
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+
+    __table_args__ = (db.Index('ix_payment_invoices_node_id', 'node_id'),
+                      db.Index('ix_payment_invoices_project_id', 'project_id'))
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'node_id': self.node_id, 'project_id': self.project_id,
+            'invoice_no': self.invoice_no, 'amount': float(self.amount or 0),
+            'invoice_date': self.invoice_date.isoformat() if self.invoice_date else None,
+            'remark': self.remark,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M') if self.created_at else None,
         }
 
 
