@@ -64,7 +64,7 @@ python tests/run_qa.py
 - 断言：`app/routes.py:167-169 make_apply_no()` 连续生成 5000 个单号必须唯一（确定性用例）。
 - 实测：5000 次仅约 16~17 个唯一值。单号 = `AP` + 秒级时间 + `microsecond % 1000`，同秒内只有约 1000 个取值；CR-04 允许同节点多次申请后，`payment_applications.apply_no` 唯一键在并发下被撞 → `sqlite3.IntegrityError` → HTTP 500，本次申请丢失（数据回滚一致）。
 - 并发证据：40 轮 × 8 线程并发申请，5 轮各 1 次 500，期望 320 笔仅成功 256 笔。
-- 复现：`python <工作区>\_dbg_apply_race.py 40`（临时库 + 随机端口）。
+- 复现：回归套件第 7 组「申请单号生成器不得产生重复」即确定性复现（`xfail='CR04-01'`）；并发侧可对同一节点多线程 POST `/nodes/<id>/update`（action=apply）复现 500。
 - 待开发修复（建议自增/序列或 UUID/随机后缀），修好后本用例转 PASS 并摘掉 `xfail`。
 
 最后一项 P2-08（图片 OCR）已随 `290273b` 修复：OCR 前先把图片转存系统临时目录，避开 WinRT 访问工作区被拒（0x80070005）；用例改为**默认启用**（测试图片改用系统中文字体 48px 渲染，识别率稳定），无 OCR 环境的机器可显式设 `QA_ENABLE_OCR=0` 跳过。
