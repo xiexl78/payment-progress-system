@@ -22,7 +22,7 @@ python tests/run_qa.py
 
 ## 三、当前基线（2026-10-27）
 
-`python tests/run_qa.py` → **270 项：270 PASS / 0 FAIL / 0 XFAIL / 0 XPASS，退出码 0**（在干净 HEAD 快照 `6756347` 上连跑两遍一致；较 CR-04 口径 +4 项：需求⑤「操作已失效/刷新不恢复」防回退用例）。
+`python tests/run_qa.py` → **294 项：293 PASS / 0 FAIL / 1 XFAIL / 0 XPASS，退出码 0**（CR-05 T3/T4/T5 的干净 HEAD 上连跑两遍一致）。1 项 XFAIL 为 `CR05-TOKEN-BURN`：令牌在业务校验前被消费，校验失败后同页重试合法金额仍报「操作已失效」（设计 §8.2 次生问题，待开发 T2b 调顺序）。270 → 294 新增：需求⑤ 令牌语义 5 项 + 需求③④⑥ 用例 19 项。
 
 状态含义：
 

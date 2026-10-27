@@ -205,7 +205,27 @@ def _inject_node_token(sess, base, path, data):
     return data
 
 
+_APPLY_SEQ = [0]
+
+
+def next_apply_no(prefix='QA'):
+    """CR-05 需求③：申请单号人工必填后，用例默认生成全局唯一单号。"""
+    import uuid
+    _APPLY_SEQ[0] += 1
+    return '%s-%d-%s' % (prefix, _APPLY_SEQ[0], uuid.uuid4().hex[:8])
+
+
+def _inject_apply_no(data):
+    """action=apply 时自动补唯一单号（显式传了就不动，便于测单号语义）。"""
+    if isinstance(data, dict) and (data.get('action') or '').strip() == 'apply' \
+            and not data.get('apply_no'):
+        data = dict(data)
+        data['apply_no'] = next_apply_no()
+    return data
+
+
 def post(sess, base, path, data=None, files=None):
+    data = _inject_apply_no(data)
     data = _inject_node_token(sess, base, path, data)
     return sess.post(base + path, data=data, files=files,
                      allow_redirects=False, timeout=120)

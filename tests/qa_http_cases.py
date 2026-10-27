@@ -1375,8 +1375,8 @@ def _batch6_export_import(s_admin):
               all(k in flat for k in ('项目编号', '项目名称')), flat[:120])
         header = next((' '.join(str(c) for c in row if c is not None)
                        for row in rows if any('项目编号' in str(c) for c in row if c is not None)), '')
-        check('导出', '导出含三本账列（已申请/已开票/已付款，CR-04）',
-              all(k in header for k in ('已申请', '已开票')), header[:160])
+        check('导出', '导出含三本账列（申请/开票/付款，CR-05 需求⑥改名后）',
+              all(k in header for k in ('申请金额', '开票金额', '付款金额')), header[:160])
         check('导出', '导出金额为两位小数（Decimal 口径）',
               any(isinstance(c, (int, float)) and abs(round(float(c), 2) - float(c)) < 1e-9
                   for row in rows for c in row), '未发现两位小数金额')
@@ -1654,7 +1654,9 @@ def _stale_token_cases(s_admin):
 
     def submit(tok):
         return sess.post(BASE + '/nodes/%d/update' % nid,
-                         data={'action': 'apply', 'apply_amount': '10', 'confirm_token': tok},
+                         data={'action': 'apply', 'apply_amount': '10',
+                               'apply_no': C.next_apply_no(),
+                               'confirm_token': tok},
                          allow_redirects=False)
 
     # 独立会话，避免影响其他用例的 Cookie
@@ -1689,6 +1691,217 @@ def _stale_token_cases(s_admin):
         submit(first_tok)
         check('令牌', '已用过的令牌刷新后仍不可重放',
               _node_vals(nid)['applied'] == before2, _node_vals(nid)['applied'])
+    # §8.4.1 T-8.4-1/2：节点数不影响会话 Cookie（24 节点项目 = 8 科目 × 3）
+    _, pid24 = create_project(s_admin, 'QA-TOK-24', 'QA令牌24节点',
+                              [('S%d' % i, '10000', '0') for i in range(8)])
+    if pid24:
+        u24 = BASE + '/projects/%d' % pid24
+        s24, _ = C.login(BASE, 'admin', 'admin123')
+        r1 = s24.get(u24, timeout=60)
+        size1 = len(s24.cookies.get('session') or '')
+        for _ in range(10):
+            s24.get(u24, timeout=60)
+        size10 = len(s24.cookies.get('session') or '')
+        check('令牌', '24 节点项目首次打开 Cookie < 4000 字节（浏览器上限 4093）',
+              size1 < 4000 and r1.status_code == 200, '%d 字节' % size1)
+        check('令牌', '连续打开详情页 10 次 Cookie 不随节点数累积（≤首次+200B）',
+              size10 <= size1 + 200, '%d→%d 字节' % (size1, size10))
+
+
+def _token_semantics_cases(s_admin):
+    """CR-05 §8.4：业务校验失败不烧令牌 / 令牌绑定会话 / 并发双击只成功一次。"""
+    _, pid = create_project(s_admin, 'QA-TOK-SEM', 'QA令牌语义',
+                            [('科目A', '10000', '0'), ('科目B', '10000', '0')])
+    if pid is None:
+        check('令牌', '语义测试项目创建成功', False, '创建失败')
+        return
+    url = BASE + '/projects/%d' % pid
+    n1, n2, n3 = node_ids(pid)[0], node_ids(pid)[1], node_ids(pid)[2]
+
+    def token_of(html, nid, action):
+        pairs = dict(((int(n), a), t) for n, a, t in C.NODE_FORM_RE.findall(html))
+        return pairs.get((nid, action))
+
+    def submit(sess, nid, tok, amount='10'):
+        return sess.post(BASE + '/nodes/%d/update' % nid,
+                         data={'action': 'pay', 'paid_amount': amount,
+                               'confirm_token': tok},
+                         allow_redirects=False)
+
+    sess, _ = C.login(BASE, 'admin', 'admin123')
+    html = sess.get(url, timeout=60).text
+
+    # §8.4.2-1：业务校验失败（超应付）不应烧掉令牌，同页改小金额仍可提交
+    tok = token_of(html, n1, 'pay')
+    submit(sess, n1, tok, '999999')
+    rejected = _node_vals(n1)['paid'] == d2(0)
+    submit(sess, n1, tok, '10')
+    check('令牌', '业务校验失败（超应付）后同一令牌仍可提交合法金额',
+          rejected and _node_vals(n1)['paid'] == d2(10),
+          '首次被拒=%s，重试后 paid=%s（应先校验后消费，校验失败不烧令牌）'
+          % (rejected, _node_vals(n1)['paid']))
+
+    # §8.4.2-2：令牌绑定登录会话，另一会话（同用户另一次登录）拿到也用不了
+    sess2, _ = C.login(BASE, 'admin', 'admin123')
+    tok2 = token_of(sess2.get(url, timeout=60).text, n2, 'pay')
+    submit(sess, n2, tok2)
+    check('令牌', '令牌绑定会话：其它会话签发的令牌被拒（防登出/换设备重放）',
+          _node_vals(n2)['paid'] == d2(0), 'paid=%s' % _node_vals(n2)['paid'])
+
+    # §8.4.2-3：并发双击同一令牌，只成功一次、无重复副作用、无 500
+    tok3 = token_of(html, n3, 'pay')
+    before = _node_vals(n3)['paid']
+    results = []
+
+    def fire():
+        results.append(submit(sess, n3, tok3))
+
+    ths = [threading.Thread(target=fire) for _ in range(2)]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join()
+    after = _node_vals(n3)['paid']
+    codes = [r.status_code for r in results]
+    check('令牌', '并发双击同一令牌只成功一次（无 500、金额只加一次）',
+          after == before + d2(10) and all(c < 500 for c in codes),
+          'paid %s→%s，状态码 %s' % (before, after, codes))
+
+
+def _cr05_cases(s_admin):
+    """CR-05 需求③单号必填 / 需求④一张申请多笔付款 / 需求⑥节点字段改名。"""
+    _, pid = create_project(s_admin, 'QA-CR05', 'QA申请单与多笔付款',
+                            [('CRM', '10000', '0'), ('OA', '10000', '0')])
+    if pid is None:
+        check('CR05', '测试项目创建成功', False, '创建失败')
+        return
+    url = BASE + '/projects/%d' % pid
+    first, second = node_ids(pid, 'first')[0], node_ids(pid, 'first')[1]
+
+    def node_post(sess, nid, data):
+        """直发节点表单：显式校验单号/说明，绕开自动补单号。"""
+        data = dict(data)
+        if 'confirm_token' not in data:
+            action = (data.get('action') or '').strip()
+            data['confirm_token'] = C.node_tokens(sess, BASE, pid).get((nid, action))
+        return sess.post(BASE + '/nodes/%d/update' % nid, data=data,
+                         allow_redirects=True, timeout=120)
+
+    def page(sess):
+        return sess.get(url, timeout=60).text
+
+    # ---------- 需求③：申请单号人工必填 + 说明停用 ----------
+    applied0 = _node_vals(first)['applied']
+    r = node_post(s_admin, first, {'action': 'apply', 'apply_amount': '10'})
+    check('CR05③', '申请缺单号被拒（库不变、提示含「单号」）',
+          _node_vals(first)['applied'] == applied0 and '单号' in r.text,
+          'applied=%s code=%s' % (_node_vals(first)['applied'], r.status_code))
+    for bad, label in (('   ', '单号全空白'), ('AB CD!', '单号含非法字符'),
+                       ('A' * 65, '单号超 64 字符')):
+        before = _node_vals(first)['applied']
+        r = node_post(s_admin, first, {'action': 'apply', 'apply_amount': '10',
+                                       'apply_no': bad})
+        check('CR05③', '%s 被拒（库不变）' % label,
+              _node_vals(first)['applied'] == before and '单号' in r.text,
+              'applied=%s' % _node_vals(first)['applied'])
+    # 正常单号 + 说明字段应被忽略（需求③取消「说明」）
+    dup_no = C.next_apply_no('QA-DUP')
+    r = node_post(s_admin, first, {'action': 'apply', 'apply_amount': '100',
+                                   'apply_no': dup_no, 'description': '旧说明不应入库'})
+    stored_desc = q1(DB, 'SELECT description FROM payment_applications WHERE apply_no=?',
+                     (dup_no,))
+    check('CR05③', '正常单号可申请且说明字段被忽略（不再入库）',
+          _node_vals(first)['applied'] == applied0 + d2(100) and not stored_desc,
+          'applied=%s description=%r' % (_node_vals(first)['applied'], stored_desc))
+    before = _node_vals(first)['applied']
+    r = node_post(s_admin, first, {'action': 'apply', 'apply_amount': '100',
+                                   'apply_no': dup_no})
+    check('CR05③', '重复单号被拒（提示已存在、库不变）',
+          _node_vals(first)['applied'] == before and '已存在' in r.text,
+          'applied=%s' % _node_vals(first)['applied'])
+    trim_no = C.next_apply_no('QA-TRIM')
+    r = node_post(s_admin, first, {'action': 'apply', 'apply_amount': '10',
+                                   'apply_no': '  %s  ' % trim_no})
+    stored = q1(DB, 'SELECT apply_no FROM payment_applications WHERE node_id=? '
+                    'ORDER BY id DESC LIMIT 1', (first,))
+    check('CR05③', '单号首尾空白被去空白后入库',
+          stored == trim_no, 'stored=%r' % (stored,))
+    html = page(s_admin)
+    check('CR05③', '节点登记表单不再有「说明」输入框',
+          'name="description"' not in html)
+
+    # ---------- 需求④：申请单列表 + 增加付款 ----------
+    # 用「申请 100 元」那张申请单（dup_no），剩余可付 100
+    app_id = q1(DB, 'SELECT id FROM payment_applications WHERE apply_no=?', (dup_no,))
+    check('CR05④', '项目详情有「付款申请单」卡与列头（单号/申请/已付/笔数）',
+          all(k in html for k in ('付款申请单', '申请单号', '申请金额', '已付金额',
+                                  '剩余可付', '付款笔数', '增加付款')))
+
+    def add_payment(sess, app_id_, amount, action_node):
+        tok = C.node_tokens(sess, BASE, pid).get((action_node, 'pay'))
+        return sess.post(BASE + '/applications/%d/payments' % app_id_,
+                         data={'paid_amount': str(amount), 'confirm_token': tok},
+                         allow_redirects=False, timeout=60)
+
+    paid0 = _node_vals(first)['paid']
+    r = add_payment(s_admin, app_id, '40', first)
+    rec = q1(DB, 'SELECT application_id FROM payment_records WHERE node_id=? '
+                 'ORDER BY id DESC LIMIT 1', (first,))
+    check('CR05④', '增加付款成功：流水关联申请单、节点已付增加',
+          _node_vals(first)['paid'] == paid0 + d2(40) and rec == app_id,
+          'paid=%s record.application_id=%s' % (_node_vals(first)['paid'], rec))
+    paid1 = _node_vals(first)['paid']
+    add_payment(s_admin, app_id, '60', first)
+    check('CR05④', '多笔付款累计到申请金额允许',
+          _node_vals(first)['paid'] == paid1 + d2(60),
+          'paid=%s' % _node_vals(first)['paid'])
+    # 申请金额已付满：令牌仍在但服务端以「剩余可付」为核心再校验
+    paid2 = _node_vals(first)['paid']
+    r = add_payment(s_admin, app_id, '0.01', first)
+    check('CR05④', '付款超过申请单剩余可付被拒（库不变）',
+          _node_vals(first)['paid'] == paid2,
+          'paid=%s' % _node_vals(first)['paid'])
+    last_pay = q1(DB, 'SELECT COUNT(*) FROM payment_records WHERE application_id=?',
+                  (app_id,))
+    check('CR05④', '申请单付款笔数与流水一致（2 笔）', last_pay == 2, 'records=%s' % last_pay)
+    # 无申请的节点仍可直接付款（CR-04 口径保留）
+    before = _node_vals(second)['paid']
+    node_post(s_admin, second, {'action': 'pay', 'paid_amount': '10'})
+    check('CR05④', '无申请单的节点仍可直接付款',
+          _node_vals(second)['paid'] == before + d2(10),
+          'paid=%s' % _node_vals(second)['paid'])
+    # 权限：viewer 不能增加付款
+    sv, _ = C.login(BASE, 'viewer', '123456')
+    before_v = _node_vals(first)['paid']
+    rv = add_payment(sv, app_id, '10', first)
+    check('CR05④', 'viewer 增加付款被拒（库不变）',
+          rv.status_code in (302, 403) and _node_vals(first)['paid'] == before_v,
+          'code=%s paid=%s' % (rv.status_code, _node_vals(first)['paid']))
+
+    # ---------- 需求⑥：字段改名与派生值 ----------
+    from app.nodes import payment_state, invoice_state
+    states = [
+        (payment_state(d2(1000), d2(0), d2(0)), '未申请'),
+        (payment_state(d2(1000), d2(1000), d2(0)), '已申请'),
+        (payment_state(d2(1000), d2(1000), d2(500)), '部分付款'),
+        (payment_state(d2(1000), d2(1000), d2(1000)), '已付款'),
+    ]
+    check('CR05⑥', '「付款」派生值四态正确（未申请/已申请/部分付款/已付款）',
+          all(got == want for got, want in states), str(states))
+    inv = [(invoice_state(d2(1000), d2(0)), '未开票'),
+           (invoice_state(d2(1000), d2(500)), '已开票')]
+    check('CR05⑥', '「发票」派生值两态正确（未开票/已开票）',
+          all(got == want for got, want in inv), str(inv))
+    html2 = page(s_admin)
+    check('CR05⑥', '详情页列头改为「付款」「发票」且删除「已付款」列',
+          '>付款<' in html2 and '>发票<' in html2 and '<th>已付款</th>' not in html2)
+    # 造一个「已申请未付款」节点，四态都能在页面上看到
+    third = node_ids(pid, 'progress')[0]
+    node_post(s_admin, third, {'action': 'apply', 'apply_amount': '10',
+                               'apply_no': C.next_apply_no('QA-STATE')})
+    html3 = page(s_admin)
+    check('CR05⑥', '页面展示派生值（未申请/已申请/部分付款均有出现）',
+          all(k in html3 for k in ('未申请', '已申请', '部分付款')))
 
 
 def run(server):
@@ -1725,5 +1938,7 @@ def run(server):
     section('########## 11f. 三本账并列（CR-04） ##########', lambda: _three_books_cases(s_admin))
     section('########## 11g. 比例必填（CR-04） ##########', lambda: _ratio_required_cases(s_admin))
     section('########## 11h. 令牌与刷新（需求⑤） ##########', lambda: _stale_token_cases(s_admin))
+    section('########## 11h-b. 令牌语义（CR-05 §8.4） ##########', lambda: _token_semantics_cases(s_admin))
+    section('########## 11i. 单号·多笔付款·字段改名（CR-05 ③④⑥） ##########', lambda: _cr05_cases(s_admin))
     section('########## 12. 导出（批次 6a） ##########', lambda: _batch6_export_import(s_admin))
     section('########## 12. 审计补充（批次 3 补测，末项会删临时库 audit_logs） ##########', lambda: _audit_extras(s_admin))
