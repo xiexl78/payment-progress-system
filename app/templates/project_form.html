@@ -51,6 +51,12 @@
       <textarea name="remark" placeholder="项目说明、合同信息等">{{ project.remark if project else '' }}</textarea>
     </div>
 
+    <div class="form-row">
+      <label class="field-label">质保期（月） <span class="muted">留空 = 不推算质保到期日（不同项目可不同，1–600）</span></label>
+      <input type="number" name="warranty_months" min="1" max="600" step="1" style="width:100%;"
+             value="{{ project.warranty_months if project and project.warranty_months else (form.get('warranty_months', '') if form else '') }}">
+    </div>
+
     {% if not project %}
     <div class="form-row">
       <label class="field-label mt-8">付款节点比例（百分数，四项合计必须 = 100%，系统不提供默认值）*</label>

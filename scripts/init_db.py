@@ -270,6 +270,7 @@ def build_seed_project():
         status='进行中',
         trial_date=None,          # 由迁移数据回填 2025-11-04
         acceptance_date=None,
+        warranty_months=36,       # CR-05：历史项目回填 36 个月（原有质保口径不变）
         remark='由《付款进度表（新增动设备监测）.xlsx》迁移初始化',
     )
     db.session.add(project)

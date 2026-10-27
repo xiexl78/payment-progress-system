@@ -192,6 +192,7 @@ def _project_info_rows(project):
         ('增补金额合计', money_value(project.total_additional()), True),
         ('试运行日期', _date_text(project.trial_date) or '—', False),
         ('验收日期', _date_text(project.acceptance_date) or '—', False),
+        ('质保期（月）', str(project.warranty_months) if project.warranty_months else '未填写', False),
         ('质保到期', _date_text(project.warranty_due_date) or '—', False),
         ('备注', project.remark or '', False),
         ('创建时间', _local_text(project.created_at), False),

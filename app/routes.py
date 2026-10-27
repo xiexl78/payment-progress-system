@@ -33,7 +33,8 @@ from .nodes import (FLOW_STATUS as NODE_FLOW_STATUS, NODE_TYPE_LABELS,
                     node_progress_label, three_dim)
 from .validation import (DEFAULT_ACCOUNT_PASSWORDS, PROJECT_STATUSES, NODE_TYPES,
                          NODE_LABELS, TAX_RATES, ValidationError, parse_amount,
-                         parse_date, validate_application_payment,
+                         parse_date, parse_warranty_months,
+                         validate_application_payment,
                          validate_apply_no,
                          validate_contract_change_items,
                          validate_contract_submission, validate_node_action,
@@ -43,8 +44,6 @@ from .validation import (DEFAULT_ACCOUNT_PASSWORDS, PROJECT_STATUSES, NODE_TYPES
 
 bp = Blueprint('main', __name__)
 
-#: 质保期天数：与原始 Excel 公式 `N3+365*3` 保持一致（P1 口径待业务确认）
-WARRANTY_DAYS = 365 * 3
 #: 识别只处理前 5 万字符（合同正文远小于此；避免超大文本/异常文本触发正则退化）
 MAX_RECOGNIZE_CHARS = 50000
 
@@ -273,9 +272,9 @@ def _guard_writable_project(project):
 def sync_project_dates(project, collect=False):
     """根据试运行/验收日期联动节点触发日期与质保到期日（幂等、不 commit）。
 
-    - 项目级 ``warranty_due_date`` = 验收日期 + WARRANTY_DAYS；
+    - 项目级 ``warranty_due_date`` = 验收日期 + 质保期（项目 warranty_months，可配置）；
     - 进度款 ``trigger_date`` = 试运行日期；验收款 ``trigger_date`` = 验收日期；
-      质保金 ``due_date`` = 验收日期 + WARRANTY_DAYS；
+      质保金 ``due_date`` = 验收日期 + 质保期（未填质保期则不推算，不套默认 36）；
     - 已发生资金业务（申请/开票/付款）的节点**冻结日期**，只统计差异，不改写；
     - 日期被清空时，未发生业务的节点派生日期同步清空（修复单向联动）。
 
@@ -283,7 +282,9 @@ def sync_project_dates(project, collect=False):
     """
     trial = project.trial_date
     acceptance = project.acceptance_date
-    warranty_due = (acceptance + timedelta(days=WARRANTY_DAYS)) if acceptance else None
+    months = project.warranty_months
+    warranty_due = (timeutil.add_months(acceptance, months)
+                    if acceptance and months else None)
     project_changed = project.warranty_due_date != warranty_due
     if project_changed:
         project.warranty_due_date = warranty_due
@@ -324,8 +325,8 @@ def _date_str(value):
 # ---------- 审计快照辅助 ----------
 
 _PROJECT_AUDIT_FIELDS = ('id', 'project_no', 'name', 'status', 'trial_date',
-                         'acceptance_date', 'warranty_due_date', 'remark',
-                         'created_by', 'updated_by')
+                         'acceptance_date', 'warranty_due_date', 'warranty_months',
+                         'remark', 'created_by', 'updated_by')
 _ITEM_AUDIT_FIELDS = ('id', 'project_id', 'item_name', 'tax_rate',
                       'original_amount', 'additional_amount', 'updated_by')
 _NODE_AUDIT_FIELDS = ('id', 'project_id', 'item_id', 'node_type', 'node_name',
@@ -705,6 +706,7 @@ def project_new():
         try:
             item_rows = validate_project_item_rows(request.form)
             ratios = validate_project_ratios(request.form)
+            warranty_months = parse_warranty_months(request.form.get('warranty_months'))
         except ValidationError as exc:
             for msg in exc.errors:
                 flash(msg, 'danger')
@@ -712,6 +714,7 @@ def project_new():
                                    form=request.form)
 
         project = Project(project_no=project_no, name=name, remark=remark,
+                          warranty_months=warranty_months,
                           status='进行中', created_by=current_user().id,
                           updated_by=current_user().id)
         try:
@@ -842,6 +845,7 @@ def project_edit(project_id):
             trial = parse_date(request.form.get('trial_date'), field='试运行日期')
             acceptance = parse_date(request.form.get('acceptance_date'), field='验收日期')
             validate_project_dates(trial, acceptance)
+            warranty_months = parse_warranty_months(request.form.get('warranty_months'))
         except ValidationError as exc:
             for msg in exc.errors:
                 flash(msg, 'danger')
@@ -852,6 +856,7 @@ def project_edit(project_id):
         project.status = status
         project.trial_date = trial
         project.acceptance_date = acceptance
+        project.warranty_months = warranty_months
         project.updated_by = current_user().id
         sync_project_dates(project)
         audit_record('project.edit', 'project', project.id, project.id,
@@ -1202,7 +1207,12 @@ def acceptance_add(project_id):
                         'acceptor': rec.acceptor, 'conclusion': rec.conclusion},
                  critical=False)
     db.session.commit()
-    flash(f'验收记录已登记：{acc_date}，质保到期日自动推算为 {project.warranty_due_date}', 'success')
+    if project.warranty_due_date:
+        flash(f'验收记录已登记：{acc_date}，质保到期日按质保期 {project.warranty_months} 个月'
+              f'推算为 {project.warranty_due_date}', 'success')
+    else:
+        flash(f'验收记录已登记：{acc_date}；项目未填写质保期（月），质保到期日暂不推算，'
+              '请在项目编辑中补填', 'warning')
     return redirect(url_for('main.project_detail', project_id=project.id))
 
 
@@ -1468,6 +1478,8 @@ def _project_contract_values(project):
         'additional_amount': fmt_money(Decimal(item.additional_amount or 0)) if item else '0.00',
         'tax_rate': (item.tax_rate or '') if item else '',
         'payment_method': _payment_method_from_project(project),
+        'warranty_months': ('' if project.warranty_months is None
+                            else str(project.warranty_months)),
         'ratios_pct': ratios,
         'amounts': {nt: (fmt_money(Decimal(node_map[nt].due_amount or 0)) if nt in node_map else '0.00')
                     for nt in NODE_TYPES},
@@ -1500,6 +1512,8 @@ def _recognized_contract_values(contract, result):
         'additional_amount': '0.00',
         'tax_rate': result.get('tax_rate') or '',
         'payment_method': result.get('payment_method') or '',
+        'warranty_months': ('' if result.get('warranty_months') in (None, '')
+                            else str(result.get('warranty_months'))),
         'ratios_pct': ratios,
         'amounts': {},
     }
@@ -1514,6 +1528,7 @@ def _raw_contract_form_values(form):
         'additional_amount': form.get('additional_amount') or '0.00',
         'tax_rate': form.get('tax_rate') or '',
         'payment_method': form.get('payment_method') or '',
+        'warranty_months': form.get('warranty_months') or '',
         'ratios_pct': {nt: (form.get('ratio_' + nt) or '') for nt in NODE_TYPES},
         'amounts': {},
     }
@@ -1557,6 +1572,11 @@ def _diff_contract_values(current, submission):
         diffs.append({'field': 'payment_method', 'label': '付款方式',
                       'old': current.get('payment_method') or '—',
                       'new': submission.payment_method or '—', 'delta': ''})
+    cur_months = (current.get('warranty_months') or '').strip()
+    new_months = '' if submission.warranty_months is None else str(submission.warranty_months)
+    if cur_months != new_months:
+        diffs.append({'field': 'warranty_months', 'label': '质保期（月）',
+                      'old': cur_months or '—', 'new': new_months or '—', 'delta': ''})
     cur_ratios = current.get('ratios_pct') or {}
     for nt in NODE_TYPES:
         cur_pct = _dec_str(cur_ratios.get(nt))
@@ -1612,7 +1632,10 @@ def _apply_contract_values(project, submission, contract, *, update_amounts=True
     project.name = submission.contract_name
     project.remark = _contract_remark(submission, contract.file_name)
     project.updated_by = operator_id
+    # CR-05 需求②：质保期是日期口径，先更新再 sync（合同变更不修改它）
+    project.warranty_months = submission.warranty_months
     if not update_amounts:
+        sync_project_dates(project)
         return
     items = list(project.items)
     if items:
@@ -1641,6 +1664,7 @@ def _create_contract_project(submission, contract):
     project = Project(
         project_no=submission.project_no, name=submission.contract_name,
         status='进行中', remark=_contract_remark(submission, contract.file_name),
+        warranty_months=submission.warranty_months,
         created_by=operator_id, updated_by=operator_id,
     )
     db.session.add(project)
@@ -1793,6 +1817,7 @@ def contract_confirm_submit(contract_id):
                                            for k, v in submission.ratios_pct.items()},
                             'node_amounts': {k: format(v, 'f')
                                              for k, v in submission.node_amounts.items()},
+                            'warranty_months': submission.warranty_months,
                             'diff': diff})
         db.session.commit()
         for msg in submission.warnings:
@@ -2123,6 +2148,8 @@ def _apply_contract_change(project, plan):
                'nodes': after_nodes,
                'frozen_node_ids': [row['node'].id for row in plan['node_plan']
                                    if row['frozen']],
+               'warranty_months': project.warranty_months,
+               'due_dates_untouched': True,
                'total': format(plan['new_total'], 'f')},
         critical=True)
     db.session.commit()

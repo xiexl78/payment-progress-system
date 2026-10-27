@@ -55,6 +55,7 @@
     <div class="info-item"><div class="l">增补金额</div><div class="v">￥{{ '{:,.2f}'.format(project.total_additional()) }}</div></div>
     <div class="info-item"><div class="l">试运行日期</div><div class="v">{{ project.trial_date.strftime('%Y-%m-%d') if project.trial_date else '—' }}</div></div>
     <div class="info-item"><div class="l">验收日期</div><div class="v">{{ project.acceptance_date.strftime('%Y-%m-%d') if project.acceptance_date else '—' }}</div></div>
+    <div class="info-item"><div class="l">质保期</div><div class="v">{{ project.warranty_months ~ ' 个月' if project.warranty_months else '未填写' }}</div></div>
     <div class="info-item"><div class="l">质保到期</div><div class="v text-warning">{{ project.warranty_due_date.strftime('%Y-%m-%d') if project.warranty_due_date else '—' }}</div></div>
     <div class="info-item"><div class="l">超付合计</div><div class="v {{ 'text-danger' if overpaid_total and overpaid_total > 0 else '' }}">￥{{ '{:,.2f}'.format(overpaid_total or 0) }}</div></div>
   </div>

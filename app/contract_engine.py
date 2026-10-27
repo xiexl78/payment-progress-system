@@ -169,6 +169,10 @@ NODE_NAMES = {'first': '首付款', 'progress': '进度款', 'acceptance': '验�
 CALC_BASES = {'first': 'total', 'progress': 'total', 'acceptance': 'total', 'warranty': 'total'}
 
 
+#: 中文数字 → 月份（合同里「两年」「十二个月」这类写法）
+_CN_MONTHS = {'一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5, '六': 6,
+              '七': 7, '八': 8, '九': 9, '十': 10, '十一': 11, '十二': 12}
+
 def _rule_node_name(node_type, ratio):
     """节点名称：类型 + 实际比例；比例未识别时只写类型名。"""
     from .nodes import node_name as _node_name
@@ -193,6 +197,25 @@ def extract_ratios(text):
         if not found:
             result[nt] = (None, None, False)
     return result
+
+
+def extract_warranty_months(text):
+    """提取质保期（月），返回 (月数|None, 出处片段)。
+
+    CR-05 需求②：支持「质保期3年」「质保 36 个月」「保修期两年」「质量保证期为24个月」；
+    年 → ×12；识别不到返回 (None, None)，由确认页提示人工填写（不套默认 36）。
+    """
+    pats = (r'(?:质量保证期|质保期|保质期|保修期|质保|保修)[^。；;\n]{0,10}?'
+            r'(\d+|[一二两三四五六七八九十]{1,2})\s*(年|个月|月)')
+    for m in re.finditer(pats, text):
+        raw, unit = m.group(1), m.group(2)
+        num = int(raw) if raw.isdigit() else _CN_MONTHS.get(raw)
+        if not num:
+            continue
+        months = num * 12 if unit == '年' else num
+        if 1 <= months <= 600:
+            return months, m.group(0).strip()[:160]
+    return None, None
 
 
 def extract_payment_method(text):
@@ -494,6 +517,7 @@ def recognize_by_rules(text, file_name=''):
     amount, amount_src = extract_amount(text)
     tax_rate, tax_src = extract_tax_rate(text)
     pay_method, pay_src = extract_payment_method(text)
+    warranty_months, warranty_src = extract_warranty_months(text)
     ratios = extract_ratios(text)
 
     nodes = []
@@ -515,6 +539,8 @@ def recognize_by_rules(text, file_name=''):
 
     sources = {'contract_amount': amount_src or '', 'tax_rate': tax_src or '',
                'payment_method': pay_src or ''}
+    if warranty_src:
+        sources['warranty_months'] = warranty_src
     for nd in nodes:
         if nd['source_text']:
             sources.setdefault(nd['node_type'], nd['source_text'])
@@ -537,6 +563,7 @@ def recognize_by_rules(text, file_name=''):
         'contract_amount': amount,
         'tax_rate': tax_rate,
         'payment_method': pay_method,
+        'warranty_months': warranty_months,
         'nodes': nodes,
         'sources': sources,
         'warnings': warnings,
@@ -571,6 +598,7 @@ def recognize_contract(text, file_name=''):
                 'contract_amount': float(llm_result.get('contract_amount') or 0) or None,
                 'tax_rate': llm_result.get('tax_rate'),
                 'payment_method': llm_result.get('payment_method'),
+                'warranty_months': llm_result.get('warranty_months'),
                 'nodes': nodes,
                 'sources': llm_result.get('source_texts') or {},
                 'warnings': [llm_msg] if llm_msg else [],

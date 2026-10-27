@@ -27,6 +27,7 @@ __all__ = [
     'parse_amount',
     'parse_ratio_pct',
     'parse_date',
+    'parse_warranty_months',
     'validate_project_dates',
     'validate_project_item_rows',
     'validate_project_ratios',
@@ -246,6 +247,7 @@ class ContractSubmission:
     contract_total: Decimal
     tail: Decimal
     tail_node: str
+    warranty_months: int = None
     warnings: list = field(default_factory=list)
 
 
@@ -316,6 +318,21 @@ def build_contract_numbers(original_amount, additional_amount, ratios_pct):
     }
 
 
+def parse_warranty_months(raw, *, required=False):
+    """质保期（月）：允许空（空 = 不推算日期，不套默认 36）；1–600 的整数。"""
+    text = (raw or '').strip()
+    if not text:
+        if required:
+            raise ValidationError('请填写质保期（月）')
+        return None
+    if not re.fullmatch(r'\d+', text):
+        raise ValidationError('质保期必须为整数月份（1–600）')
+    months = int(text)
+    if months < 1 or months > 600:
+        raise ValidationError('质保期需在 1–600 个月之间')
+    return months
+
+
 def validate_contract_submission(form, *, additional_amount=None):
     """校验合同确认/回改表单，返回规范化 ``ContractSubmission``。
 
@@ -349,6 +366,7 @@ def validate_contract_submission(form, *, additional_amount=None):
     for nt in NODE_TYPES:
         ratios[nt] = _try(parse_ratio_pct, form.get('ratio_' + nt),
                           field=NODE_LABELS[nt] + '比例')
+    warranty_months = _try(parse_warranty_months, form.get('warranty_months'))
 
     if errors:
         raise ValidationError(errors)
@@ -363,6 +381,7 @@ def validate_contract_submission(form, *, additional_amount=None):
         expected_total=numbers['expected_total'],
         contract_total=numbers['contract_total'],
         tail=numbers['tail'], tail_node=numbers['tail_node'],
+        warranty_months=warranty_months,
         warnings=numbers['warnings'],
     )
 

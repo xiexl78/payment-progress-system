@@ -164,6 +164,14 @@
         <div class="src-text">识别值：{{ result.sources.payment_method }}</div>
         {% endif %}
       </div>
+      <div class="form-row">
+        <label class="field-label">质保期（月） <span class="muted">留空 = 不推算质保到期日；识别不到请手工填写</span></label>
+        <input type="number" name="warranty_months" min="1" max="600" step="1"
+               style="width:100%;" value="{{ values.warranty_months }}" placeholder="例如 36">
+        {% if not values.warranty_months %}
+        <div class="src-text">未识别到质保期，请手工填写（留空则不推算质保到期日）</div>
+        {% endif %}
+      </div>
     </div>
 
     <!-- 中部：付款节点金额自动换算表 -->
