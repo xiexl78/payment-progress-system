@@ -158,7 +158,7 @@
           </span>
         </div>
         <span class="hint">{{ g.meta.trigger }}</span>
-        <span class="sum">合计应付 <b>￥{{ '{:,.2f}'.format(g.sum_due) }}</b> · 已申请 <b>￥{{ '{:,.2f}'.format(g.sum_applied) }}</b> · 已开票 <b>￥{{ '{:,.2f}'.format(g.sum_invoice) }}</b> · 已支付 <b>￥{{ '{:,.2f}'.format(g.sum_paid) }}</b></span>
+        <span class="sum">合计应付 <b>￥{{ '{:,.2f}'.format(g.sum_due) }}</b> · 申请 <b>￥{{ '{:,.2f}'.format(g.sum_applied) }}</b> · 开票 <b>￥{{ '{:,.2f}'.format(g.sum_invoice) }}</b> · 付款 <b>￥{{ '{:,.2f}'.format(g.sum_paid) }}</b></span>
       </div>
       <div class="table-wrap">
         <table class="table">
@@ -166,9 +166,8 @@
             <tr>
               <th>科目</th>
               <th class="num">应付金额</th>
-              <th class="num">已申请</th>
-              <th class="num">已开票</th>
-              <th class="num">已付款</th>
+              <th class="num">付款</th>
+              <th class="num">发票</th>
               <th>进度</th>
               <th style="min-width:460px;">登记（申请 / 开票 / 付款）</th>
             </tr>
@@ -181,9 +180,15 @@
               <td class="num">￥{{ '{:,.2f}'.format(n.due_amount) }}
                 {% if n.change_note %}<div class="text-muted" style="font-size:12px;">{{ n.change_note }}</div>{% endif %}
               </td>
-              <td class="num">{{ d.apply_label }}</td>
-              <td class="num">{{ d.invoice_label }}</td>
-              <td class="num">{{ d.pay_label }}</td>
+              <td class="num">
+                <span class="badge {{ 'badge-green' if d.payment_state == '已付款' else 'badge-orange' if d.payment_state == '部分付款' else 'badge-blue' if d.payment_state == '已申请' else 'badge-gray' }}">{{ d.payment_state }}</span>
+                <div class="text-muted" style="font-size:12px;">已付 ￥{{ '{:,.2f}'.format(d.paid) }} / 应付 ￥{{ '{:,.2f}'.format(d.due) }}</div>
+                {% if d.applied > 0 %}<div class="text-muted" style="font-size:12px;">申请 ￥{{ '{:,.2f}'.format(d.applied) }}</div>{% endif %}
+              </td>
+              <td class="num">
+                <span class="badge {{ 'badge-green' if d.invoice_state == '已开票' else 'badge-gray' }}">{{ d.invoice_state }}</span>
+                {% if d.invoice > 0 %}<div class="text-muted" style="font-size:12px;">￥{{ '{:,.2f}'.format(d.invoice) }} / ￥{{ '{:,.2f}'.format(d.due) }}</div>{% endif %}
+              </td>
               <td><span class="badge {{ 'badge-green' if d.status == '已付款' else 'badge-blue' if d.status != '未触发' else 'badge-gray' }}">{{ status_labels.get(d.status, d.status) }}</span></td>
               <td>
                 {% if current_user.role in ('admin', 'operator') and project.status != '已归档' and not project.deleted_at %}

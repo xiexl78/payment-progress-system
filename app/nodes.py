@@ -17,7 +17,7 @@ from .money import CENT, ZERO
 
 __all__ = ['FLOW_STATUS', 'STATUS_LABELS', 'NODE_TYPE_LABELS',
            'derive_status', 'node_name', 'three_dim', 'status_label',
-           'node_progress_label']
+           'node_progress_label', 'payment_state', 'invoice_state']
 
 #: 兼容缓存列的全部取值（顺序即页面/筛选顺序）
 FLOW_STATUS = ['未触发', '未开票已申请', '已开票未申请', '已申请',
@@ -98,6 +98,25 @@ def _fmt(value):
     return fmt_money(value)
 
 
+def payment_state(due, applied, paid):
+    """付款列：未申请 / 已申请 / 部分付款 / 已付款（展示用，永不参与校验）"""
+    due = Decimal(due or 0)
+    applied = Decimal(applied or 0)
+    paid = Decimal(paid or 0)
+    if due > 0 and paid >= due:
+        return '已付款'
+    if paid > 0:
+        return '部分付款'
+    if applied > 0:
+        return '已申请'
+    return '未申请'
+
+
+def invoice_state(due, invoice):
+    """发票列：未开票 / 已开票"""
+    return '已开票' if Decimal(invoice or 0) > 0 else '未开票'
+
+
 def three_dim(node):
     """返回节点的三维进度字典（Decimal 金额 + 展示标签）。"""
     due = Decimal(node.due_amount or 0)
@@ -112,5 +131,7 @@ def three_dim(node):
         'apply_label': node_progress_label('apply', due, applied),
         'invoice_label': node_progress_label('invoice', due, invoice),
         'pay_label': node_progress_label('pay', due, paid),
+        'payment_state': payment_state(due, applied, paid),
+        'invoice_state': invoice_state(due, invoice),
         'status': derive_status(due, applied, invoice, paid),
     }

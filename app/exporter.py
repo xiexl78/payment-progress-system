@@ -23,6 +23,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from .money import CENT
+from .nodes import invoice_state, payment_state
 from .timeutil import to_local, utcnow
 from .validation import NODE_LABELS
 
@@ -37,13 +38,13 @@ __all__ = [
 ITEM_HEADERS = ('科目名称', '税率', '原金额', '增补金额', '科目总额')
 NODE_HEADERS = ('科目', '节点名称', '节点类型', '比例', '计算基数',
                 '应付金额', '已申请金额', '已开票金额', '已支付金额', '未付金额',
-                '状态', '应付日期', '触发日期')
+                '状态', '付款状态', '发票状态', '应付日期', '触发日期')
 APPLICATION_HEADERS = ('申请单号', '科目', '节点', '申请金额', '已开票金额',
                        '发票号', '状态', '申请人', '申请时间')
 RECORD_HEADERS = ('付款日期', '科目', '节点', '付款金额', '付款方式',
                   '凭证号', '经办人', '关联申请单号')
 ACCEPTANCE_HEADERS = ('验收日期', '验收人', '结论', '备注', '登记时间')
-REPORT_HEADERS = ('项目名称', '项目编号', '状态', '应付金额', '已申请', '已开票', '已付金额',
+REPORT_HEADERS = ('项目名称', '项目编号', '状态', '应付金额', '申请金额', '开票金额', '付款金额',
                   '未付金额', '超付金额', '付款进度(%)')
 AUDIT_HEADERS = ('时间', '操作人', '角色', '动作', '对象类型', '对象ID',
                  '项目ID', '结果', 'IP', '浏览器', '变更前', '变更后')
@@ -231,6 +232,9 @@ def _node_rows(project):
             money_value(node.paid_amount),
             money_value(node.remaining_amount),
             node.status,
+            payment_state(node.due_amount, getattr(node, 'applied_amount', 0) or 0,
+                          node.paid_amount),
+            invoice_state(node.due_amount, node.invoice_amount),
             _date_text(node.due_date),
             _date_text(node.trigger_date),
         ))
@@ -309,7 +313,7 @@ def build_project_workbook(project):
                   money_value(sum(Decimal(n.invoice_amount or 0) for n in project.nodes)),
                   money_value(sum(Decimal(n.paid_amount or 0) for n in project.nodes)),
                   money_value(sum(Decimal(n.remaining_amount) for n in project.nodes)),
-                  '', '', '')
+                  '', '', '', '', '')
     _add_sheet(workbook, '付款节点', NODE_HEADERS, nodes,
                money_cols=(6, 7, 8, 9, 10), total_row=node_total)
 
