@@ -63,6 +63,31 @@ def init_security(app):
         return {'csrf_token': generate_csrf_token}
 
     @app.before_request
+    def _drop_legacy_node_tokens():  # noqa: ANN001
+        # CR-05 需求⑤：CR-04 曾把节点操作令牌写进 Cookie 会话（旧会话可能已
+        # 膨胀到浏览器上限），首次请求就丢弃，Cookie 立即回落到正常体积。
+        if app.config.get('NODE_TOKENS_SESSION_KEY_CLEANUP', True):
+            session.pop('node_tokens', None)
+        return None
+
+    @app.after_request
+    def _guard_session_cookie_size(response):  # noqa: ANN001
+        # CR-05 需求⑤兜底：浏览器对单条 Cookie 的限制约 4093B，超限会被静默
+        # 丢弃且不报错。超过 3500B 记 warning，便于再出现问题时快速定位。
+        try:
+            serializer = app.session_interface.get_signing_serializer(app)
+            if serializer is None:
+                return response
+            payload = serializer.dumps(dict(session))
+            if len(payload) > 3500:
+                app.logger.warning(
+                    '会话 Cookie 过大（%d 字节，浏览器上限约 4093）：%s %s',
+                    len(payload), request.method, request.path)
+        except Exception:  # 兜底：记录体积不得影响正常响应
+            app.logger.debug('会话 Cookie 体积检查失败', exc_info=True)
+        return response
+
+    @app.before_request
     def _protect_csrf():  # noqa: ANN001
         if not app.config.get('CSRF_ENABLED', True):
             return None

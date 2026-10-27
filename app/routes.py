@@ -12,6 +12,7 @@ from functools import wraps
 
 from flask import (Blueprint, render_template, request, redirect, url_for, session,
                    flash, jsonify, abort, current_app, send_file)
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy import or_, update
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
@@ -24,7 +25,7 @@ from .exporter import (audit_csv_bytes, build_project_workbook,
                        workbook_bytes)
 from .models import (db, User, Project, ProjectItem, PaymentNode, PaymentApplication,
                      PaymentInvoice, PaymentRecord, AcceptanceRecord, ContractFile,
-                     AuditLog)
+                     ContractScreenshot, NodeActionToken, AuditLog)
 from .money import (CENT, MAX_MONEY, ZERO, allocate_tail, fmt_money as money_fmt,
                     mul_ratio, parse_money, sum_money)
 from .nodes import (FLOW_STATUS as NODE_FLOW_STATUS, NODE_TYPE_LABELS,
@@ -361,35 +362,102 @@ def _operator_id():
     return user.id if user else None
 
 
-# ---------- 节点操作一次性令牌（CR-04 Q2：防双击/重放） ----------
+# ---------- 节点操作令牌（CR-05 需求⑤：无状态 HMAC + 防重放） ----------
+#
+# CR-04 的旧实现把每个节点的 3 个一次性 token 塞进 Cookie 会话：12 节点项目
+# 每渲染一次详情页就追加约 1.1KB，第 4 次起超过浏览器 4093B 上限被整包丢弃，
+# 页面 HTML 里的新 token 与浏览器实际保存的旧会话对不上 —— 于是永远提示
+# 「操作已失效」，刷新只会继续追加，永远恢复不了（需求⑤根因）。
+#
+# 现方案：token = itsdangerous 签名串（节点/操作/会话 sid 摘要/jti/过期时间），
+# 不写入 session（Cookie 体积恒定）；服务端用 node_action_tokens 表以 jti 主键
+# 登记消费记录做防重放，因此仍然「一次点击只能成功一次」。
 NODE_ACTIONS = ('apply', 'invoice', 'pay')
+#: 令牌有效期（秒）：与页面提示的「2 小时」一致
+NODE_TOKEN_TTL = 2 * 60 * 60
+NODE_TOKEN_SALT = 'payment-progress.node-action'
+
+NODE_TOKEN_OK = 'ok'
+NODE_TOKEN_REPLAY = 'replay'
+NODE_TOKEN_EXPIRED = 'expired'
+NODE_TOKEN_INVALID = 'invalid'
+
+
+def _node_token_serializer():
+    return URLSafeTimedSerializer(current_app.config['SECRET_KEY'],
+                                  salt=NODE_TOKEN_SALT)
+
+
+def _session_digest():
+    """当前登录会话 sid 的短摘要：令牌与会话绑定，登出/改密后旧令牌自动失效。"""
+    sid = session_guard.current_token() or ''
+    return hashlib.sha256(sid.encode('utf-8')).hexdigest()[:8]
 
 
 def _issue_node_tokens(project):
-    """为详情页每个节点的三个操作各签发一次性 token，存服务端会话。"""
-    import secrets
-    store = session.get('node_tokens') or {}
+    """为详情页每个节点的三个操作签发签名令牌（无状态，不写 session）。"""
+    session.pop('node_tokens', None)  # 清理 CR-04 遗留在旧会话里的令牌表
+    serializer = _node_token_serializer()
+    sid_digest = _session_digest()
+    expires_at = int(timeutil.utcnow().timestamp()) + NODE_TOKEN_TTL
     issued = {}
     for node in project.nodes:
         per_node = {}
         for action in NODE_ACTIONS:
-            token = secrets.token_urlsafe(18)
-            store[token] = {'node': node.id, 'action': action}
-            per_node[action] = token
+            payload = {'n': node.id, 'a': action, 's': sid_digest,
+                       'j': secrets.token_urlsafe(16)[:22], 'e': expires_at}
+            per_node[action] = serializer.dumps(payload)
         issued[node.id] = per_node
-    # 防止会话无限膨胀：只保留最近 600 个
-    if len(store) > 600:
-        store = dict(list(store.items())[-600:])
-    session['node_tokens'] = store
     return issued
 
 
 def _consume_node_token(token, node_id, action):
-    """校验并作废一次性 token（真正的并发保护由 CAS 承担）。"""
-    store = session.get('node_tokens') or {}
-    meta = store.pop(token or '', None)
-    session['node_tokens'] = store
-    return bool(meta and meta.get('node') == node_id and meta.get('action') == action)
+    """校验令牌并登记消费；重复提交由 jti 主键冲突判定（返回状态字符串）。"""
+    token = (token or '').strip()
+    if not token:
+        return NODE_TOKEN_INVALID
+    try:
+        data = _node_token_serializer().loads(token, max_age=NODE_TOKEN_TTL)
+    except SignatureExpired:
+        return NODE_TOKEN_EXPIRED
+    except BadSignature:
+        return NODE_TOKEN_INVALID
+    except Exception:
+        return NODE_TOKEN_INVALID
+    if not isinstance(data, dict):
+        return NODE_TOKEN_INVALID
+    if data.get('n') != node_id or data.get('a') != action:
+        return NODE_TOKEN_INVALID
+    sid_digest = _session_digest()
+    if not sid_digest or data.get('s') != sid_digest:
+        return NODE_TOKEN_INVALID
+    jti = data.get('j')
+    if not jti or len(str(jti)) > 64:
+        return NODE_TOKEN_INVALID
+    now = timeutil.utcnow()
+    # 顺带清理一天前过期的历史消费记录（单条 DELETE，量很小）
+    try:
+        NodeActionToken.query.filter(
+            NodeActionToken.expires_at < now - timedelta(days=1)
+        ).delete(synchronize_session=False)
+    except Exception:
+        db.session.rollback()
+    expires_at = now + timedelta(seconds=NODE_TOKEN_TTL)
+    if data.get('e'):
+        try:
+            expires_at = datetime.utcfromtimestamp(int(data['e']))
+        except (TypeError, ValueError, OSError, OverflowError):
+            pass
+    row = NodeActionToken(jti=str(jti), node_id=node_id, action=action,
+                          session_sid=session_guard.current_token(),
+                          expires_at=expires_at, consumed_at=now)
+    db.session.add(row)
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return NODE_TOKEN_REPLAY
+    return NODE_TOKEN_OK
 
 
 # ---------- 认证 ----------
@@ -405,18 +473,14 @@ def _login_throttle_config():
 
 
 def _refresh_session_after_sensitive():
-    """敏感操作（改金额/合同）后刷新当前会话：轮换 CSRF token，响应重新签名 Cookie。
+    """业务操作后不再轮换 CSRF token（CR-05 需求⑤）。
 
-    注意：不做服务端会话行轮换——同一会话并发请求下会互相失效（QA 并发用例暴露）。
-    账号级敏感操作（改密/重置/停用/登出）才撤销服务端会话。
+    CR-04 时期每笔业务操作后 rotate_csrf_token()，同一会话其它标签页/回退页面
+    的 CSRF 全部失效，用户只看到 403「请刷新页面」；令牌改无状态签名后，
+    CSRF 只在登录成功、登出、改密等账号级敏感操作时轮换（见 login 与
+    session_guard.revoke_* 路径），保持 Flask 标准做法。
     """
-    try:
-        if not current_user():
-            return
-        from .security import rotate_csrf_token
-        rotate_csrf_token()
-    except Exception:
-        current_app.logger.exception('敏感操作后刷新会话失败')
+    return None
 
 
 def _must_change_password(user):
@@ -467,6 +531,12 @@ def login():
 
             login_guard.reset(username, ip)
             session_guard.create_session(user)
+            # 账号级敏感操作：登录成功后轮换 CSRF（登录页表单 token 不复用）
+            try:
+                from .security import rotate_csrf_token
+                rotate_csrf_token()
+            except Exception:
+                current_app.logger.exception('登录后轮换 CSRF token 失败')
             audit_record('auth.login.success', 'user', user.id,
                          after={'username': username})
             db.session.commit()
@@ -883,8 +953,15 @@ def node_update(node_id):
     if action not in NODE_ACTIONS:
         flash('未知的节点操作', 'danger')
         return redirect(detail_url)
-    if not _consume_node_token(request.form.get('confirm_token'), node.id, action):
-        flash('操作已失效（可能已提交过或页面已过期），请刷新页面后重试', 'danger')
+    token_status = _consume_node_token(request.form.get('confirm_token'),
+                                      node.id, action)
+    if token_status != NODE_TOKEN_OK:
+        if token_status == NODE_TOKEN_REPLAY:
+            flash('该操作已提交（请不要重复点击），请刷新页面查看最新状态', 'warning')
+        elif token_status == NODE_TOKEN_EXPIRED:
+            flash('操作令牌已过期（页面停留超过 2 小时），请刷新页面后重试', 'danger')
+        else:
+            flash('操作已失效（页面已过期或链接无效），请刷新页面后重试', 'danger')
         return redirect(detail_url)
 
     before_snapshot = _node_snapshot(node)
