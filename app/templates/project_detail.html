@@ -235,6 +235,72 @@
   {% endfor %}
 </div>
 
+{# ---------- 付款申请单（CR-05 需求④：一张申请可对应多笔付款） ---------- #}
+<div class="card">
+  <div class="card-title">付款申请单
+    <span class="sub">一张申请单可登记多笔付款；申请单累计付款不超过申请金额，节点累计付款不超过应付。无申请的节点仍可直接付款。</span>
+  </div>
+  {% if applications %}
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>申请单号</th><th>科目</th><th>节点</th>
+          <th class="num">申请金额</th><th class="num">已付金额</th><th class="num">剩余可付</th>
+          <th class="num">付款笔数</th><th>申请时间</th>
+          <th style="min-width:420px;">操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for a in applications %}
+        <tr>
+          <td>{{ a.app.apply_no }}</td>
+          <td>{{ a.item_name }}</td>
+          <td>{{ a.node.node_name }}</td>
+          <td class="num">￥{{ '{:,.2f}'.format(a.apply_amount) }}</td>
+          <td class="num {{ 'text-danger' if a.over else '' }}">￥{{ '{:,.2f}'.format(a.paid) }}</td>
+          <td class="num">￥{{ '{:,.2f}'.format(a.remaining) }}</td>
+          <td class="num">{{ a.count }}</td>
+          <td>{{ a.apply_time_text }}</td>
+          <td>
+            {% if current_user.role in ('admin', 'operator') and project.status != '已归档' and not project.deleted_at %}
+            {% if a.remaining > 0 and a.node.paid_amount < a.node.due_amount %}
+            <form method="post" action="{{ url_for('main.application_payment', app_id=a.app.id) }}" class="row" style="gap:4px;flex-wrap:wrap;">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <input type="hidden" name="confirm_token" value="{{ node_tokens[a.node.id]['pay'] }}">
+              <input type="number" name="paid_amount" class="small" step="0.01" min="0.01" max="{{ '%.2f'|format(a.remaining) }}" value="{{ '%.2f'|format(a.remaining) }}" style="width:92px;" placeholder="付款额" required title="预填剩余可付，可改小">
+              <input type="date" name="pay_date" class="small">
+              <input type="text" name="pay_method" class="small" style="width:80px;" placeholder="方式">
+              <input type="text" name="voucher_no" class="small" style="width:90px;" placeholder="凭证号">
+              <button type="submit" class="btn btn-success btn-sm">增加付款</button>
+            </form>
+            {% else %}
+            <span class="text-muted" style="font-size:12px;">{{ '已达申请金额' if a.remaining <= 0 else '节点已付满应付' }}</span>
+            {% endif %}
+            {% endif %}
+            <details style="margin-top:6px;">
+              <summary style="cursor:pointer;font-size:12px;">付款明细（{{ a.count }} 笔）</summary>
+              <ul style="margin:4px 0 0 16px;font-size:12px;">
+                {% for r in a.records %}
+                <li>{{ r.pay_date.isoformat() if r.pay_date else '' }} ￥{{ '{:,.2f}'.format(r.paid_amount) }}
+                  {{ r.pay_method or '' }}{% if r.voucher_no %} · 凭证 {{ r.voucher_no }}{% endif %}
+                  {% if r.operator_name %} · {{ r.operator_name }}{% endif %}</li>
+                {% else %}
+                <li class="text-muted">暂无付款记录</li>
+                {% endfor %}
+              </ul>
+            </details>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="text-muted" style="font-size:13px;">暂无付款申请单。可在上方节点「登记」区申请。</p>
+  {% endif %}
+</div>
+
 <div class="flex mt-16">
   <a href="{{ url_for('main.projects') }}" class="btn btn-ghost">返回项目列表</a>
 </div>

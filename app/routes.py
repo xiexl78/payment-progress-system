@@ -33,7 +33,8 @@ from .nodes import (FLOW_STATUS as NODE_FLOW_STATUS, NODE_TYPE_LABELS,
                     node_progress_label, three_dim)
 from .validation import (DEFAULT_ACCOUNT_PASSWORDS, PROJECT_STATUSES, NODE_TYPES,
                          NODE_LABELS, TAX_RATES, ValidationError, parse_amount,
-                         parse_date, validate_apply_no,
+                         parse_date, validate_application_payment,
+                         validate_apply_no,
                          validate_contract_change_items,
                          validate_contract_submission, validate_node_action,
                          validate_password, validate_project_dates,
@@ -785,8 +786,33 @@ def project_detail(project_id):
                           if Decimal(node.paid_amount or 0) > Decimal(node.due_amount or 0)),
                          ZERO).quantize(CENT)
     acceptances = AcceptanceRecord.query.filter_by(project_id=project.id).order_by(AcceptanceRecord.acceptance_date.desc()).all()
+
+    # 付款申请单列表（CR-05 需求④）：已付金额 = 该申请单下 payment_records 合计（动态算）
+    applications = []
+    for node in project.nodes:
+        for app in node.applications:
+            paid = sum_money(r.paid_amount for r in app.records)
+            apply_amount = Decimal(app.apply_amount or 0).quantize(CENT)
+            applications.append({
+                'app': app,
+                'node': node,
+                'item_name': node.item.item_name if node.item else '',
+                'apply_amount': apply_amount,
+                'paid': paid,
+                'remaining': (apply_amount - paid).quantize(CENT),
+                'count': len(app.records),
+                'over': paid > apply_amount,
+                'apply_time_text': (timeutil.to_local(app.apply_time).strftime('%Y-%m-%d %H:%M')
+                                    if app.apply_time else ''),
+                'records': sorted(app.records,
+                                  key=lambda r: (r.pay_date or r.created_at, r.id)),
+            })
+    applications.sort(key=lambda row: (
+        row['app'].apply_time is None, row['app'].apply_time or datetime.min, row['app'].id),
+        reverse=True)
     return render_template('project_detail.html', project=project, node_groups=node_groups,
                            acceptances=acceptances, templates=NODE_TEMPLATES,
+                           applications=applications,
                            node_three=node_three, node_tokens=_issue_node_tokens(project),
                            totals_dim=totals_dim, status_labels=STATUS_LABELS,
                            flow_status=NODE_FLOW_STATUS,
@@ -924,6 +950,16 @@ def project_restore(project_id):
     return redirect(url_for('main.project_detail', project_id=project.id))
 
 
+def _flash_node_token_failure(token_status):
+    """节点一次性令牌校验失败的统一中文提示（CR-05 需求⑤）。"""
+    if token_status == NODE_TOKEN_REPLAY:
+        flash('该操作已提交（请不要重复点击），请刷新页面查看最新状态', 'warning')
+    elif token_status == NODE_TOKEN_EXPIRED:
+        flash('操作令牌已过期（页面停留超过 2 小时），请刷新页面后重试', 'danger')
+    else:
+        flash('操作已失效（页面已过期或链接无效），请刷新页面后重试', 'danger')
+
+
 @bp.route('/nodes/<int:node_id>/update', methods=['POST'])
 @login_required
 @role_required('admin', 'operator')
@@ -944,12 +980,7 @@ def node_update(node_id):
     token_status = _consume_node_token(request.form.get('confirm_token'),
                                       node.id, action)
     if token_status != NODE_TOKEN_OK:
-        if token_status == NODE_TOKEN_REPLAY:
-            flash('该操作已提交（请不要重复点击），请刷新页面查看最新状态', 'warning')
-        elif token_status == NODE_TOKEN_EXPIRED:
-            flash('操作令牌已过期（页面停留超过 2 小时），请刷新页面后重试', 'danger')
-        else:
-            flash('操作已失效（页面已过期或链接无效），请刷新页面后重试', 'danger')
+        _flash_node_token_failure(token_status)
         return redirect(detail_url)
 
     before_snapshot = _node_snapshot(node)
@@ -1045,6 +1076,87 @@ def node_update(node_id):
                                     pay_method=rec.pay_method))
             db.session.commit()
             flash('%s 已登记付款 %s 元' % (node.node_name, fmt_money(amount)), 'success')
+    except ValidationError as exc:
+        db.session.rollback()
+        for msg in exc.errors:
+            flash(msg, 'danger')
+    return redirect(detail_url)
+
+
+@bp.route('/applications/<int:app_id>/payments', methods=['POST'])
+@login_required
+@role_required('admin', 'operator')
+def application_payment(app_id):
+    """申请单增加付款（CR-05 需求④：一张申请可对应多笔付款）。
+
+    与节点直接付款共用 ``action='pay'`` 的服务端一次性令牌；两条上限同时生效：
+    申请单剩余可付、节点应付。凭证号重复只提示不阻断。
+    """
+    application = db.session.get(PaymentApplication, app_id)
+    if not application:
+        abort(404)
+    node = application.node
+    if not node:
+        abort(404)
+    guard = _guard_writable_project(node.project)
+    if guard:
+        return guard
+    detail_url = url_for('main.project_detail', project_id=node.project_id)
+    token_status = _consume_node_token(request.form.get('confirm_token'),
+                                       node.id, 'pay')
+    if token_status != NODE_TOKEN_OK:
+        _flash_node_token_failure(token_status)
+        return redirect(detail_url)
+
+    actor = current_user()
+    before_snapshot = _node_snapshot(node)
+    before_app = dict(application.to_dict())
+    try:
+        parsed = validate_application_payment(application, request.form)
+        amount = parsed['amount']
+        pay_date = parse_date(request.form.get('pay_date'), field='付款日期') or timeutil.local_today()
+        pay_method = (request.form.get('pay_method') or '').strip()
+        voucher = (request.form.get('voucher_no') or '').strip()
+        result = db.session.execute(
+            update(PaymentNode)
+            .where(PaymentNode.id == node.id,
+                   PaymentNode.paid_amount + amount <= PaymentNode.due_amount)
+            .values(paid_amount=PaymentNode.paid_amount + amount,
+                    updated_at=_now_utc(), updated_by=actor.id))
+        if result.rowcount != 1:
+            db.session.rollback()
+            flash('付款登记失败：累计付款将超过应付，或该节点已被他人修改，请刷新后重试', 'danger')
+            return redirect(detail_url)
+        db.session.refresh(node)
+        duplicate_voucher = bool(voucher) and bool(
+            PaymentRecord.query.filter_by(voucher_no=voucher).first())
+        rec = PaymentRecord(node_id=node.id, application_id=application.id,
+                            paid_amount=amount,
+                            pay_date=pay_date,
+                            pay_method=pay_method or None,
+                            voucher_no=voucher or None,
+                            operator_id=actor.id,
+                            operator_name=actor.display_name)
+        db.session.add(rec)
+        db.session.flush()
+        node.status = derive_status(node.due_amount, node.applied_amount,
+                                    node.invoice_amount, node.paid_amount)
+        audit_record('application.pay', 'application', application.id,
+                     node.project_id,
+                     before=dict(before_snapshot, application=before_app),
+                     after=dict(_node_snapshot(node), record_id=rec.id,
+                                application_id=application.id,
+                                pay_amount=format(amount, 'f'),
+                                pay_date=_date_str(rec.pay_date),
+                                pay_method=rec.pay_method,
+                                voucher_no=rec.voucher_no))
+        db.session.commit()
+        if duplicate_voucher:
+            flash('申请单 %s 已登记付款 %s 元，但凭证号 %s 已在本系统使用过，请核对'
+                  % (application.apply_no, fmt_money(amount), voucher), 'warning')
+        else:
+            flash('申请单 %s 已登记付款 %s 元' % (application.apply_no, fmt_money(amount)),
+                  'success')
     except ValidationError as exc:
         db.session.rollback()
         for msg in exc.errors:

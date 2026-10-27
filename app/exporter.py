@@ -40,7 +40,7 @@ NODE_HEADERS = ('科目', '节点名称', '节点类型', '比例', '计算基�
                 '应付金额', '已申请金额', '已开票金额', '已支付金额', '未付金额',
                 '状态', '付款状态', '发票状态', '应付日期', '触发日期')
 APPLICATION_HEADERS = ('申请单号', '科目', '节点', '申请金额', '已开票金额',
-                       '发票号', '状态', '申请人', '申请时间')
+                       '发票号', '已付金额', '付款笔数', '状态', '申请人', '申请时间')
 RECORD_HEADERS = ('付款日期', '科目', '节点', '付款金额', '付款方式',
                   '凭证号', '经办人', '关联申请单号')
 ACCEPTANCE_HEADERS = ('验收日期', '验收人', '结论', '备注', '登记时间')
@@ -252,6 +252,9 @@ def _application_rows(project):
                 money_value(app.apply_amount),
                 money_value(app.invoice_amount),
                 app.invoice_no or '',
+                money_value(sum((Decimal(r.paid_amount or 0) for r in app.records),
+                                Decimal('0'))),
+                len(app.records),
                 app.status,
                 app.applicant_name or '',
                 _local_text(app.apply_time),
@@ -318,7 +321,7 @@ def build_project_workbook(project):
                money_cols=(6, 7, 8, 9, 10), total_row=node_total)
 
     _add_sheet(workbook, '付款申请', APPLICATION_HEADERS, _application_rows(project),
-               money_cols=(4, 5))
+               money_cols=(4, 5, 7))
     _add_sheet(workbook, '付款记录', RECORD_HEADERS, _record_rows(project),
                money_cols=(4,))
     _add_sheet(workbook, '验收记录', ACCEPTANCE_HEADERS, _acceptance_rows(project))

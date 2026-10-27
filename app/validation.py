@@ -419,6 +419,30 @@ def validate_apply_no(raw):
     return text
 
 
+def validate_application_payment(application, form):
+    """申请单「增加付款」校验（CR-05 需求④）：本笔 > 0、申请单剩余可付、节点应付上限。
+
+    两条上限**同时**生效：``申请单已付 + 本笔 ≤ 申请金额``、
+    ``节点已付 + 本笔 ≤ 节点应付``（沿用 CR-04 节点口径）。
+    """
+    amount = parse_amount(form.get('paid_amount'), field='付款金额', allow_zero=False)
+    node = application.node
+    due = Decimal(node.due_amount or 0)
+    if due <= 0:
+        raise ValidationError('该节点应付为 0，无法登记付款')
+    apply_amount = Decimal(application.apply_amount or 0)
+    app_paid = sum((Decimal(r.paid_amount or 0) for r in application.records), Decimal('0'))
+    if app_paid + amount > apply_amount:
+        raise ValidationError('本笔 %s 元将超过申请单剩余可付 %s 元（申请金额 %s，已付 %s）'
+                              % (_money(amount), _money(apply_amount - app_paid),
+                                 _money(apply_amount), _money(app_paid)))
+    paid = Decimal(node.paid_amount or 0)
+    if paid + amount > due:
+        raise ValidationError('累计付款金额 %s 将超过节点应付 %s'
+                              % (_money(paid + amount), _money(due)))
+    return {'amount': amount}
+
+
 def _quantize(value):
     return value.quantize(CENT, rounding=ROUND_HALF_UP)
 
