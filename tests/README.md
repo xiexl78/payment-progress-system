@@ -20,9 +20,9 @@ python tests/run_qa.py
 - **绝不读写项目内的 `instance/payment_progress.db`**，也不启动/占用 5001 端口；
 - 运行结束自动清理临时的库、上传文件与服务进程。
 
-## 三、当前基线（2026-10-24）
+## 三、当前基线（2026-10-27）
 
-`python tests/run_qa.py` → **262 项：262 PASS / 0 FAIL / 0 XFAIL / 0 XPASS，退出码 0**（CR-04 口径，连跑两遍一致）。
+`python tests/run_qa.py` → **270 项：270 PASS / 0 FAIL / 0 XFAIL / 0 XPASS，退出码 0**（在干净 HEAD 快照 `6756347` 上连跑两遍一致；较 CR-04 口径 +4 项：需求⑤「操作已失效/刷新不恢复」防回退用例）。
 
 状态含义：
 
@@ -93,7 +93,7 @@ python tests/run_qa.py
 
 ## 六点六、CR-04（三本账并列）验收状态
 
-**当前：262 项 / 262 PASS / 0 FAIL / 0 XFAIL / 0 XPASS，退出码 0；连跑两遍一致。**
+**当前：270 项 / 270 PASS / 0 FAIL / 0 XFAIL / 0 XPASS，退出码 0；干净 HEAD 快照连跑两遍一致**（CR-04 口径 266 项 + 需求⑤ 防回退 4 项）。
 
 已按 `docs/change-request-04.md` v1.2 覆盖并通过：
 

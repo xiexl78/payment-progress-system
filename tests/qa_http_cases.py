@@ -1634,6 +1634,63 @@ def _ratio_required_cases(s_admin):
               'code=%s before=%s after=%s' % (r_bad.status_code, before_total, after_total))
 
 
+def _stale_token_cases(s_admin):
+    """需求⑤（原 bug#5）：令牌曾存会话 Cookie 被撑爆 → 「操作已失效」且刷新不恢复。
+
+    现为无状态 HMAC + 防重放表：Cookie 不再随节点数增长，刷新后页面令牌立即可用。
+    """
+    # 3 个科目 → 12 个节点（复现规模：旧实现每次刷新签发 36 个令牌、Cookie 增约 1KB）
+    _, pid = create_project(s_admin, 'QA-TOK-COOKIE', 'QA令牌会话',
+                            [('科目A', '10000', '0'), ('科目B', '10000', '0'), ('科目C', '10000', '0')])
+    if pid is None:
+        check('令牌', '测试项目创建成功', False, '创建失败')
+        return
+    url = BASE + '/projects/%d' % pid
+    nid = node_ids(pid, 'first')[0]
+
+    def apply_token(html):
+        pairs = dict(((int(n), a), t) for n, a, t in C.NODE_FORM_RE.findall(html))
+        return pairs.get((nid, 'apply'))
+
+    def submit(tok):
+        return sess.post(BASE + '/nodes/%d/update' % nid,
+                         data={'action': 'apply', 'apply_amount': '10', 'confirm_token': tok},
+                         allow_redirects=False)
+
+    # 独立会话，避免影响其他用例的 Cookie
+    sess, _ = C.login(BASE, 'admin', 'admin123')
+    # 对照：首屏签发的令牌可直接提交
+    r0 = sess.get(url, timeout=30)
+    submit(apply_token(r0.text))
+    check('令牌', '首屏签发的令牌可正常提交（对照）', _node_vals(nid)['applied'] == d2(10),
+          'applied=%s' % _node_vals(nid)['applied'])
+
+    # 连续刷新详情页：会话 Cookie 不得随签发令牌线性增长（旧实现会超浏览器上限被丢弃）
+    drops, last_html = 0, ''
+    for _ in range(12):
+        resp, dropped = C.browser_get(sess, url)
+        drops += 1 if dropped else 0
+        last_html = resp.text
+    check('令牌', '详情页连续刷新 12 次不撑爆会话 Cookie（≤%d 字节）' % C.COOKIE_LIMIT,
+          drops == 0, '被浏览器丢弃 %d 次，最后 Cookie=%d 字节'
+          % (drops, len(sess.cookies.get('session') or '')))
+
+    # 刷新后页面上的令牌应立即可用（即「刷新即可恢复操作」）
+    before = _node_vals(nid)['applied']
+    submit(apply_token(last_html))
+    page = sess.get(url, timeout=30).text
+    check('令牌', '刷新后页面上的令牌立即可用（刷新即可恢复操作）',
+          _node_vals(nid)['applied'] == before + d2(10),
+          '刷新后仍未生效：%s' % ('操作已失效' if '操作已失效' in page else 'applied 未增加'))
+    # 旧令牌在刷新后依旧一次性（写请求不因刷新复活）
+    first_tok = apply_token(r0.text)
+    if first_tok:
+        before2 = _node_vals(nid)['applied']
+        submit(first_tok)
+        check('令牌', '已用过的令牌刷新后仍不可重放',
+              _node_vals(nid)['applied'] == before2, _node_vals(nid)['applied'])
+
+
 def run(server):
     global DB, BASE, APP, UPLOAD_DIR
     DB, BASE, APP, UPLOAD_DIR = server.db_path, server.base, server.app, server.upload_dir
@@ -1667,5 +1724,6 @@ def run(server):
     section('########## 11e. 合同变更（CR-04） ##########', lambda: _batch8_change_cases(s_admin))
     section('########## 11f. 三本账并列（CR-04） ##########', lambda: _three_books_cases(s_admin))
     section('########## 11g. 比例必填（CR-04） ##########', lambda: _ratio_required_cases(s_admin))
+    section('########## 11h. 令牌与刷新（需求⑤） ##########', lambda: _stale_token_cases(s_admin))
     section('########## 12. 导出（批次 6a） ##########', lambda: _batch6_export_import(s_admin))
     section('########## 12. 审计补充（批次 3 补测，末项会删临时库 audit_logs） ##########', lambda: _audit_extras(s_admin))

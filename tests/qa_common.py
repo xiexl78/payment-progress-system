@@ -211,5 +211,25 @@ def post(sess, base, path, data=None, files=None):
                      allow_redirects=False, timeout=120)
 
 
+#: 浏览器单 Cookie 上限（Werkzeug 超过 4093 字节即告警，浏览器会静默丢弃）
+COOKIE_LIMIT = 4093
+
+
+def browser_get(sess, url, limit=COOKIE_LIMIT):
+    """GET 并按真实浏览器规则处理会话 Cookie：新 Cookie 超限时静默丢弃（保留旧值）。
+
+    返回 ``(response, dropped)``。用于复现「令牌失效、刷新也不恢复」类问题：
+    浏览器丢弃新 Cookie 后服务端会话停在旧快照，页面渲染出的令牌随之失效。
+    """
+    before = sess.cookies.get('session')
+    resp = sess.get(url, timeout=60)
+    after = sess.cookies.get('session')
+    dropped = after is not None and len(after) > limit
+    if dropped and before is not None:
+        host = resp.url.split('/')[2].rsplit(':', 1)[0]
+        sess.cookies.set('session', before, domain=host, path='/')
+    return resp, dropped
+
+
 def d2(value):
     return Decimal(str(value)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
