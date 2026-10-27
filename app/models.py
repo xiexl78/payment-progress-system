@@ -47,7 +47,9 @@ class Project(db.Model):
     status = db.Column(db.String(16), nullable=False, default='进行中')  # 进行中/已完成/已归档
     trial_date = db.Column(db.Date, nullable=True)          # 试运行日期
     acceptance_date = db.Column(db.Date, nullable=True)     # 验收日期
-    warranty_due_date = db.Column(db.Date, nullable=True)   # 质保到期日期 = 验收日期+3年
+    warranty_due_date = db.Column(db.Date, nullable=True)   # 质保到期日期 = 验收日期+质保期（CR-05 起可配置）
+    # CR-05：质保期（月）。空 = 未填，不推算到期日（不再写死 36）
+    warranty_months = db.Column(db.Integer, nullable=True)
     remark = db.Column(db.Text, nullable=True)
     created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)      # 存储 UTC，展示转本地时
@@ -77,6 +79,7 @@ class Project(db.Model):
             'trial_date': self.trial_date.isoformat() if self.trial_date else None,
             'acceptance_date': self.acceptance_date.isoformat() if self.acceptance_date else None,
             'warranty_due_date': self.warranty_due_date.isoformat() if self.warranty_due_date else None,
+            'warranty_months': self.warranty_months,
             'total_original': self.total_original(),
             'total_additional': self.total_additional(),
             'total_amount': self.total_amount(),
@@ -287,6 +290,8 @@ class ContractFile(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)   # UTC
     confirmed_by = db.Column(db.Integer, nullable=True)      # 最后一次确认/回改人
     confirmed_at = db.Column(db.DateTime, nullable=True)     # 最后一次确认/回改时间（UTC）
+    # CR-05：file=上传合同文件（旧入口兜底）/ shots=按模板上传的关键信息截图任务
+    source = db.Column(db.String(16), nullable=False, default='file')
 
     project = db.relationship('Project', backref='contracts', lazy='selectin')
 
@@ -295,9 +300,65 @@ class ContractFile(db.Model):
             'id': self.id, 'file_name': self.file_name, 'file_type': self.file_type,
             'file_size': self.file_size, 'engine': self.engine, 'status': self.status,
             'project_id': self.project_id, 'contract_name': self.contract_name,
+            'source': self.source,
             'error_msg': self.error_msg,
             'created_at': self.created_at.strftime('%Y-%m-%d %H:%M') if self.created_at else None,
         }
+
+
+class ContractScreenshot(db.Model):
+    """合同关键信息截图（CR-05 需求①）。
+
+    一次「截图识别」= 一条 ``contract_files`` 任务（``file_type='img'``、
+    ``source='shots'``）+ 2~3 条截图明细；确认生成项目后回填 ``project_id``，
+    项目详情据此直接展示原图（无需再翻识别任务）。
+    """
+    __tablename__ = 'contract_screenshots'
+    id = db.Column(db.Integer, primary_key=True)
+    contract_id = db.Column(db.Integer, db.ForeignKey('contract_files.id'), nullable=False)
+    project_id = db.Column(db.Integer, db.ForeignKey('projects.id'), nullable=True)
+    shot_type = db.Column(db.String(16), nullable=False)   # amount / payment / warranty
+    file_name = db.Column(db.String(256), nullable=False)  # 原始文件名
+    stored_path = db.Column(db.String(512), nullable=False)  # 相对 UPLOAD_DIR
+    mime = db.Column(db.String(64), nullable=True)
+    file_size = db.Column(db.Integer, nullable=True)
+    ocr_text = db.Column(db.Text, nullable=True)           # 该张截图 OCR 文本（复核识别来源）
+    ocr_status = db.Column(db.String(16), nullable=False, default='pending')  # pending/ok/failed/skipped
+    ocr_msg = db.Column(db.String(255), nullable=True)
+    created_by = db.Column(db.Integer, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)   # UTC
+
+    contract = db.relationship('ContractFile', backref='screenshots', lazy='selectin')
+
+    __table_args__ = (db.Index('ix_contract_screenshots_contract_id', 'contract_id'),
+                      db.Index('ix_contract_screenshots_project_type', 'project_id', 'shot_type'))
+
+    def to_dict(self):
+        return {
+            'id': self.id, 'contract_id': self.contract_id, 'project_id': self.project_id,
+            'shot_type': self.shot_type, 'file_name': self.file_name,
+            'mime': self.mime, 'file_size': self.file_size,
+            'ocr_status': self.ocr_status, 'ocr_msg': self.ocr_msg,
+            'created_at': self.created_at.strftime('%Y-%m-%d %H:%M') if self.created_at else None,
+        }
+
+
+class NodeActionToken(db.Model):
+    """节点操作令牌的消费记录（CR-05 需求⑤防重放）。
+
+    令牌本身是无状态 HMAC（不入 Cookie 会话）；提交时把令牌里的 ``jti``
+    插入本表，主键冲突即代表「同一令牌已提交过」。
+    """
+    __tablename__ = 'node_action_tokens'
+    jti = db.Column(db.String(64), primary_key=True)
+    node_id = db.Column(db.Integer, nullable=False)
+    action = db.Column(db.String(16), nullable=False)      # apply / invoice / pay
+    session_sid = db.Column(db.String(64), nullable=True)  # 绑定的登录会话
+    expires_at = db.Column(db.DateTime, nullable=False)    # UTC
+    consumed_at = db.Column(db.DateTime, nullable=False)   # UTC
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    __table_args__ = (db.Index('ix_node_action_tokens_expires_at', 'expires_at'),)
 
 
 class AcceptanceRecord(db.Model):

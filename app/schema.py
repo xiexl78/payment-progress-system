@@ -29,6 +29,8 @@ _COLUMN_PATCHES = {
         'updated_by': 'INTEGER',
         'deleted_at': 'DATETIME',
         'deleted_by': 'INTEGER',
+        # CR-05：可配置质保期（月）；历史行由 scripts/migrate_cr05.py 回填 36
+        'warranty_months': 'INTEGER',
     },
     'project_items': {
         'updated_at': 'DATETIME',
@@ -44,6 +46,8 @@ _COLUMN_PATCHES = {
     'contract_files': {
         'confirmed_by': 'INTEGER',
         'confirmed_at': 'DATETIME',
+        # CR-05：file=上传文件（旧入口）/ shots=截图识别任务；已有行默认 file
+        'source': "VARCHAR(16) NOT NULL DEFAULT 'file'",
     },
     # CR-04 草案库：早期 payment_invoices 不含 project_id（模型后加列），
     # 旧库表已存在但缺列时初始化建表逻辑不会再处理，必须在此补列并回填。

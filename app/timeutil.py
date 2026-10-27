@@ -76,3 +76,29 @@ def local_date_end_utc(day):
 def month_start_local(days_ago=0):
     """（预留）业务时区今天往前 days_ago 天的 00:00。"""
     return local_date_start_utc(local_today() - timedelta(days=days_ago))
+
+
+def _last_day_of_month(year, month):
+    """某年某月的最后一天（不引入 calendar 以外的依赖）。"""
+    import calendar
+    return calendar.monthrange(year, month)[1]
+
+
+def add_months(day, months):
+    """日期加 N 个自然月（CR-05：质保到期日 = 验收日 + warranty_months）。
+
+    按目标月最后一天对齐：1/31 + 1 月 = 2/28（闰年 2/29）；日期本身是月末时
+    结果也是目标月末。``months`` 为空/0 时原样返回；``day`` 为空返回 None。
+    """
+    if day is None:
+        return None
+    try:
+        months = int(months or 0)
+    except (TypeError, ValueError):
+        return None
+    total = day.year * 12 + (day.month - 1) + months
+    year, month = divmod(total, 12)
+    month += 1
+    last = _last_day_of_month(year, month)
+    return date(year, month, min(day.day, last))
+
