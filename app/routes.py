@@ -6,7 +6,7 @@ import json
 import os
 import re
 import secrets
-from datetime import date, timedelta, datetime
+from datetime import date, timedelta, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from functools import wraps
 
@@ -427,7 +427,9 @@ def _issue_node_tokens(project):
     serializer = _node_token_serializer()
     sid_digest = _session_digest()
     ttl = _node_token_ttl_seconds()
-    expires_at = int(timeutil.utcnow().timestamp()) + ttl
+    # naive UTC 直接 .timestamp() 会按本机时区解释（Asia/Shanghai 会晚 8 小时），
+    # 导致 expires_at 早于 now、消费记录被清理，同令牌可重放（CR-05 自测发现）。
+    expires_at = int(timeutil.utcnow().replace(tzinfo=timezone.utc).timestamp()) + ttl
     issued = {}
     for node in project.nodes:
         per_node = {}
