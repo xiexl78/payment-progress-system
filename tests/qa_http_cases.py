@@ -634,11 +634,16 @@ def _concurrency(s_admin):
           apps == 320 and uniq == 320 and abs(applied - 320) < 0.005,
           '申请单=%s 唯一单号=%s 累计申请=%s' % (apps, uniq, applied))
 
-    # 单号生成器本身：连续生成 5000 个必须唯一（防止回退到秒级时间碰撞）
+    # 自动单号生成器已退化为历史工具（CR-05 起单号人工必填）：断言格式与可控后缀，
+    # 不再做概率性「5000 次必须全唯一」断言（32^6 空间下约 1% 概率误报，属测试脆弱）。
+    import re as _re
     from app.routes import make_apply_no
-    nos = [make_apply_no() for _ in range(5000)]
-    check('并发', '申请单号生成器连续 5000 次无重复',
-          len(nos) == len(set(nos)), '唯一值=%d/5000' % len(set(nos)))
+    sample = [make_apply_no() for _ in range(50)]
+    check('并发', '历史自动单号格式 AP+14位时间-6位随机（无易混淆字符）',
+          all(_re.match(r'^AP\d{14}-[A-Z2-9]{6}$', s) for s in sample),
+          '样例=%s' % (sample[:2],))
+    check('并发', '自动单号支持指定后缀（便于工具/旧数据复用）',
+          make_apply_no('TEST01').endswith('-TEST01'), 'no=%s' % (make_apply_no('TEST01'),))
 
     # 并发付款：节点已付金额必须等于付款流水合计（不丢更新）
     lost = []
@@ -1813,22 +1818,32 @@ def _cr05_cases(s_admin):
     check('CR05③', '申请缺单号被拒（库不变、提示含「单号」）',
           _node_vals(first)['applied'] == applied0 and '单号' in r.text,
           'applied=%s code=%s' % (_node_vals(first)['applied'], r.status_code))
-    for bad, label in (('   ', '单号全空白'), ('AB CD!', '单号含非法字符'),
-                       ('A' * 65, '单号超 64 字符')):
+    for bad, label in (('   ', '单号全空白'), ('A' * 65, '单号超 64 字符')):
         before = _node_vals(first)['applied']
         r = node_post(s_admin, first, {'action': 'apply', 'apply_amount': '10',
                                        'apply_no': bad})
         check('CR05③', '%s 被拒（库不变）' % label,
               _node_vals(first)['applied'] == before and '单号' in r.text,
               'applied=%s' % _node_vals(first)['applied'])
+    # Q3：不限字符集（含中文/符号/空格内部）应被接受，仅去首尾空白
+    free_no = '首付/1-2_3 号'
+    before = _node_vals(first)['applied']
+    r = node_post(s_admin, first, {'action': 'apply', 'apply_amount': '10',
+                                   'apply_no': free_no})
+    stored_free = q1(DB, 'SELECT apply_no FROM payment_applications WHERE node_id=? '
+                         'ORDER BY id DESC LIMIT 1', (first,))
+    check('CR05③', '单号不限字符集（中文/符号/内部空格均可）',
+          _node_vals(first)['applied'] == before + d2(10) and stored_free == free_no,
+          'applied=%s stored=%r' % (_node_vals(first)['applied'], stored_free))
     # 正常单号 + 说明字段应被忽略（需求③取消「说明」）
+    before_ok = _node_vals(first)['applied']
     dup_no = C.next_apply_no('QA-DUP')
     r = node_post(s_admin, first, {'action': 'apply', 'apply_amount': '100',
                                    'apply_no': dup_no, 'description': '旧说明不应入库'})
     stored_desc = q1(DB, 'SELECT description FROM payment_applications WHERE apply_no=?',
                      (dup_no,))
     check('CR05③', '正常单号可申请且说明字段被忽略（不再入库）',
-          _node_vals(first)['applied'] == applied0 + d2(100) and not stored_desc,
+          _node_vals(first)['applied'] == before_ok + d2(100) and not stored_desc,
           'applied=%s description=%r' % (_node_vals(first)['applied'], stored_desc))
     before = _node_vals(first)['applied']
     r = node_post(s_admin, first, {'action': 'apply', 'apply_amount': '100',
@@ -2244,7 +2259,7 @@ def _cr05_final_cases(s_admin):
                 'confirm_token': tok}, allow_redirects=True)
         stored = q1(DB, 'SELECT apply_no FROM payment_applications ORDER BY id DESC LIMIT 1')
         check('CR05③', '申请单号允许中文（仅长度+唯一，不限制字符集）',
-              stored == '申请单-中文01', 'stored=%r' % (stored,), xfail='CR05-③CN')
+              stored == '申请单-中文01', 'stored=%r' % (stored,))
         tok64 = C.node_tokens(s_admin, BASE, pq).get((nid, 'apply'))
         C.post(s_admin, BASE, '/nodes/%d/update' % nid,
                {'action': 'apply', 'apply_amount': '10', 'apply_no': 'A' * 64,
@@ -2252,6 +2267,14 @@ def _cr05_final_cases(s_admin):
         stored64 = q1(DB, 'SELECT apply_no FROM payment_applications ORDER BY id DESC LIMIT 1')
         check('CR05③', '申请单号 64 字符（边界）可提交', stored64 == 'A' * 64,
               'len=%s' % (len(stored64 or ''),))
+        tok_cn64 = C.node_tokens(s_admin, BASE, pq).get((nid, 'apply'))
+        cn64 = '首付' * 32  # 64 个汉字（按字符计，非字节）
+        C.post(s_admin, BASE, '/nodes/%d/update' % nid,
+               {'action': 'apply', 'apply_amount': '10', 'apply_no': cn64,
+                'confirm_token': tok_cn64}, allow_redirects=True)
+        stored_cn64 = q1(DB, 'SELECT apply_no FROM payment_applications ORDER BY id DESC LIMIT 1')
+        check('CR05③', '申请单号 64 个汉字（按字符计）可提交', stored_cn64 == cn64,
+              'len=%s' % (len(stored_cn64 or ''),))
 
     # ---------- ⑤ 令牌：节点/动作不匹配不消费、过期拒绝、已提交提示、消费记录 ----------
     _, pt = create_project(s_admin, 'QA-TOK-FIN', 'QA令牌最终', [('科目', '10000', '0')])
@@ -2326,7 +2349,9 @@ def _cr05_final_cases(s_admin):
             exp_tok = dict(((int(n), a), t)
                            for n, a, t in C.NODE_FORM_RE.findall(html)).get((nid, 'apply'))
             before2 = _node_vals(nid)['applied']
-            _time.sleep(1.4)
+            # TTL 是整数秒比较：sleep 1.4s 时 age 可能仍算 1 秒 → 未过期（偶发误报），
+            # 睡 2.6s 保证 age≥2 > max_age=1，确定性过期。
+            _time.sleep(2.6)
             rexp = C.post(s_admin, BASE, '/nodes/%d/update' % nid,
                           {'action': 'apply', 'apply_amount': '10',
                            'apply_no': C.next_apply_no('QA-EXP'), 'confirm_token': exp_tok},
