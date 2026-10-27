@@ -445,7 +445,7 @@ item.additional_amount = new_total - original_amount   # 允许为负
 
 | # | 问题 | 建议 | 影响 |
 |---|---|---|---|
-| Q1 | 重复操作保护：同一发票号多次登记、同一付款凭证号重复付款、双击重复提交，各保留哪些保护？ | 金额累计上限保留；同一发票号唯一（DB 唯一索引或强提示）；同凭证号重复付款强提示+二次确认；表单一次性 token（CR-05 起改为签名令牌 + `node_action_tokens` jti 防重放，TTL 2 小时）防双击。是否要求“同一笔业务只能一次”请确认 | 迁移索引/校验/页面提示 |
+| Q1 | 重复操作保护：同一发票号多次登记、同一付款凭证号重复付款、双击重复提交，各保留哪些保护？ | 金额累计上限保留；同一发票号唯一（DB 唯一索引或强提示）；同凭证号重复付款强提示+二次确认；表单一次性 token（CR-05 起改为签名令牌 + `node_action_tokens` jti 防重放，TTL 由 `NODE_TOKEN_TTL_MINUTES` 配置、默认 30 分钟）防双击。是否要求“同一笔业务只能一次”请确认 | 迁移索引/校验/页面提示 |
 | Q2 | 变更降额后：已开票金额 > 新应付、或存在历史「超付待处理」节点，如何处理？ | 阻断变更，提示先红冲/冲销；超付节点先清理再变更 | §6.2 阻断清单、测试 16 |
 | Q3 | 申请金额与开票金额、付款金额之间是否要有业务匹配（如付款不得超过已申请/已开票）？ | 不建议：按 Chief 口径三者并列，各自只受应付上限约束；金额差异由报表提示 | 若要求匹配，等于恢复前置，需推翻 §3 |
 | Q4 | 已付款后是否允许补申请、补开票？发票红冲/作废、付款冲销是否本期需要？ | 补申请/补开票允许（额度内）；红冲/冲销本期不做，仅登记正向金额 | 动作规则与页面 |
@@ -491,6 +491,7 @@ item.additional_amount = new_total - original_amount   # 允许为负
 ## 附录 A：节点操作一次性 token 的存储修订（CR-05）
 
 - CR-04 实现曾把节点操作的一次性 token 全量写入 Flask 客户端 session Cookie（`_issue_node_tokens`），导致 Cookie 超过浏览器 4093B 被丢弃，出现「操作已失效且刷新无效」。
-- 自 CR-05 起，一次性语义不变，但 token 不再写入 session：改为 `itsdangerous` 签名串（载荷 `{node_id, action, 会话 sid 摘要, jti, 过期时间}`，TTL 2 小时），页面隐藏字段携带；服务端只在消费时把 `jti` 写入 `node_action_tokens(jti PK, node_id, action, session_sid, expires_at, consumed_at, created_at)`，主键冲突即判重复提交。
+- 自 CR-05 起，一次性语义不变，但 token 不再写入 session：改为 `itsdangerous` 签名串（载荷 `{node_id, action, 会话 sid 摘要, jti, 过期时间}`，TTL **由 `NODE_TOKEN_TTL_MINUTES` 配置，默认 30 分钟**），页面隐藏字段携带；服务端只在消费时把 `jti` 写入 `node_action_tokens(jti PK, node_id, action, session_sid, expires_at, consumed_at, created_at)`，主键冲突即判重复提交。
+- Chief 已追认方案 B（2026-10-27），附条件：TTL 可配默认 30 分钟、提示语按配置动态生成、清理条件 `expires_at < now`；对应 T2c 待开发，不影响三本账口径。
 - 本文 Q1 所称「表单一次性 token」即指该签名令牌；三本账（申请/开票/付款）并列口径不受影响。
 - 实现细节见 `docs/change-request-05.md` §2.2 / §8.3。

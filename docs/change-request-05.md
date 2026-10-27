@@ -1,9 +1,9 @@
 # CR-05 设计：截图式合同识别 / 可配置质保期 / 申请单号与多笔付款 / 会话令牌失效修复 / 节点字段改名
 
-- 版本：v1.3（2026-10-27，第⑤条令牌按**实际落地**同步为「无状态签名令牌 + jti 消费记录」；回填 T1~T5/T7 完成状态与 Q 结论；新增 T2b/T6 剩余工作）
-- 基线：`e6f67d5`（回归 266 项全绿）；实现已到 `79c333d`，干净 HEAD 快照回归 **270 项全绿**（测试 `3c05dc4`）
+- 版本：v1.4（2026-10-27，用户确认 Q1–Q10 全 A（13:27）；方案 B 获 Chief 有条件追认；T2c 已实现）
+- 基线：设计起点 `e6f67d5`；最新 HEAD `4ff9fb1`，干净快照回归 **323 项全绿**
 - 作者：架构师
-- 状态：T1/T2/T3/T4/T5/T7 已提交并自测通过；剩 **T2b**（先校验后消费）与 **T6**（需求① 三截图）；Q1/Q4 按推荐结论 A 开工（Chief 可推翻）
+- 状态：T1~T7 全部已提交（T2b `61fa95d`、T6 `a8af7ea`）；T2c `6186918` 已实现（TTL 可配默认 30、动态提示、清理 `expires_at < now`）；Q1–Q10 用户已确认全 A；方案 B 已追认；剩余为测试收口与文档对齐
 - 涉及需求：CR-05 六条（合同识别截图化、质保期可配置、申请单号必填+去说明、一申请多付款、会话失效 bug、节点字段改名）
 
 ---
@@ -21,9 +21,9 @@
 
 **第 5 条根因已实测确认**（§8.1），不是页面缓存问题：详情页每次渲染把 3×节点数个一次性 token 追加进浏览器 Cookie 会话，12 节点项目第 4 次刷新 Cookie 就达 4590 字节，超过浏览器 4093 字节上限被静默丢弃；页面 HTML 里的新 token 与浏览器实际保存的旧会话对不上，于是永远「操作已失效」，刷新只会继续追加、永远修不好。修完 Cookie 体积恒定，刷新即可恢复。
 
-> **实现状态（v1.3）**：T1 `d1d3005`（模型/迁移：`ContractScreenshot`、`NodeActionToken`、`ContractFile.source`、`projects.warranty_months`、`timeutil.add_months`）、T2 `a2f4a09`（令牌修复）、T3 `73f8832`（单号必填/去说明）、T4 `68b08a5`（申请单列表 + 增加付款）、T5 `c7ef62f`（付款/发票派生列、删已付款列）、T7 `79c333d`（质保期可配置）均已提交并自测；测试 `3c05dc4` 后干净快照 **270/270 全绿**。尚未做：**T2b**（把「消费令牌」挪到业务校验之后，见 §2.2.2）与 **T6**（需求① 三截图上传/OCR/详情展示，见 §11）。
+> **实现状态（v1.4）**：T1 `d1d3005`、T2 `a2f4a09`、T3 `73f8832`、T4 `68b08a5`、T5 `c7ef62f`、T7 `79c333d`、T2b `61fa95d`（先校验后消费）、T6 `a8af7ea`（三截图上传/OCR/详情展示）、T2c `6186918`（TTL 可配默认 30 分钟、动态提示、清理 `expires_at < now`）均已提交；最新测试基线 `4ff9fb1` 为 **323/323 全绿**。Q1–Q10 用户已于 2026-10-27 13:27 确认全部按 A，无改动。
 >
-> 第⑤条实际落地为「无状态签名令牌 + jti 消费记录」（下称方案 B），与 Chief m01253 拍板的方案 A（服务端签发 `token` 行 + `used_at` 原子消费）不同；差异、理由与回退清单见 §8.3 与 §15，**请 Chief 追认**。
+> 第⑤条实际落地为「无状态签名令牌 + jti 消费记录」（下称方案 B），与 Chief m01253 原定方案 A（服务端签发 `token` 行 + `used_at` 原子消费）不同；**Chief 已于 2026-10-27 有条件追认**（TTL 30 分钟可配、提示语动态、清理条件 `expires_at < now`，见 §8.3），无需回退方案 A（Q1–Q10 的 A 结论不受影响）。
 
 ---
 
@@ -69,7 +69,7 @@
 
 ### 2.2 新增表 `node_action_tokens`（需求⑤：jti 消费记录，方案 B）
 
-> 方案史：Chief m01253 原定方案 A（服务端签发 `token` 行、`used_at` 原子消费、TTL 30 分钟）；实际落地按架构师拍板改为方案 B（无状态签名令牌 + 只登记消费），已由 `a2f4a09` 实现、测试 `3c05dc4` 验收（干净快照 270 项全绿、Cookie 恒定 226 B）。差异、理由与追认请求见 §8.3。
+> 方案史：Chief m01253 原定方案 A（服务端签发 `token` 行、`used_at` 原子消费、TTL 30 分钟）；实际落地改为方案 B（无状态签名令牌 + 只登记消费），已由 `a2f4a09` 实现、测试验收（当前干净快照 323 项全绿、Cookie 恒定 226 B）。**Chief 已于 2026-10-27 有条件追认方案 B**，三项条件已由 T2c `6186918` 落地，见 §8.3。
 
 | 列 | 类型 | 说明 |
 |---|---|---|
@@ -77,7 +77,7 @@
 | `node_id` | INTEGER NOT NULL | 绑定的节点 |
 | `action` | VARCHAR(16) NOT NULL | `apply` / `invoice` / `pay` |
 | `session_sid` | VARCHAR(64) NULL | 消费时的登录会话 sid（仅供排查） |
-| `expires_at` | DATETIME NOT NULL | 令牌过期时间（签发时刻 + `NODE_TOKEN_TTL`） |
+| `expires_at` | DATETIME NOT NULL | 令牌过期时间（签发时刻 + `NODE_TOKEN_TTL_MINUTES`，默认 30 分钟） |
 | `consumed_at` | DATETIME NOT NULL | 消费时间 |
 | `created_at` | DATETIME NULL | 写入时间（UTC） |
 
@@ -105,11 +105,14 @@ CREATE INDEX ix_node_action_tokens_expires_at ON node_action_tokens (expires_at)
 - 不建 `node_id` 外键：行按 TTL 清理，不参与引用完整性；不建 `(node_id)` 索引（无按节点查询的路径）。
 - 旧库由 `app/schema.py` 的「缺表按 metadata 补建」自动建表（`e6f67d5` 已修过同类旧库缺表问题）。
 
-#### 2.2.2 签发/消费时序（含未修项 T2b）
+#### 2.2.2 签发/消费时序（T2b 已修，`61fa95d`）
 
-1. GET `/projects/<id>` — `_issue_node_tokens(project)`（`app/routes.py:399`）：为每个节点 × 3 动作现签令牌，**渲染零写库**；同时 `session.pop('node_tokens')` 清理 CR-04 遗留在旧会话里的令牌表。TTL 见 `app/routes.py:379 NODE_TOKEN_TTL = 2 * 60 * 60`。
-2. POST `/nodes/<id>/update` / `/applications/<id>/payments` — `_consume_node_token()`（`app/routes.py:416`）：`loads(max_age=NODE_TOKEN_TTL)` 验签并验过期 → 比对 `n`/`a` → 比对 `s` 与当前会话 sid 摘要 → `INSERT node_action_tokens(jti)`，主键冲突即判「已提交」并返回 `NODE_TOKEN_REPLAY`。
-3. ⚠ **现状缺陷（T2b 待修）**：第 2 步在路由里发生在 `validate_node_action()` **之前**，且函数内部自带 `commit()`；业务校验失败（如金额超应付）也会烧掉令牌，用户必须刷新才能重试（§8.2 次生问题仍未消除）。修法：拆成 `_verify_node_token()`（只验签，返回 jti）与 `_record_node_token(jti)`（只 `db.session.add`、不单独 commit），路由顺序改为「验签 → 业务校验 → 登记 jti + 写业务明细 → 一次 commit」，`IntegrityError` 时回滚并提示「已提交」。修完后 §8.4.2 第 1 条才成立。
+1. GET `/projects/<id>` — `_issue_node_tokens(project)`（`app/routes.py:399`）：为每个节点 × 3 动作现签令牌，**渲染零写库**；同时 `session.pop('node_tokens')` 清理 CR-04 遗留在旧会话里的令牌表。TTL 由配置 `NODE_TOKEN_TTL_MINUTES` 决定（默认 **30 分钟**，见下）。
+2. POST `/nodes/<id>/update` / `/applications/<id>/payments` — `_consume_node_token()`（`app/routes.py:416`）：`loads(max_age=NODE_TOKEN_TTL)` 验签并验过期 → 比对 `n`/`a` → 比对 `s` 与当前会话 sid 摘要 → 登记 `jti`；`NODE_TOKEN_TTL = NODE_TOKEN_TTL_MINUTES * 60`，禁止再写死 2 小时。
+3. ✅ **T2b 已实现（`61fa95d`）**：路由把 `validate_node_action()` 前移到 `_consume_node_token()` 之前（`routes.py:997` 校验、`:1018` 消费），业务校验失败不再烧令牌，同一页面可直接改金额重试，§8.4.2 第 1 条成立。**残留风险**：消费仍由 `_consume_node_token()` 内部单独 `commit()`，若校验通过后业务 CAS 失败（并发/金额被他人改动），令牌仍已被消耗；彻底同事务需再拆 `_verify`/`_record`，暂列后续事项，不影响 Q1–Q10 结论。
+
+4. **TTL 与清理（用户卡片确认④，设计口径）**：新增配置 `NODE_TOKEN_TTL_MINUTES`（`config.py` / 环境变量，默认 **30**，范围 1–1440）；签发时写 `expires_at = now + minutes`，验签用同一值，提示语中的“页面停留超过 N 分钟”由该配置动态渲染，**不得出现硬编码“2 小时”**。`GET` 详情页清理条件为 `DELETE ... WHERE expires_at < now`（只清已过期，不再用 `now - 1 天`）。
+5. **T2c 已实现（`6186918`）**：`routes.py:379-398` 读 `current_app.config['NODE_TOKEN_TTL_MINUTES']`，缺省 `NODE_TOKEN_TTL = 30 * 60`；提示语按配置动态渲染；GET 清理条件改为 `NodeActionToken.expires_at < now`。文档口径与实现一致，无需再改代码。
 
 ### 2.3 列变更
 
@@ -188,6 +191,7 @@ SELECT id, acceptance_date, warranty_due_date, warranty_months FROM projects
 
 - `accept=".jpg,.jpeg,.png,.bmp,.webp"`，单张 ≤ 10MB（`MAX_SHOT_BYTES`），服务端再校验一次。
 - ①② 缺失 → 表单错误提示，不建识别任务、不落库。
+- **Q1=A 兜底**：保留原「上传整份合同文件（PDF/Word/txt/Markdown/图片）」入口，折叠在页面下方次要卡片（`<details>` 或「兜底」区），提交仍走 `contract_upload()` 单文件流程；主流程只走三截图，不删除旧数据与旧路由（实现 `a8af7ea`，`contracts.html:35-38`）。
 
 ### 4.2 存储
 
@@ -455,27 +459,27 @@ The final size was 4590 bytes but the limit is 4093 bytes. Browsers may silently
 5. 刷新 = 再签发 T5 并继续追加，Set-Cookie 依旧超限被丢弃 → **永远对不上，刷新无效**；
 6. 回归 266 项全绿是因为 `requests` 的 cookiejar 不限制单个 Cookie 大小，只有真实浏览器才触发。
 
-**次生问题（仍未修，列为 T2b）**：`routes.py:985` 先 `_consume_node_token()` 再 `validate_node_action()`，业务校验失败（如金额超应付）也会把令牌烧掉；同一页面重试合法金额时已无令牌，仍报「操作已失效」。实测（T2 修复前）：有效令牌提交 999999 元 → 业务报错；同页再用原令牌提交 10 元 → 「操作已失效」且库不变。T2（`a2f4a09`）只解决了会话膨胀，本项在方案 B 下依然存在，修法见 §2.2.2 第 3 条。
+**次生问题（T2b 已部分修复）**：原 `routes.py:985` 先 `_consume_node_token()` 再 `validate_node_action()`，业务校验失败也会烧令牌；`61fa95d` 已把校验前移（先校验后消费），校验失败不再烧。残留：消费仍在 `_consume_node_token()` 内单独 commit，校验通过后若业务 CAS 失败（并发/金额被改），令牌仍被消耗，需重开详情页。
 
 ### 8.3 修复方案（实际落地：方案 B，无状态签名令牌 + jti 消费记录）
 
-> **与 Chief m01253 决策的差异（请追认）**：Chief 拍板方案 A（服务端签发 `token` 行、`used_at` 原子消费、TTL 30 分钟）。落地时按架构师在群里对开发建议的回复改为方案 B，`a2f4a09` 已实现并由测试验收（270 项全绿）。若 Chief 不追认，按 §15 末尾「回方案 A」清单重做 T2（约 1 个任务工作量，测试需同步改 token 语义 4 条）。
+> **Chief 已追认方案 B（2026-10-27）**，附条件：① TTL 改为可配置 `NODE_TOKEN_TTL_MINUTES`，默认 **30 分钟**，不得写死 2 小时；② 提示语按实际配置值动态生成；③ `jti` 清理条件为 `expires_at < now`。三项已由 T2c `6186918` 落地，本次只改文档，不改代码；方案 A 不再要求回退。
 
 | 项 | 方案 B（现状实现） |
 |---|---|
 | 令牌存储 | 从 session 移除 `node_tokens`；令牌为 `itsdangerous` 签名串，**不入库、不写 session**；`node_action_tokens` 只记已使用的 `jti`。Cookie 只剩用户/CSRF，实测恒定 **226 B**（12 节点项目连续刷新不增长） |
-| 签发 | `_issue_node_tokens(project)`（`routes.py:399`）返回 `{node_id: {action: token}}`，渲染零写库；payload `{n,a,s,j,e}`，TTL `NODE_TOKEN_TTL = 2 小时` |
+| 签发 | `_issue_node_tokens(project)`（`routes.py:399`）返回 `{node_id: {action: token}}`，渲染零写库；payload `{n,a,s,j,e}`，TTL 由 `NODE_TOKEN_TTL_MINUTES`（默认 30 分钟，`6186918` 已配）计算 |
 | 消费 | `_consume_node_token()`（`routes.py:416`）验签 + 验过期 + 比对 node/action + 比对会话 sid 摘要 → `INSERT node_action_tokens(jti)`；主键冲突 = 已提交 |
-| 顺序 | ⚠ 现状仍是「先消费、后业务校验」→ 校验失败烧令牌；T2b 改为「先校验、后消费」并与业务写入同事务提交（§2.2.2） |
-| 错误提示 | `_flash_node_token_failure()`（`routes.py:958`）：已提交「该操作已提交（请不要重复点击），请刷新页面查看最新状态」；过期「操作令牌已过期（页面停留超过 2 小时），请刷新页面后重试」；无效「操作已失效（页面已过期或链接无效），请刷新页面后重试」 |
+| 顺序 | T2b（`61fa95d`）已把 `validate_node_action()` 前移到消费之前，校验失败不烧令牌；消费仍单独 commit，业务 CAS 失败时令牌已被消耗（残留，见 §2.2.2） |
+| 错误提示 | `_flash_node_token_failure()`（`routes.py:958`）：已提交「该操作已提交（请不要重复点击），请刷新页面查看最新状态」；过期「操作令牌已过期（页面停留超过 N 分钟），请刷新页面后重试」，N 由当前 `NODE_TOKEN_TTL_MINUTES` 动态渲染（`6186918` 已实现）；无效「操作已失效（页面已过期或链接无效），请刷新页面后重试」 |
 | 日志 | 现状**没有**分场景失败日志（只 flash）；可选补：记录 node_id/action/jti 前 6 位，不打印完整令牌 |
 | 兼容 | 详情页渲染时 `session.pop('node_tokens', None)` 清理 CR-04 遗留令牌表（`routes.py:401`）；CR-04 的 600 条截断逻辑随旧实现一并删除 |
 | CSRF | 业务成功后不再轮换 CSRF；只在登录成功后轮换（`routes.py:525-530`），多标签页表单不再互相失效 |
-| 为何不用 A | ① 渲染零写库：12 节点项目每次打开详情页少 36 行 INSERT + 1 行 DELETE，GET 不产生写锁；② 令牌表只存已消费 jti，规模恒定、无「按 TTL 堆积」风险；③ 令牌自带过期与 sid 绑定，会话失效即连带失效。代价：依赖 `SECRET_KEY`（轮换会使未用令牌失效）、无服务端主动吊销（靠 2h TTL + 会话绑定） |
+| 为何不用 A | ① 渲染零写库：12 节点项目每次打开详情页少 36 行 INSERT + 1 行 DELETE，GET 不产生写锁；② 令牌表只存已消费 jti，规模恒定、无「按 TTL 堆积」风险；③ 令牌自带过期与 sid 绑定，会话失效即连带失效。代价：依赖 `SECRET_KEY`（轮换会使未用令牌失效）、无服务端主动吊销（靠默认 30 分钟可配 TTL + 会话绑定） |
 
 ### 8.4 验收用例（交给测试）
 
-#### 8.4.1 四条必过（Chief 指定，缺一不可上线）
+#### 8.4.1 六条必过（Chief 指定，缺一不可上线）
 
 | # | 用例 | 断言 |
 |---|---|---|
@@ -483,14 +487,16 @@ The final size was 4590 bytes but the limit is 4093 bytes. Browsers may silently
 | T-8.4-2 | 连续打开详情页 10 次 | 第 10 次 session Cookie 长度 ≤ 第 1 次 + 200 B（不随节点数累积）；无 Werkzeug “cookie is too large” 告警 |
 | T-8.4-3 | 同一 token 第二次提交 | 第一次成功；第二次被拒（提示“已使用”），节点 `applied_amount/invoice_amount/paid_amount` 不变，申请/发票/付款明细行数不增 |
 | T-8.4-4 | 二次提交的 DB 副作用 | 同一 token 并发/顺序提交两次，业务表只产生一次副作用（唯一申请单/发票/付款各 1 行，金额只加一次），`node_action_tokens` 只多出 1 行 `jti` |
+| T-8.4-5 | 过期令牌（注入 1 秒 TTL） | 测试用 `NODE_TOKEN_TTL_MINUTES` 可覆盖为 1 秒（或直接构造 `e` 为过去的签名令牌）；等待 >1 秒后提交 → 被拒并提示“已过期”，业务表无副作用 |
+| T-8.4-6 | jti 清理条件 | 详情页 GET 只删除 `expires_at < now` 的 `node_action_tokens` 行；未过期（含 1 秒前刚签发）的行必须保留，清理后总行数=本页节点数×3（若同页已消费则加上历史未过期行） |
 
 #### 8.4.2 补充用例
 
-1. 业务校验失败（超应付）后，同一 token 仍可提交合法金额（令牌未被烧）——**T2b 完成后才成立**，现状应断成「失败后需重新打开详情页」；
+1. 业务校验失败（超应付）后，同一 token 仍可提交合法金额（令牌未被烧）——**T2b（`61fa95d`）已实现**；注意消费仍单独提交，CAS 失败需重开详情页；
 2. 过期 token、错 node/action、跨会话（他人）token：均被拒；`jti` 已存在时报「已提交」，提示语与场景对应；
 3. 并发双击：一只成功、一只失败，无重复副作用；
 4. **bug 主诉场景**：反复刷新详情页 10 次后再提交申请/开票/付款 → 全部成功；
-5. 原有回归全绿（当前 270 项；含 token 语义用例 `qa_http_cases.py:1575-1588` 已按方案 B 重写）；
+5. 原有回归全绿（当前 323 项；含 token 语义用例 `qa_http_cases.py:1575-1588` 已按方案 B 重写）；
 6. 迁移后旧会话里的 `node_tokens` 被清理：首次请求 Cookie 体积回落，旧 token 无法再使用。
 
 ---
@@ -523,7 +529,7 @@ def invoice_state(due, invoice):
 ### 9.3 其它同步位置
 
 - `project_detail.html:161` 分组汇总文案「已申请/已开票/已支付」→「申请/开票/付款」；
-- `reports.html:38` 表头「已申请/已开票/已付金额」→「申请金额/开票金额/付款金额」（Q8：或改成状态列）；
+- `reports.html:38` 表头「已申请/已开票/已付金额」→「申请金额/开票金额/付款金额」，并新增「付款状态」「发票状态」两列（Q8=A，报表直接给状态列，不再用“或”）；
 - `exporter.py`：`NODE_HEADERS` 金额列保留（`已申请金额/已开票金额/已支付金额/未付金额`），新增「付款状态」「发票状态」两列；`REPORT_HEADERS` 同步；
 - 待办提醒（`routes.py:2061-2070`）仍按 `n.status in ('未开票已申请','已申请')`，本次不改（后续可切到「申请>0 且 付款<应付」）。
 
@@ -551,14 +557,14 @@ def invoice_state(due, invoice):
 |---|---|---|---|
 | T1 | 数据模型 + 迁移（`models.py` / `schema.py` / `timeutil.add_months` / `scripts/migrate_cr05.py`） | **已完成** `d1d3005` | `app/models.py`、`app/schema.py`、`app/timeutil.py`、`scripts/` |
 | T2 | **需求⑤ token 修复**（方案 B：签名令牌 + `jti` 防重放 + 提示 + 清理） | **已完成** `a2f4a09`（测试 `3c05dc4` 验收） | `app/routes.py` |
-| T2b | 修「校验失败烧令牌」：拆 `_verify_node_token()` / `_record_node_token()`，路由改「验签→业务校验→登记 jti + 写明细→一次 commit」 | **待开发**（先做，量小） | `app/routes.py`、`tests/qa_http_cases.py` |
+| T2b | 修「校验失败烧令牌」：拆 `_verify_node_token()` / `_record_node_token()`，路由改「验签→业务校验→登记 jti + 写明细→一次 commit」 | **已完成** `61fa95d` | `app/routes.py`、`tests/qa_http_cases.py` |
 | T3 | 需求③ 单号必填 + 说明移除 | **已完成** `73f8832` | `app/routes.py`、`app/validation.py`、`templates/project_detail.html`、`app/exporter.py` |
 | T4 | 需求④ 申请单列表 + 增加付款 | **已完成** `68b08a5` | `app/routes.py`、`templates/project_detail.html`、`app/validation.py` |
 | T5 | 需求⑥ 派生字段改名（`payment_state` / `invoice_state`、删已付款列） | **已完成** `c7ef62f` | `app/nodes.py`、`templates/project_detail.html`、`app/exporter.py`、`templates/reports.html` |
-| T6 | 需求① 三截图上传/分类型 OCR/确认页带图/项目详情看图/图片鉴权路由 | **待开发（已解封）**，按 Q1=A（旧入口保留兜底）、Q4=A（分图取数、合计≠100% 阻断）、Q9=A（viewer 不可看）、Q10=A（`UPLOAD_DIR/shots/`、≤10MB 原图）开工 | `app/models.py`、`app/contract_engine.py`、`app/routes.py`、`app/security.py`、`templates/contracts.html`、`templates/contract_confirm.html`、`templates/project_detail.html` |
+| T6 | 需求① 三截图上传/分类型 OCR/确认页带图/项目详情看图/图片鉴权路由 | **已完成** `a8af7ea`；按 Q1=A（旧入口保留兜底）、Q4=A（分图取数、合计≠100% 阻断）、Q9=A（viewer 不可看）、Q10=A（`UPLOAD_DIR/shots/`、≤10MB 原图）实现 | `app/models.py`、`app/contract_engine.py`、`app/routes.py`、`app/security.py`、`templates/contracts.html`、`templates/contract_confirm.html`、`templates/project_detail.html` |
 | T7 | 需求② 质保期字段与推算 | **已完成** `79c333d` | `app/routes.py`、`app/validation.py`、`templates/project_form.html`、`templates/contract_confirm.html`、`templates/project_detail.html` |
 
-建议顺序：**T2b → T6**（T6 不依赖 T2b，可与测试补用例并行；T2b 只动 `routes.py` 的令牌调用顺序 + 2 条用例）。
+建议顺序：**T2b → T6 均已完成**；剩余为测试收口（截图用例并入后 323→最终基线）、`docs/qa-baseline.md` 更新与仓库清理。
 
 ---
 
@@ -570,8 +576,8 @@ def invoice_state(due, invoice):
   - `qa_http_cases.py:1378`（导出含三本账列）→ 已按「付款 / 发票」表头；
   - `qa_http_cases.py:427`、`492-497`（质保到期 = 验收 + 3 年）→ 已改按 `warranty_months` 推算；
   - `qa_common.py:171-204`（`NODE_FORM_RE` / `node_tokens` / `post` 自动补 token）→ 已适配新表单（单号输入框、无说明框）；
-- 待补：截图上传（①②必传、分图识别映射、图片鉴权 403/200、viewer 403）、T2b「校验失败令牌仍可用」、一申请多付款两道上限（申请单/节点）、质保月末对齐（如 1/31+1 月）、跨标签页（登录后不再轮换 CSRF）；
-- 基线数量更新 `docs/qa-baseline.md`：CR-05 前 266 → 当前干净快照 **270**（需求⑤ 4 条）；六条全部完成后预期 **300–310**。
+- 待补：截图上传（①②必传、分图识别映射、图片鉴权 403/200、viewer 403）、一申请多付款两道上限（申请单/节点）、质保月末对齐（如 1/31+1 月）的剩余用例；跨标签页（登录后不再轮换 CSRF）另立；
+- 基线数量更新 `docs/qa-baseline.md`：CR-05 前 266 → 最新干净快照 **323**（`4ff9fb1`）；T6 截图用例已并入，后续以实际全绿数为准。
 
 ---
 
@@ -582,28 +588,28 @@ def invoice_state(due, invoice):
 | WinRT OCR 在无桌面/服务账号环境不可用 | 截图识别失败 | 与现有图片识别同一依赖；识别失败降级为手填，确认页保留全部可编辑字段并提示原因 |
 | 截图只覆盖合同局部，可能识别不出质保金比例 | 比例不全 | 确认页手填（CR-04 已无默认值）+ 标红必填 |
 | 需求④放开了「一张申请多笔付款」，会出现「付款 > 申请」 | 报表口径 | 节点上限仍强制；申请单列表显示「已付 / 申请」，超出时标红 |
-| 令牌机制改动涉及安全面 | 越权/重放风险 | 现状：`SECRET_KEY` 签名 + 绑定 node/action + 会话 sid 摘要 + 2 小时 TTL + `jti` 主键防重放；T2b 后「校验失败不烧令牌、登记与业务同事务」；操作审计仍记录操作人 |
-| 方案 B 偏离 Chief 方案 A | 决策不一致 | 已在 §8.3 列表差异与理由并请 Chief 追认；不追认则按 §15 末尾清单回退（约 1 个任务） |
+| 令牌机制改动涉及安全面 | 越权/重放风险 | 现状：`SECRET_KEY` 签名 + 绑定 node/action + 会话 sid 摘要 + TTL 默认 30 分钟可配（T2c `6186918` 已配、清理 `expires_at < now`）+ `jti` 主键防重放；T2b 后「校验失败不烧令牌」；操作审计仍记录操作人 |
+| 方案 B 偏离 Chief 方案 A | 决策不一致 | **已追认（2026-10-27）**，附条件 TTL 30 分钟可配、提示语动态、清理条件 `expires_at < now`（T2c 落地）；无需回退 |
 | 模板结构大改 | 现有测试选择器失效 | 测试同步先行小改（`qa_common.py`），开发与测试约定表单 `name` 不随意改 |
 
 ---
 
-## 14. 开放问题与拍板记录（待用户一次性确认）
+## 14. 开放问题与拍板记录（用户已确认）
 
-> 状态（v1.3）：Q2/Q3/Q5/Q6/Q7/Q8 已随 T3/T4/T5/T7 按建议 A 落地并通过测试；Q1/Q4/Q9/Q10 由架构师按建议 A 解封 T6（Chief 可推翻，推翻后 T6 再调）。**当前没有阻塞 T6 的待拍板项**。
+> 状态（v1.4）：**用户已于 2026-10-27 13:27 一次性确认 Q1–Q10 全部按建议 A，无改动**。下表“落地结论”记录实现/开工情况；“用户确认”为最终拍板记录，后续实施不得偏离。
 
-| # | 问题 | 建议选项（推荐 A） | 结论 |
-|---|---|---|---|
-| Q1 | 旧「上传合同文件（PDF/Word/txt）」入口是否保留？ | A 保留、折叠为兜底（推荐）；B 删除，只留三截图 | 按 **A** 开工（T6） |
-| Q2 | 质保期为空 / 历史回填？ | A 允许空不推算、历史回填 36 且不改日期（推荐）；B 禁止空；C 历史不回填 | **A，已实现**（`79c333d`） |
-| Q3 | 质保期起点？ | A 验收日期（推荐）；B 合同固定到期日（需新增字段） | **A，已实现**（验收日 + N 月） |
-| Q4 | 三图识别冲突 / 比例合计≠100%？ | A 分图取数、合计≠100% 阻断（推荐）；B 以金额图整体重算、容忍差额 | 按 **A** 开工（T6） |
-| Q5 | 申请单号格式与唯一性？ | A 仅必填+全局唯一+≤64，不强制格式（推荐）；B 强制 `PAY-YYYY-NNNN` | **A + 字符集**：必填、strip 后 ≤64、`^[A-Za-z0-9_/\-]{1,64}$`、全局唯一、重复中文阻断（`73f8832`） |
-| Q6 | 一申请多付款上限？ | A 申请累计≤申请金额，保留无申请付款（推荐）；B 不限制申请累计 | **A 且阻断**：本笔>0、申请单「已付+本笔≤申请金额」、节点「已付+本笔≤应付」，超了报错不落库；凭证号重复只提示（`68b08a5`） |
-| Q7 | 令牌签发粒度？ | A 每节点×3 动作各一条（推荐）；B 每节点一条三动作共用；C 只按实际渲染表单签发 | **A，已实现**（每节点×3 签名令牌，渲染零写库） |
-| Q8 | 节点展示与报表？ | A 付款四值+金额小字、发票两值+金额、报表加状态列（推荐）；B 只显示金额 | **A，已实现**（`c7ef62f`） |
-| Q9 | viewer 能否看合同截图？ | A 不可看，与 D5 一致（推荐）；B 可看 | **A（架构师定）**：图片路由只给 admin/operator，viewer 403 |
-| Q10 | 截图存储与大小？ | A `UPLOAD_DIR/shots/`、单张≤10MB、保留原图（推荐）；B 压缩后存储 | **A（架构师定）**：`UPLOAD_DIR/shots/<contract_id>/`、单张 ≤10MB、保留原图 |
+| # | 问题 | 建议选项（推荐 A） | 落地结论 | 用户确认 |
+|---|---|---|---|---|
+| Q1 | 旧「上传合同文件（PDF/Word/txt）」入口是否保留？ | A 保留、折叠为兜底（推荐）；B 删除，只留三截图 | **A 已实现**（`a8af7ea`；`contracts.html:35-38` 兜底卡片） | **A**（2026-10-27 13:27） |
+| Q2 | 质保期为空 / 历史回填？ | A 允许空不推算、历史回填 36 且不改日期（推荐）；B 禁止空；C 历史不回填 | **A 已实现**（`79c333d`） | **A**（2026-10-27 13:27） |
+| Q3 | 质保期起点？ | A 验收日期（推荐）；B 合同固定到期日（需新增字段） | **A 已实现**（验收日 + N 月） | **A**（2026-10-27 13:27） |
+| Q4 | 三图识别冲突 / 比例合计≠100%？ | A 分图取数、合计≠100% 阻断（推荐）；B 以金额图整体重算、容忍差额 | **A 已实现**（`a8af7ea`） | **A**（2026-10-27 13:27） |
+| Q5 | 申请单号格式与唯一性？ | A 仅必填+全局唯一+≤64，不强制格式（推荐）；B 强制 `PAY-YYYY-NNNN` | **A 已实现 + 字符集**：必填、strip 后 ≤64、`^[A-Za-z0-9_/\-]{1,64}$`、全局唯一（`73f8832`） | **A**（2026-10-27 13:27） |
+| Q6 | 一申请多付款上限？ | A 申请累计≤申请金额，保留无申请付款（推荐）；B 不限制申请累计 | **A 已实现且阻断**：申请单「已付+本笔≤申请金额」、节点「已付+本笔≤应付」；凭证号重复只提示（`68b08a5`） | **A**（2026-10-27 13:27） |
+| Q7 | 令牌签发粒度？ | A 每节点×3 动作各一条（推荐）；B 每节点一条三动作共用；C 只按实际渲染表单签发 | **A 已实现**（每节点×3 签名令牌，渲染零写库） | **A**（2026-10-27 13:27） |
+| Q8 | 节点展示与报表？ | A 付款四值+金额小字、发票两值+金额、报表加状态列（推荐）；B 只显示金额 | **A 已实现**（`c7ef62f`） | **A**（2026-10-27 13:27） |
+| Q9 | viewer 能否看合同截图？ | A 不可看，与 D5 一致（推荐）；B 可看 | **A 已实现**（图片路由仅 admin/operator，viewer 403） | **A**（2026-10-27 13:27） |
+| Q10 | 截图存储与大小？ | A `UPLOAD_DIR/shots/`、单张≤10MB、保留原图（推荐）；B 压缩后存储 | **A 已实现**：`UPLOAD_DIR/shots/<contract_id>/`、单张 ≤10MB、保留原图 | **A**（2026-10-27 13:27） |
 
 结论已落到：§2 数据模型、§4 上传与展示、§5 质保期、§8 token、§9 展示、§11 任务依赖。
 
@@ -621,18 +627,23 @@ def invoice_state(due, invoice):
 | T4 | `68b08a5` | 项目详情「付款申请单」卡 + `POST /applications/<id>/payments` 增加付款；两道上限（申请单/节点） | 自测通过 |
 | T5 | `c7ef62f` | `nodes.payment_state()` / `invoice_state()`；详情列改「付款/发票」、删「已付款」列；导出同步 | 自测通过 |
 | T7 | `79c333d` | 质保期按月可配置（字段/校验/日期推算/确认页/导出）；空值不推算 | 自测 25/25 |
-| 测试 | `3c05dc4` | 需求⑤ 用例转正 + 防回退；干净快照 `6756347` 双跑 **270 / 270 PASS / 0 FAIL / 0 XFAIL / 0 XPASS** | 退出码 0 |
+| T2b | `61fa95d` | 路由改为「先 `validate_node_action()` 后 `_consume_node_token()`」，校验失败不烧令牌（消费仍单独提交，CAS 失败残留见 §2.2.2） | 自测通过 |
+| T6 | `a8af7ea` | 需求① 三截图上传、分类型 OCR、确认页带图、项目详情看图、鉴权图片路由；旧整文件入口保留为兜底 | 自测通过 |
+| T2c | `6186918` | `NODE_TOKEN_TTL_MINUTES` 配置化（默认 30、范围 1–1440）、提示语动态、清理 `expires_at < now` | 测试基线 323 全绿 |
+| 测试 | `3c05dc4`→`4ff9fb1` | 需求⑤ 用例转正 + CR-05 需求②③④⑥补测 + T6 截图用例 + T2c TTL 用例；干净快照双跑 **323 / 323 PASS / 0 FAIL / 0 XFAIL / 0 XPASS** | 退出码 0 |
 
 ### 15.2 剩余工作
 
-- **T2b（开发，先做，量小）**：按 §2.2.2 拆 `_verify_node_token()` / `_record_node_token()`，把「登记 jti」挪到业务校验之后、与业务写入同事务；配套 2 条用例（校验失败后同一令牌仍可提交、二次提交无副作用）。
-- **T6（开发，已解封）**：按 §4 实现三截图上传、分类型 OCR 合并、确认页带图核对、项目详情看图、鉴权图片路由（viewer 403）；测试补「①②必传、③可选、比例合计≠100% 阻断、识别失败手填、图片 403/200」。
-- **工作区清理**：`docs/change-request-04.md`（M，附录 A 与本文章节要对齐）、`tests/qa_common.py` / `tests/qa_http_cases.py`（M，测试正在补 CR-05 用例）、`.qa-base2/`（临时目录，不入库）、`启动开发系统.cmd`（本地脚本，不入库）；`scripts/migrate_cr05.py` 仍是未跟踪文件，需随 T6 一起入库。
+- **T6 截图用例待并入**：①②必传、③可选、比例合计≠100% 阻断、识别失败手填、图片 403/200、viewer 403；与工作区未提交的 `tests/qa_db_cases.py` / `tests/qa_http_cases.py` 一起收口后跑最终基线。
+- **文档收口**：`docs/qa-baseline.md` 由 266/270 更新到最终数；`docs/change-request-04.md` 附录 A 与本文 §2.2 再对齐一次（当前无未提交 diff）。
+- **工作区清理**：`.qa-base2/`（临时目录，不入库）、`启动开发系统.cmd`（本地脚本，不入库）、`scripts/migrate_cr05.py`（未跟踪，需随 T6 入库）。
+- **T2c 已完成**（`6186918`）：`NODE_TOKEN_TTL_MINUTES` 配置化（默认 30、范围 1–1440）；提示语按配置动态渲染；GET 清理条件 `expires_at < now`；§8.4.1 T-8.4-5/6 已可执行。
+- **决策遗留**：无。第⑤条方案 B 已追认（2026-10-27 附三项条件），Q1–Q10 的 A 结论已回填 §14。
 
-### 15.3 若 Chief 不追认方案 B（回方案 A 清单）
+### 15.3 若方案 B 被撤回（回方案 A 清单，备查，当前不触发）
 
 1. `app/models.py`：`NodeActionToken` 字段改为 `token PK / node_id / action / user_id / created_at / expires_at / used_at`，删 `jti / session_sid / consumed_at`；
 2. `app/routes.py`：删 `itsdangerous` 导入与 `NODE_TOKEN_TTL / NODE_TOKEN_SALT / _node_token_serializer() / _session_digest()`；`_issue_node_tokens()` 改为「清过期 → 每节点×3 插行」；`_consume_node_token()` 改为 `UPDATE ... WHERE used_at IS NULL AND expires_at > now`，并保持「先校验后消费」；
 3. 详情页 GET 变为写库路径（12 节点 36 行 INSERT + 1 DELETE），Cookie 用例改为「体积恒定」断言；
 4. 测试改 4 条 token 语义用例与 TTL（30 分钟）；
-5. 估算：开发 0.5 个任务 + 测试 0.5 个任务，需重跑 270 基线。
+5. 估算：开发 0.5 个任务 + 测试 0.5 个任务，需重跑 323 基线。
