@@ -1921,6 +1921,522 @@ def _cr05_cases(s_admin):
           all(k in html3 for k in ('未申请', '已申请', '部分付款')))
 
 
+def _shot_cases(s_admin):
+    """CR-05 需求①：按模板上传三张关键信息截图（①②必传、③选传、分类型 OCR、原图对照）。"""
+    import io
+    import json
+    from PIL import Image, ImageDraw, ImageFont
+
+    def _font(size=46):
+        for fp in (r'C:\Windows\Fonts\simhei.ttf', r'C:\Windows\Fonts\msyh.ttc',
+                   r'C:\Windows\Fonts\simsun.ttc'):
+            if os.path.exists(fp):
+                try:
+                    return ImageFont.truetype(fp, size)
+                except OSError:
+                    pass
+        return None
+
+    def png_bytes(lines, solid=False):
+        """生成白底中文截图；solid=True 时整张纯色（模拟无法识别）。"""
+        im = Image.new('RGB', (1500, 620), 'white' if not solid else (250, 250, 250))
+        if not solid:
+            draw = ImageDraw.Draw(im)
+            font = _font()
+            y = 40
+            for text in lines:
+                if font:
+                    draw.text((50, y), text, font=font, fill='black')
+                else:
+                    draw.text((50, y), text, fill='black')
+                y += 92
+        buf = io.BytesIO()
+        im.save(buf, 'PNG')
+        return buf.getvalue()
+
+    def shots_upload(files):
+        data = {}
+        for shot_type, (name, blob) in files.items():
+            data['shot_' + shot_type] = (name, blob, 'image/png')
+        return C.post(s_admin, BASE, '/contracts/shots', files=data)
+
+    AMOUNT_PNG = png_bytes(['合同总金额：165000.00 元', '税率：13%',
+                            '合同名称：QA 截图识别合同'])
+    PAY_PNG = png_bytes(['首付款 40%', '进度款 50%', '验收款 8%', '质保金 2%',
+                         '付款方式：银行转账'])
+    WARR_PNG = png_bytes(['质保期：36 个月', '质保金比例 2%'])
+    BLANK_PNG = png_bytes([], solid=True)
+
+    cnt0 = q1(DB, 'SELECT COUNT(*) FROM contract_files')
+
+    # ①② 必传：只传①
+    r = shots_upload({'amount': ('amount.png', AMOUNT_PNG)})
+    cnt1 = q1(DB, 'SELECT COUNT(*) FROM contract_files')
+    check('CR05①', '仅传①（缺付款条件截图）被拒且不建合同记录',
+          r.status_code == 302 and cnt1 == cnt0, 'code=%s cnt=%s→%s'
+          % (r.status_code, cnt0, cnt1))
+    # 格式白名单：PDF 冒充截图被拒
+    r = C.post(s_admin, BASE, '/contracts/shots',
+               files={'shot_amount': ('a.pdf', b'%PDF-1.4 fake', 'application/pdf'),
+                      'shot_payment': ('b.png', PAY_PNG, 'image/png')})
+    check('CR05①', '非图片格式（.pdf）被拒且不建合同记录',
+          r.status_code == 302 and q1(DB, 'SELECT COUNT(*) FROM contract_files') == cnt0,
+          'code=%s' % r.status_code)
+    # 大小上限：>10MB 被拒
+    big = b'\x89PNG' + b'\x00' * (11 * 1024 * 1024)
+    r = shots_upload({'amount': ('big.png', big), 'payment': ('pay.png', PAY_PNG)})
+    check('CR05①', '单张截图超过 10MB 被拒且不建合同记录',
+          r.status_code == 302 and q1(DB, 'SELECT COUNT(*) FROM contract_files') == cnt0,
+          'code=%s' % r.status_code)
+    # ①② 必传已满足、③ 选传：不传③也能进入确认页
+    r = shots_upload({'amount': ('amount.png', AMOUNT_PNG),
+                      'payment': ('payment.png', PAY_PNG)})
+    new_ct = q1(DB, 'SELECT id FROM contract_files ORDER BY id DESC LIMIT 1')
+    two_shots = q(DB, 'SELECT shot_type FROM contract_screenshots WHERE contract_id=? '
+                      'ORDER BY id', (new_ct,))
+    check('CR05①', '①②必传即通过、③选传可缺省（合同 source=shots，含 2 张截图）',
+          r.status_code == 302 and '/contracts/%d/confirm' % new_ct in r.headers.get('Location', '')
+          and [row[0] for row in two_shots] == ['amount', 'payment'],
+          'loc=%s shots=%s' % (r.headers.get('Location'), two_shots))
+
+    # 三张截图（含③）：分类型 OCR + 定向识别
+    r = shots_upload({'amount': ('amount.png', AMOUNT_PNG),
+                      'payment': ('payment.png', PAY_PNG),
+                      'warranty': ('warranty.png', WARR_PNG)})
+    ct = q1(DB, 'SELECT id FROM contract_files ORDER BY id DESC LIMIT 1')
+    rows = q(DB, 'SELECT shot_type, ocr_status, mime, file_size, stored_path '
+                 'FROM contract_screenshots WHERE contract_id=? ORDER BY id', (ct,))
+    status = {row[0]: row[1] for row in rows}
+    check('CR05①', '三张截图分类型入库（amount/payment/warranty，OCR 均成功）',
+          [row[0] for row in rows] == ['amount', 'payment', 'warranty']
+          and all(v == 'ok' for v in status.values()), str(status))
+    check('CR05①', '截图原件落盘且记录 MIME/大小',
+          all(row[2] == 'image/png' and (row[3] or 0) > 0 and '/shots/%d/' % ct in row[4]
+              for row in rows), str(rows[:2]))
+    check('CR05①', '截图识别进入确认页（redirect /contracts/<id>/confirm）',
+          r.status_code == 302 and '/contracts/%d/confirm' % ct in r.headers.get('Location', ''),
+          'loc=%s' % r.headers.get('Location'))
+
+    result = json.loads(q1(DB, 'SELECT result_json FROM contract_files WHERE id=?', (ct,)) or '{}')
+    ratios = {nt: (result.get('ratios') or {}).get(nt, {}).get('value')
+              for nt in ('first', 'progress', 'acceptance', 'warranty')}
+    check('CR05①', '截图①只认金额、②只认比例（金额 165000，比例 40/50/8/2）',
+          abs(float(result.get('contract_amount') or 0) - 165000) < 0.01
+          and ratios == {'first': 0.4, 'progress': 0.5, 'acceptance': 0.08,
+                         'warranty': 0.02},
+          'amount=%s ratios=%s' % (result.get('contract_amount'), ratios))
+    check('CR05①', '截图③识别质保期（36 个月）并填到确认页字段',
+          result.get('warranty_months') == 36, 'warranty_months=%s' % result.get('warranty_months'))
+
+    page = s_admin.get(BASE + '/contracts/%d/confirm' % ct, timeout=60).text
+    shot_ids = [row[0] for row in q(DB, 'SELECT id FROM contract_screenshots '
+                                        'WHERE contract_id=? ORDER BY id', (ct,))]
+    check('CR05①', '确认页可对照原图（3 张缩略图 + 原图链接 + 「对照」提示）',
+          all(('/contracts/shots/%d/image' % sid) in page for sid in shot_ids)
+          and page.count('<img') >= 3 and '对照' in page)
+    check('CR05①', '确认页回填识别值（金额/税率/36 个月）',
+          '165000' in page and '13' in page and 'warranty_months' in page and '36' in page)
+
+    # 原图回显权限与响应头
+    img_url = BASE + '/contracts/shots/%d/image' % shot_ids[0]
+    ri = s_admin.get(img_url, timeout=60)
+    check('CR05①', 'admin 可取原图（200 + image/png + no-store）',
+          ri.status_code == 200 and ri.headers.get('Content-Type', '').startswith('image/png')
+          and 'no-store' in (ri.headers.get('Cache-Control') or ''),
+          'code=%s ct=%s cc=%s' % (ri.status_code, ri.headers.get('Content-Type'),
+                                   ri.headers.get('Cache-Control')))
+    s_view, _ = C.login(BASE, 'viewer', '123456')
+    rv = s_view.get(img_url, timeout=60)
+    check('CR05①', 'viewer 不可查看截图原图（403）', rv.status_code == 403,
+          'code=%s' % rv.status_code)
+    ra = requests.get(img_url, timeout=60, allow_redirects=False)
+    check('CR05①', '未登录访问原图被重定向到登录页',
+          ra.status_code in (301, 302) and 'login' in ra.headers.get('Location', ''),
+          'code=%s loc=%s' % (ra.status_code, ra.headers.get('Location')))
+
+    # 确认建项目：比例/质保期写入项目，图片在项目详情可见
+    no = 'QA-SHOT-PROJ'
+    rc = confirm_ct(s_admin, ct, {
+        'contract_name': 'QA 截图项目', 'project_no': no,
+        'original_amount': '165000', 'additional_amount': '0', 'tax_rate': '13%',
+        'ratio_first': '40', 'ratio_progress': '50', 'ratio_acceptance': '8',
+        'ratio_warranty': '2', 'warranty_months': '36',
+        'confirmed_ok': '1'})
+    pid = q1(DB, 'SELECT id FROM projects WHERE project_no=?', (no,))
+    check('CR05①', '截图识别结果确认后新建项目成功', rc.status_code == 302 and pid,
+          'code=%s pid=%s' % (rc.status_code, pid))
+    if pid:
+        months = q1(DB, 'SELECT warranty_months FROM projects WHERE id=?', (pid,))
+        due = {row[0]: row[1] for row in q(
+            DB, 'SELECT node_type, due_amount FROM payment_nodes WHERE project_id=?',
+            (pid,))}
+        check('CR05①', '识别出的质保期写入项目且节点金额按识别比例生成',
+              months == 36 and abs(float(due.get('first') or 0) - 66000) < 0.02
+              and abs(float(due.get('warranty') or 0) - 3300) < 0.02,
+              'months=%s due=%s' % (months, due))
+        detail = s_admin.get(BASE + '/projects/%d' % pid, timeout=60).text
+        linked = q1(DB, 'SELECT COUNT(*) FROM contract_screenshots WHERE project_id=?', (pid,))
+        check('CR05①', '项目详情可直接看到合同截图（卡片 + 3 张缩略图）',
+              '合同截图' in detail and all(
+                  ('/contracts/shots/%d/image' % sid) in detail for sid in shot_ids)
+              and linked == 3, 'linked=%s' % linked)
+        # 验收后质保到期 = 验收日 + 36 个月
+        C.post(s_admin, BASE, '/projects/%d/acceptance' % pid,
+               {'acceptance_date': '2026-03-10'})
+        w = str(q1(DB, 'SELECT warranty_due_date FROM projects WHERE id=?', (pid,)))
+        check('CR05①', '项目质保到期按识别出的 36 个月推算（2026-03-10→2029-03-10）',
+              w == '2029-03-10', w)
+
+    # OCR 全失败兜底：①② 均识别不到时必须人工核对勾选，勾选后才能提交
+    r = shots_upload({'amount': ('blank1.png', BLANK_PNG),
+                      'payment': ('blank2.png', BLANK_PNG)})
+    ct_bad = q1(DB, 'SELECT id FROM contract_files ORDER BY id DESC LIMIT 1')
+    bad_status = [row[0] for row in q(
+        DB, 'SELECT ocr_status FROM contract_screenshots WHERE contract_id=?', (ct_bad,))]
+    page_bad = s_admin.get(BASE + '/contracts/%d/confirm' % ct_bad, timeout=60).text
+    check('CR05①', '①②均 OCR 失败时确认页提示人工对照原图填写',
+          all(v != 'ok' for v in bad_status) and '人工' in page_bad and '对照原图' in page_bad,
+          str(bad_status))
+    base_data = {'contract_name': 'QA 人工兜底', 'project_no': 'QA-SHOT-MANUAL',
+                 'original_amount': '1000', 'additional_amount': '0', 'tax_rate': '6%',
+                 'ratio_first': '30', 'ratio_progress': '52', 'ratio_acceptance': '15',
+                 'ratio_warranty': '3'}
+    r_no_manual = confirm_ct(s_admin, ct_bad, dict(base_data))
+    no_manual_pid = q1(DB, 'SELECT id FROM projects WHERE project_no=?',
+                       ('QA-SHOT-MANUAL',))
+    check('CR05①', '未勾选「人工录入已核对」时拒绝提交（不生成项目）',
+          r_no_manual.status_code == 200 and not no_manual_pid
+          and '人工' in r_no_manual.text, 'code=%s' % r_no_manual.status_code)
+    r_manual = confirm_ct(s_admin, ct_bad, dict(base_data, manual_confirm='1'))
+    manual_pid = q1(DB, 'SELECT id FROM projects WHERE project_no=?',
+                    ('QA-SHOT-MANUAL',))
+    check('CR05①', '勾选人工核对后可提交并生成项目（OCR 失败不阻断人工兜底）',
+          r_manual.status_code == 302 and manual_pid,
+          'code=%s pid=%s' % (r_manual.status_code, manual_pid))
+
+
+def _cr05_final_cases(s_admin):
+    """CR-05 最终版补充：② 质保期展开 / ③ 单号边界 / ⑤ 令牌过期与绑定 / ⑥ 两道上限 / ① 兜底与冲突。"""
+    import io
+
+    # ---------- ② 质保期：多档月份、月末对齐、非法值、编辑重算、导出 ----------
+    def warranty_due(pid):
+        return str(q1(DB, 'SELECT warranty_due_date FROM projects WHERE id=?', (pid,)))
+
+    def warranty_node_due(pid):
+        return str(q1(DB, "SELECT due_date FROM payment_nodes WHERE project_id=? "
+                               "AND node_type='warranty'", (pid,)))
+
+    for months, want in ((6, '2026-09-10'), (24, '2028-03-10'), (60, '2031-03-10')):
+        _, pw = create_project(s_admin, 'QA-WARR-%d' % months, 'QA质保%d月' % months,
+                               [('科目', '1000', '0')], warranty_months=months)
+        if pw:
+            C.post(s_admin, BASE, '/projects/%d/acceptance' % pw,
+                   {'acceptance_date': '2026-03-10'})
+            check('CR05②', '质保期 %d 个月：验收 2026-03-10 → 到期 %s（项目与质保金节点同源）'
+                  % (months, want),
+                  warranty_due(pw) == want and warranty_node_due(pw) == want,
+                  '项目=%s 节点=%s' % (warranty_due(pw), warranty_node_due(pw)))
+        else:
+            check('CR05②', '质保期 %d 个月项目创建成功' % months, False, '创建失败')
+
+    # 月末对齐：1/31 + 1 月 = 2/28（闰年 2028 → 2/29）
+    _, p1 = create_project(s_admin, 'QA-WARR-MEND', 'QA质保月末', [('科目', '1000', '0')],
+                           warranty_months=1)
+    _, p2 = create_project(s_admin, 'QA-WARR-LEAP', 'QA质保闰年', [('科目', '1000', '0')],
+                           warranty_months=1)
+    if p1 and p2:
+        C.post(s_admin, BASE, '/projects/%d/acceptance' % p1, {'acceptance_date': '2026-01-31'})
+        C.post(s_admin, BASE, '/projects/%d/acceptance' % p2, {'acceptance_date': '2028-01-31'})
+        check('CR05②', '质保期 1 个月月末对齐：2026-01-31→2026-02-28、2028-01-31→2028-02-29',
+              warranty_due(p1) == '2026-02-28' and warranty_due(p2) == '2028-02-29',
+              '%s / %s' % (warranty_due(p1), warranty_due(p2)))
+
+    # 非法值：0 / -1 / 601 / abc / 2.5 均拒绝且不建项目
+    bad_ok = True
+    details = []
+    for bad in ('0', '-1', '601', 'abc', '2.5'):
+        no = 'QA-WARR-BAD'
+        r = C.post(s_admin, BASE, '/projects/new',
+                   dict(C.RATIO_FORM, project_no=no, name='QA非法质保',
+                        item_name='科目', original_amount='1000', warranty_months=bad))
+        created = q1(DB, 'SELECT id FROM projects WHERE project_no=?', (no,))
+        details.append('%s:code=%s,pid=%s' % (bad, r.status_code, created))
+        if r.status_code != 200 or created:
+            bad_ok = False
+    check('CR05②', '质保期非法值（0/-1/601/abc/2.5）均被拒且不建项目', bad_ok, '; '.join(details))
+
+    # 编辑页修改质保期 → 到期日与质保金节点日期重算 + 审计体现
+    _, pe = create_project(s_admin, 'QA-WARR-EDIT', 'QA质保编辑', [('科目', '1000', '0')],
+                           warranty_months=36)
+    if pe:
+        C.post(s_admin, BASE, '/projects/%d/acceptance' % pe, {'acceptance_date': '2026-03-10'})
+        before_due = warranty_due(pe)
+        status = q1(DB, 'SELECT status FROM projects WHERE id=?', (pe,))
+        C.post(s_admin, BASE, '/projects/%d/edit' % pe,
+               {'name': 'QA质保编辑', 'status': status, 'acceptance_date': '2026-03-10',
+                'warranty_months': '24'})
+        after_due = warranty_due(pe)
+        audit_after = q1(DB, "SELECT after_json FROM audit_logs WHERE action='project.edit' "
+                             "AND object_id=? ORDER BY id DESC LIMIT 1", (pe,)) or ''
+        check('CR05②', '编辑质保期 36→24 个月：到期日与质保金节点重算（2029-03-10→2027-03-10）',
+              before_due == '2029-03-10' and after_due == '2027-03-10'
+              and warranty_node_due(pe) == '2027-03-10',
+              '%s→%s 节点=%s' % (before_due, after_due, warranty_node_due(pe)))
+        check('CR05②', '编辑质保期写入审计（before/after 含 warranty_months）',
+              'warranty_months' in audit_after and '"24"' in audit_after,
+              audit_after[:160])
+
+    # 空质保期 + 已登记验收：不推算、不出现 36 默认，页面提示补填
+    _, pn = create_project(s_admin, 'QA-WARR-EMPTY2', 'QA未填质保2', [('科目', '1000', '0')])
+    if pn:
+        C.post(s_admin, BASE, '/projects/%d/acceptance' % pn, {'acceptance_date': '2026-03-10'})
+        page = s_admin.get(BASE + '/projects/%d' % pn, timeout=60).text
+        check('CR05②', '空质保期已登记验收：到期为空且页面提示补填（不写死 36 个月）',
+              warranty_due(pn) == 'None' and ('补填' in page or '未填写' in page or '未填' in page),
+              'due=%s 提示=%s' % (warranty_due(pn),
+                                  '有' if ('补填' in page or '未填写' in page) else '无'))
+
+    # 合同变更不改日期：warranty_months / warranty_due_date / 质保金节点 due_date 均不变
+    _, pc = create_project(s_admin, 'QA-WARR-CHG', 'QA质保+变更', [('科目', '100000', '0')],
+                           warranty_months=36)
+    if pc:
+        C.post(s_admin, BASE, '/projects/%d/acceptance' % pc, {'acceptance_date': '2026-03-10'})
+        d0, n0 = warranty_due(pc), warranty_node_due(pc)
+        iid = item_ids(pc)[0]
+        r1, r2 = contract_change(s_admin, pc, {iid: '120000'})
+        d1, n1 = warranty_due(pc), warranty_node_due(pc)
+        chg_after = q1(DB, "SELECT after_json FROM audit_logs "
+                           "WHERE action='project.contract_change' AND object_id=? "
+                           "ORDER BY id DESC LIMIT 1", (pc,)) or ''
+        check('CR05②', '合同变更不改质保期与日期（到期日/质保金节点日期不变）',
+              r2 is not None and r2.status_code == 302 and d0 == d1 and n0 == n1,
+              'r2=%s 到期 %s→%s 节点 %s→%s' % (getattr(r2, 'status_code', None), d0, d1, n0, n1))
+        check('CR05②', '合同变更审计保留质保期口径（warranty_months 未变）',
+              'warranty_months' in chg_after and 'due_dates_untouched' in chg_after,
+              chg_after[:160])
+
+    # 导出含「质保期（月）」列
+    try:
+        from openpyxl import load_workbook
+        resp = s_admin.get(BASE + '/reports/export.xlsx', timeout=120)
+        if resp.status_code != 200:
+            resp = s_admin.get(BASE + '/reports/export', timeout=120)
+        wb = load_workbook(io.BytesIO(resp.content))
+        texts = []
+        for ws in wb.worksheets:
+            for row in ws.iter_rows(values_only=True):
+                texts.extend(str(v) for v in row if v is not None)
+        check('CR05②', '导出 workbook 含「质保期（月）」列', any('质保期' in t for t in texts),
+              'sheets=%s' % wb.sheetnames)
+    except Exception as exc:  # noqa: BLE001
+        check('CR05②', '导出 workbook 含「质保期（月）」列', False, repr(exc))
+
+    # ---------- ③ 单号：允许中文（Q3）、64 字符边界 ----------
+    _, pq = create_project(s_admin, 'QA-APPLY-CN', 'QA单号中文', [('科目', '1000', '0')])
+    if pq:
+        nid = node_ids(pq, 'first')[0]
+        tok = C.node_tokens(s_admin, BASE, pq).get((nid, 'apply'))
+        C.post(s_admin, BASE, '/nodes/%d/update' % nid,
+               {'action': 'apply', 'apply_amount': '10', 'apply_no': '申请单-中文01',
+                'confirm_token': tok}, allow_redirects=True)
+        stored = q1(DB, 'SELECT apply_no FROM payment_applications ORDER BY id DESC LIMIT 1')
+        check('CR05③', '申请单号允许中文（仅长度+唯一，不限制字符集）',
+              stored == '申请单-中文01', 'stored=%r' % (stored,), xfail='CR05-③CN')
+        tok64 = C.node_tokens(s_admin, BASE, pq).get((nid, 'apply'))
+        C.post(s_admin, BASE, '/nodes/%d/update' % nid,
+               {'action': 'apply', 'apply_amount': '10', 'apply_no': 'A' * 64,
+                'confirm_token': tok64}, allow_redirects=True)
+        stored64 = q1(DB, 'SELECT apply_no FROM payment_applications ORDER BY id DESC LIMIT 1')
+        check('CR05③', '申请单号 64 字符（边界）可提交', stored64 == 'A' * 64,
+              'len=%s' % (len(stored64 or ''),))
+
+    # ---------- ⑤ 令牌：节点/动作不匹配不消费、过期拒绝、已提交提示、消费记录 ----------
+    _, pt = create_project(s_admin, 'QA-TOK-FIN', 'QA令牌最终', [('科目', '10000', '0')])
+    if pt:
+        url = BASE + '/projects/%d' % pt
+        nid = node_ids(pt, 'first')[0]
+        toks = C.node_tokens(s_admin, BASE, pt)
+        apply_tok = toks.get((nid, 'apply'))
+        before = _node_vals(nid)
+        r = C.post(s_admin, BASE, '/nodes/%d/update' % nid,
+                   {'action': 'pay', 'paid_amount': '10', 'confirm_token': apply_tok},
+                   allow_redirects=True)
+        check('CR05⑤', '动作不匹配（apply 令牌用于付款）被拒且库不变',
+              _node_vals(nid)['paid'] == d2(0) and '失效' in r.text,
+              'paid=%s' % _node_vals(nid)['paid'])
+        C.post(s_admin, BASE, '/nodes/%d/update' % nid,
+               {'action': 'apply', 'apply_amount': '10', 'apply_no': C.next_apply_no('QA-TOK'),
+                'confirm_token': apply_tok}, allow_redirects=True)
+        check('CR05⑤', '动作不匹配被拒后原令牌仍可用（校验失败不消费）',
+              _node_vals(nid)['applied'] == before['applied'] + d2(10),
+              'applied=%s' % _node_vals(nid)['applied'])
+        replay_tok = C.node_tokens(s_admin, BASE, pt).get((nid, 'pay'))
+        C.post(s_admin, BASE, '/nodes/%d/update' % nid,
+               {'action': 'pay', 'paid_amount': '10', 'confirm_token': replay_tok},
+               allow_redirects=True)
+        rr = C.post(s_admin, BASE, '/nodes/%d/update' % nid,
+                    {'action': 'pay', 'paid_amount': '10', 'confirm_token': replay_tok},
+                    allow_redirects=True)
+        check('CR05⑤', '同一令牌二次提交被拒且提示「已提交」（金额只加一次）',
+              _node_vals(nid)['paid'] == d2(10) and '已提交' in rr.text,
+              'paid=%s 提示=%s' % (_node_vals(nid)['paid'], '有' if '已提交' in rr.text else '无'))
+        cnt = q1(DB, 'SELECT COUNT(*) FROM node_action_tokens')
+        check('CR05⑤', '已消费令牌登记到 node_action_tokens（jti 防重放表有记录）', cnt >= 2,
+              'rows=%s' % cnt)
+
+        # 过期：注入 1 秒 TTL（Chief 口径：配置项 NODE_TOKEN_TTL_MINUTES，默认 30 分钟；不改系统时间）
+        import time as _time
+        from app import routes as R
+        key = 'NODE_TOKEN_TTL_MINUTES'
+        old_cfg = APP.config.get(key, '<unset>')
+        old_ttl = getattr(R, 'NODE_TOKEN_TTL', None)
+        default_ttl = APP.config.get(key, '<unset>')
+        check('CR05⑤', '令牌 TTL 走配置 NODE_TOKEN_TTL_MINUTES 且默认 30 分钟',
+              default_ttl not in ('<unset>', None) and abs(float(default_ttl) - 30) < 1e-6,
+              'NODE_TOKEN_TTL_MINUTES=%r' % (default_ttl,))
+        expired_rejected, rexp = False, None
+        try:
+            APP.config[key] = 1.0 / 60.0  # 1 秒
+            if old_ttl is not None:
+                R.NODE_TOKEN_TTL = 1
+            html = s_admin.get(url, timeout=60).text
+            exp_tok = dict(((int(n), a), t)
+                           for n, a, t in C.NODE_FORM_RE.findall(html)).get((nid, 'apply'))
+            before2 = _node_vals(nid)['applied']
+            _time.sleep(1.4)
+            rexp = C.post(s_admin, BASE, '/nodes/%d/update' % nid,
+                          {'action': 'apply', 'apply_amount': '10',
+                           'apply_no': C.next_apply_no('QA-EXP'), 'confirm_token': exp_tok},
+                          allow_redirects=True)
+            expired_rejected = (_node_vals(nid)['applied'] == before2
+                                and '过期' in (rexp.text or ''))
+        finally:
+            if old_cfg == '<unset>':
+                APP.config.pop(key, None)
+            else:
+                APP.config[key] = old_cfg
+            if old_ttl is not None:
+                R.NODE_TOKEN_TTL = old_ttl
+        check('CR05⑤', '过期令牌被拒（1 秒 TTL 注入后提示过期、库不变）', expired_rejected,
+              'applied=%s 提示=%s' % (_node_vals(nid)['applied'],
+                                      '过期' if '过期' in (rexp.text if rexp else '') else '无'))
+        new_tok = C.node_tokens(s_admin, BASE, pt).get((nid, 'apply'))
+        before3 = _node_vals(nid)['applied']
+        C.post(s_admin, BASE, '/nodes/%d/update' % nid,
+               {'action': 'apply', 'apply_amount': '10', 'apply_no': C.next_apply_no('QA-OK'),
+                'confirm_token': new_tok}, allow_redirects=True)
+        check('CR05⑤', 'TTL 恢复后重新打开详情页签发的新令牌可正常提交',
+              _node_vals(nid)['applied'] == before3 + d2(10),
+              'applied=%s' % _node_vals(nid)['applied'])
+
+    # ---------- ⑥ 申请单付款同时受节点应付上限约束 ----------
+    _, ps = create_project(s_admin, 'QA-APP-CAP', 'QA申请单上限', [('科目', '1000', '0')])
+    if ps:
+        nid = node_ids(ps, 'first')[0]  # 应付 300
+        tok = C.node_tokens(s_admin, BASE, ps).get((nid, 'apply'))
+        C.post(s_admin, BASE, '/nodes/%d/update' % nid,
+               {'action': 'apply', 'apply_amount': '200',
+                'apply_no': C.next_apply_no('QA-CAP'), 'confirm_token': tok},
+               allow_redirects=True)
+        app_id = q1(DB, 'SELECT id FROM payment_applications WHERE node_id=? '
+                        'ORDER BY id DESC LIMIT 1', (nid,))
+        tok = C.node_tokens(s_admin, BASE, ps).get((nid, 'pay'))
+        C.post(s_admin, BASE, '/nodes/%d/update' % nid,
+               {'action': 'pay', 'paid_amount': '250', 'confirm_token': tok},
+               allow_redirects=True)
+        tok = C.node_tokens(s_admin, BASE, ps).get((nid, 'pay'))
+        rc = s_admin.post(BASE + '/applications/%d/payments' % app_id,
+                          data={'paid_amount': '100', 'confirm_token': tok},
+                          allow_redirects=False, timeout=60)
+        paid = _node_vals(nid)['paid']
+        check('CR05⑥', '申请单剩余可付足够但超节点应付时仍被拒（节点口径优先）',
+              paid == d2(250) and rc.status_code in (302, 400),
+              'paid=%s code=%s' % (paid, rc.status_code))
+        # 导出申请单列：已付金额/付款笔数、无「说明」
+        try:
+            from openpyxl import load_workbook
+            resp = s_admin.get(BASE + '/reports/export.xlsx', timeout=120)
+            if resp.status_code != 200:
+                resp = s_admin.get(BASE + '/reports/export', timeout=120)
+            wb = load_workbook(io.BytesIO(resp.content))
+            rows = [list(r) for ws in wb.worksheets for r in ws.iter_rows(values_only=True)]
+            app_head = next((r for r in rows if any(v == '申请单号' for v in r)), None)
+            head = [str(v) for v in (app_head or []) if v is not None]
+            check('CR05⑥', '导出申请单列含已付金额/付款笔数且不含「说明」',
+                  '已付金额' in head and '付款笔数' in head and '说明' not in head, str(head))
+        except Exception as exc:  # noqa: BLE001
+            check('CR05⑥', '导出申请单列含已付金额/付款笔数且不含「说明」', False, repr(exc))
+
+    # ---------- ① 旧单文件入口兜底、冲突以截图①为准、路径穿越、重新识别、③缺失手填 ----------
+    r_old, ct_old = upload(s_admin, SAMPLE_TXT, 'sample.txt')
+    check('CR05①', '旧单文件上传入口保留（兜底）：txt 合同仍可进入确认页',
+          r_old.status_code == 302 and ct_old, 'code=%s ct=%s'
+          % (r_old.status_code, ct_old))
+    if ct_old:
+        rc_old = confirm_ct(s_admin, ct_old, {
+            'contract_name': 'QA旧入口项目', 'project_no': 'QA-CT-OLD',
+            'original_amount': '165000', 'additional_amount': '0', 'tax_rate': '6%',
+            'ratio_first': '30', 'ratio_progress': '52', 'ratio_acceptance': '15',
+            'ratio_warranty': '3'})
+        old_pid = q1(DB, 'SELECT id FROM projects WHERE project_no=?', ('QA-CT-OLD',))
+        check('CR05①', '旧单文件入口确认后正常建项目（兜底路径可用）',
+              rc_old.status_code == 302 and old_pid, 'code=%s pid=%s'
+              % (rc_old.status_code, old_pid))
+
+    # 截图①②冲突：① 金额与② 文本里的金额不一致，以 ① 为准
+    def _png(lines, solid=False):
+        from PIL import Image, ImageDraw, ImageFont
+        font = None
+        for fp in (r'C:\Windows\Fonts\simhei.ttf', r'C:\Windows\Fonts\msyh.ttc'):
+            if os.path.exists(fp):
+                try:
+                    font = ImageFont.truetype(fp, 46)
+                    break
+                except OSError:
+                    pass
+        im = Image.new('RGB', (1500, 620), 'white' if not solid else (250, 250, 250))
+        draw = ImageDraw.Draw(im)
+        y = 40
+        for text in lines:
+            draw.text((50, y), text, font=font, fill='black')
+            y += 92
+        buf = io.BytesIO()
+        im.save(buf, 'PNG')
+        return buf.getvalue()
+
+    amt_one = _png(['合同总金额：165000.00 元', '税率：13%'])
+    pay_conflict = _png(['合同总金额：999.00 元', '首付款 30%', '进度款 52%',
+                         '验收款 15%', '质保金 3%'])
+    r = C.post(s_admin, BASE, '/contracts/shots',
+               files={'shot_amount': ('a.png', amt_one, 'image/png'),
+                      'shot_payment': ('p.png', pay_conflict, 'image/png')})
+    ct_c = q1(DB, 'SELECT id FROM contract_files ORDER BY id DESC LIMIT 1')
+    import json as _json
+    res_c = _json.loads(q1(DB, 'SELECT result_json FROM contract_files WHERE id=?',
+                           (ct_c,)) or '{}')
+    check('CR05①', '金额冲突以截图①为准（①=165000，②里的 999 不覆盖）',
+          abs(float(res_c.get('contract_amount') or 0) - 165000) < 0.01,
+          'amount=%s' % res_c.get('contract_amount'))
+    shots_c = q(DB, 'SELECT id, stored_path FROM contract_screenshots WHERE contract_id=? '
+                    'ORDER BY id', (ct_c,))
+    check('CR05①', '截图落盘路径在 uploads/shots/<contract_id>/ 内（文件名穿越被消除）',
+          all('/shots/%d/' % ct_c in row[1] and '..' not in row[1] for row in shots_c),
+          str([row[1] for row in shots_c]))
+    rr = C.post(s_admin, BASE, '/contracts/%d/rerun' % ct_c, {})
+    shots_after = q1(DB, 'SELECT COUNT(*) FROM contract_screenshots WHERE contract_id=?', (ct_c,))
+    rerun_audit = q1(DB, "SELECT COUNT(*) FROM audit_logs WHERE action='contract.rerun' "
+                         "AND object_id=?", (ct_c,))
+    check('CR05①', '重新识别（rerun）可用：截图数不变、写 contract.rerun 审计',
+          rr.status_code == 302 and shots_after == 2 and (rerun_audit or 0) >= 1,
+          'code=%s shots=%s audit=%s' % (rr.status_code, shots_after, rerun_audit))
+    page_c = s_admin.get(BASE + '/contracts/%d/confirm' % ct_c, timeout=60).text
+    check('CR05①', '未上传③时确认页质保期字段留空可手填（提示未识别/手工填写）',
+          'name="warranty_months"' in page_c
+          and any(k in page_c for k in ('未识别', '手工填写', '手填')),
+          '字段=%s' % ('有' if 'name="warranty_months"' in page_c else '无'))
+
+
 def run(server):
     global DB, BASE, APP, UPLOAD_DIR
     DB, BASE, APP, UPLOAD_DIR = server.db_path, server.base, server.app, server.upload_dir
@@ -1957,5 +2473,7 @@ def run(server):
     section('########## 11h. 令牌与刷新（需求⑤） ##########', lambda: _stale_token_cases(s_admin))
     section('########## 11h-b. 令牌语义（CR-05 §8.4） ##########', lambda: _token_semantics_cases(s_admin))
     section('########## 11i. 单号·多笔付款·字段改名（CR-05 ③④⑥） ##########', lambda: _cr05_cases(s_admin))
+    section('########## 11j. 按模板上传关键信息截图（CR-05 需求①） ##########', lambda: _shot_cases(s_admin))
+    section('########## 11k. CR-05 最终补充（②质保/③单号/⑤令牌/⑥上限/①兜底） ##########', lambda: _cr05_final_cases(s_admin))
     section('########## 12. 导出（批次 6a） ##########', lambda: _batch6_export_import(s_admin))
     section('########## 12. 审计补充（批次 3 补测，末项会删临时库 audit_logs） ##########', lambda: _audit_extras(s_admin))

@@ -301,7 +301,8 @@ def _case_schema_upgrade(tmp):
              ('project_items', 'updated_at'), ('project_items', 'updated_by'),
              ('payment_nodes', 'updated_at'), ('payment_nodes', 'updated_by'),
              ('payment_nodes', 'applied_amount'), ('payment_nodes', 'change_note'),
-             ('contract_files', 'confirmed_by'), ('contract_files', 'confirmed_at')]
+             ('contract_files', 'confirmed_by'), ('contract_files', 'confirmed_at'),
+             ('projects', 'warranty_months'), ('contract_files', 'source')]
     dropped = 0
     for table, col in drops:
         try:
@@ -309,7 +310,7 @@ def _case_schema_upgrade(tmp):
             dropped += 1
         except sqlite3.Error:
             pass
-    for tbl in ('audit_logs', 'user_sessions', 'payment_invoices'):
+    for tbl in ('audit_logs', 'user_sessions', 'payment_invoices', 'contract_screenshots'):
         try:
             conn.execute('DROP TABLE %s' % tbl)
         except sqlite3.Error:
@@ -335,6 +336,15 @@ def _case_schema_upgrade(tmp):
               'applied_amount' in nodes_cols and 'change_note' in nodes_cols
               and 'payment_invoices' in tables,
               'nodes=%s tables=%s' % (sorted(nodes_cols), sorted(tables)))
+        conn = sqlite3.connect(dbp)
+        proj_cols = {r[1] for r in conn.execute('PRAGMA table_info(projects)')}
+        cf_cols = {r[1] for r in conn.execute('PRAGMA table_info(contract_files)')}
+        conn.close()
+        check('升级', 'CR-05 旧库自动补 warranty_months / contract_files.source / 截图表',
+              'warranty_months' in proj_cols and 'source' in cf_cols
+              and 'contract_screenshots' in tables,
+              'projects=%s contract_files=%s tables=%s'
+              % (sorted(proj_cols), sorted(cf_cols), sorted(tables)))
         _dispose(app)
         try:
             app2 = make_app(dbp)
@@ -346,6 +356,93 @@ def _case_schema_upgrade(tmp):
     finally:
         pass
 
+
+
+def _run_migrate_cr05(data_dir, extra=()):
+    env = os.environ.copy()
+    for k in ('DATA_DIR', 'SECRET_KEY', 'PAYMENT_CONFIG_FILE', 'MAX_UPLOAD_MB'):
+        env.pop(k, None)
+    env['PYTHONIOENCODING'] = 'utf-8'
+    env['PYTHONUTF8'] = '1'
+    r = subprocess.run([sys.executable, 'scripts/migrate_cr05.py', '--data-dir', data_dir] + list(extra),
+                       cwd=PROJECT_ROOT, env=env,
+                       capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=240)
+    return r.returncode, (r.stdout or '') + (r.stderr or '')
+
+
+def _make_old_cr05_db(dirpath):
+    """造一个 CR-05 之前的旧库：有项目，但没有 warranty_months 列和截图任务表。"""
+    os.makedirs(dirpath, exist_ok=True)
+    dbp = os.path.join(dirpath, 'payment_progress.db')
+    seed_db(dbp)
+    conn = sqlite3.connect(dbp)
+    try:
+        try:
+            conn.execute('ALTER TABLE projects DROP COLUMN warranty_months')
+        except sqlite3.Error:
+            pass
+        try:
+            conn.execute('DROP TABLE contract_screenshots')
+        except sqlite3.Error:
+            pass
+        conn.commit()
+    finally:
+        conn.close()
+    return dbp
+
+
+def _case_cr05_migration(tmp):
+    print('\n########## 7b. CR-05 数据迁移脚本（结构升级 + 质保期回填，批次 CR-05） ##########')
+    data_dir = os.path.join(tmp, 'cr05_mig')
+    dbp = _make_old_cr05_db(data_dir)
+    projects_before = q1(dbp, 'SELECT COUNT(*) FROM projects')
+    cols_before = {r[1] for r in sqlite3.connect(dbp).execute('PRAGMA table_info(projects)')}
+
+    # 1) dry-run 不改库
+    code, out = _run_migrate_cr05(data_dir, ('--dry-run',))
+    cols_after_dry = {r[1] for r in sqlite3.connect(dbp).execute('PRAGMA table_info(projects)')}
+    check('迁移', 'migrate_cr05 --dry-run 只报告不改库',
+          code == 0 and 'dry-run' in out and cols_after_dry == cols_before,
+          'exit=%s warranty_months=%s' % (code, 'warranty_months' in cols_after_dry))
+
+    # 2) 正式迁移：补列、建表、回填 36 个月
+    code, out = _run_migrate_cr05(data_dir, ('--no-backup',))
+    cols = {r[1] for r in sqlite3.connect(dbp).execute('PRAGMA table_info(projects)')}
+    tables = {r[0] for r in sqlite3.connect(dbp).execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    nulls = q1(dbp, 'SELECT COUNT(*) FROM projects WHERE warranty_months IS NULL')
+    fixed = q1(dbp, 'SELECT COUNT(*) FROM projects WHERE warranty_months=36')
+    check('迁移', 'migrate_cr05 补齐 warranty_months / 建 contract_screenshots 表',
+          code == 0 and 'warranty_months' in cols and 'contract_screenshots' in tables,
+          'exit=%s cols=%s' % (code, 'warranty_months' in cols))
+    check('迁移', 'migrate_cr05 把历史项目质保期回填为 36 个月',
+          nulls == 0 and fixed == projects_before and projects_before > 0,
+          'nulls=%s fixed=%s total=%s' % (nulls, fixed, projects_before))
+
+    # 3) 幂等：再跑一次不重复改、不报错
+    code2, out2 = _run_migrate_cr05(data_dir, ('--no-backup',))
+    nulls2 = q1(dbp, 'SELECT COUNT(*) FROM projects WHERE warranty_months IS NULL')
+    check('迁移', 'migrate_cr05 可重复执行（幂等，第二次回填 0 个）',
+          code2 == 0 and nulls2 == 0 and '回填] warranty_months=36：0 个项目' in out2,
+          'exit=%s nulls=%s' % (code2, nulls2))
+
+    # 4) 默认备份路径生成 .bak 且通过完整性校验
+    data_dir2 = os.path.join(tmp, 'cr05_mig_bak')
+    _make_old_cr05_db(data_dir2)
+    code3, out3 = _run_migrate_cr05(data_dir2, ())
+    bak_dir = os.path.join(tmp, 'backups', 'pre-cr05')
+    baks = [n for n in os.listdir(bak_dir)] if os.path.isdir(bak_dir) else []
+    ok_bak = code3 == 0 and '完整性校验通过' in out3 and len(baks) == 1
+    if ok_bak:
+        conn = sqlite3.connect(os.path.join(bak_dir, baks[0]))
+        try:
+            bak_ok = conn.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+        finally:
+            conn.close()
+    else:
+        bak_ok = False
+    check('迁移', 'migrate_cr05 默认先备份（.bak + 完整性校验通过）', ok_bak and bak_ok,
+          'exit=%s baks=%s' % (code3, baks))
 
 
 def _subprocess_app(tmp, env_extra, code='from app import create_app; a = create_app(); print(a.config["MAX_CONTENT_LENGTH"])', pop=('SECRET_KEY', 'PAYMENT_CONFIG_FILE', 'MAX_UPLOAD_MB', 'DATA_DIR')):
@@ -495,6 +592,7 @@ def run():
         _case_initdb()
         _case_schema_upgrade(tmp)
         _case_cr04_draft_db(tmp)
+        _case_cr05_migration(tmp)
         _case_config_and_health(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
