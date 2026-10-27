@@ -2179,12 +2179,12 @@ def _cr05_final_cases(s_admin):
         after_due = warranty_due(pe)
         audit_after = q1(DB, "SELECT after_json FROM audit_logs WHERE action='project.edit' "
                              "AND object_id=? ORDER BY id DESC LIMIT 1", (pe,)) or ''
-        check('CR05②', '编辑质保期 36→24 个月：到期日与质保金节点重算（2029-03-10→2027-03-10）',
-              before_due == '2029-03-10' and after_due == '2027-03-10'
-              and warranty_node_due(pe) == '2027-03-10',
+        check('CR05②', '编辑质保期 36→24 个月：到期日与质保金节点重算（2029-03-10→2028-03-10）',
+              before_due == '2029-03-10' and after_due == '2028-03-10'
+              and warranty_node_due(pe) == '2028-03-10',
               '%s→%s 节点=%s' % (before_due, after_due, warranty_node_due(pe)))
         check('CR05②', '编辑质保期写入审计（before/after 含 warranty_months）',
-              'warranty_months' in audit_after and '"24"' in audit_after,
+              '"warranty_months":24' in audit_after.replace(' ', ''),
               audit_after[:160])
 
     # 空质保期 + 已登记验收：不推算、不出现 36 默认，页面提示补填
@@ -2216,12 +2216,14 @@ def _cr05_final_cases(s_admin):
               'warranty_months' in chg_after and 'due_dates_untouched' in chg_after,
               chg_after[:160])
 
-    # 导出含「质保期（月）」列
+    # 导出含「质保期（月）」列（项目明细导出；报表总览不含单项目字段）
     try:
         from openpyxl import load_workbook
-        resp = s_admin.get(BASE + '/reports/export.xlsx', timeout=120)
-        if resp.status_code != 200:
-            resp = s_admin.get(BASE + '/reports/export', timeout=120)
+        pid_exp = pe or pc or pn
+        resp = s_admin.get(BASE + '/projects/%d/export.xlsx' % pid_exp, timeout=120) \
+            if pid_exp else None
+        if resp is None or resp.status_code != 200:
+            resp = s_admin.get(BASE + '/reports/export.xlsx', timeout=120)
         wb = load_workbook(io.BytesIO(resp.content))
         texts = []
         for ws in wb.worksheets:

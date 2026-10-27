@@ -224,11 +224,12 @@ def _inject_apply_no(data):
     return data
 
 
-def post(sess, base, path, data=None, files=None):
+def post(sess, base, path, data=None, files=None, **kw):
     data = _inject_apply_no(data)
     data = _inject_node_token(sess, base, path, data)
-    return sess.post(base + path, data=data, files=files,
-                     allow_redirects=False, timeout=120)
+    kw.setdefault('allow_redirects', False)
+    kw.setdefault('timeout', 120)
+    return sess.post(base + path, data=data, files=files, **kw)
 
 
 #: 浏览器单 Cookie 上限（Werkzeug 超过 4093 字节即告警，浏览器会静默丢弃）
