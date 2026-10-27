@@ -55,12 +55,14 @@ def contract_change(sess, pid, totals, confirm=True):
     return r1, C.post(sess, BASE, '/projects/%d/contract-change' % pid, data)
 
 
-def create_project(sess, no, name, items, remark='', ratios=None):
-    """新建项目（CR-04：4 个节点比例必填、无默认值）。"""
+def create_project(sess, no, name, items, remark='', ratios=None, warranty_months=None):
+    """新建项目（CR-04：4 个节点比例必填、无默认值；CR-05：质保期按月可配置）。"""
     data = {'project_no': no, 'name': name, 'remark': remark,
             'item_name': [i[0] for i in items],
             'tax_rate': [i[3] if len(i) > 3 else '6%' for i in items],
             'original_amount': [i[1] for i in items]}
+    if warranty_months is not None:
+        data['warranty_months'] = str(warranty_months)
     data.update(ratios or C.RATIO_FORM)
     r = C.post(sess, BASE, '/projects/new', data)
     loc = r.headers.get('Location', '')
@@ -488,14 +490,29 @@ def _data_accuracy(s_admin):
     neg_due = q1(DB, "SELECT due_amount FROM payment_nodes WHERE project_id=? AND node_type='first'", (pid_neg,)) if pid_neg else None
     check('数据', '项目新建应拒绝负数原金额', pid_neg is None or float(neg_due or 0) >= 0,
           '生成负数应付=%s' % neg_due)
-    # 质保 1095 天跨闰年
-    _, pid_w = create_project(s_admin, 'QA-WARRANTY', 'QA质保日期', [('科目', '1000', '0')])
+    # 质保期按自然月可配置（CR-05 需求②：不写死 36 个月、不按 1095 天）
+    _, pid_w = create_project(s_admin, 'QA-WARRANTY', 'QA质保日期', [('科目', '1000', '0')],
+                              warranty_months=36)
     C.post(s_admin, BASE, '/projects/%d/acceptance' % pid_w, {'acceptance_date': '2024-02-29'})
     w = str(q1(DB, 'SELECT warranty_due_date FROM projects WHERE id=?', (pid_w,)))
-    check('数据', '质保到期=验收+1095 天（2024-02-29→2027-02-28）', w == '2027-02-28', w)
+    check('数据', '质保到期=验收+36 自然月并钳制月末（2024-02-29→2027-02-28）',
+          w == '2027-02-28', w)
     C.post(s_admin, BASE, '/projects/%d/acceptance' % pid_w, {'acceptance_date': '2026-03-10'})
     w = str(q1(DB, 'SELECT warranty_due_date FROM projects WHERE id=?', (pid_w,)))
-    check('数据', '质保到期=验收+1095 天（2026-03-10→2029-03-09）', w == '2029-03-09', w)
+    check('数据', '质保到期按自然月而非固定天数（2026-03-10→2029-03-10）',
+          w == '2029-03-10', w)
+    _, pid_w12 = create_project(s_admin, 'QA-WARRANTY12', 'QA质保12月', [('科目', '1000', '0')],
+                                warranty_months=12)
+    C.post(s_admin, BASE, '/projects/%d/acceptance' % pid_w12, {'acceptance_date': '2026-03-10'})
+    w = str(q1(DB, 'SELECT warranty_due_date FROM projects WHERE id=?', (pid_w12,)))
+    check('数据', '质保期可配置（12 个月：2026-03-10→2027-03-10）', w == '2027-03-10', w)
+    _, pid_wnone = create_project(s_admin, 'QA-WARRANTYNONE', 'QA未填质保', [('科目', '1000', '0')])
+    C.post(s_admin, BASE, '/projects/%d/acceptance' % pid_wnone, {'acceptance_date': '2026-03-10'})
+    w = q1(DB, 'SELECT warranty_due_date FROM projects WHERE id=?', (pid_wnone,))
+    wd = q1(DB, "SELECT due_date FROM payment_nodes WHERE project_id=? AND node_type='warranty'",
+            (pid_wnone,))
+    check('数据', '未填质保期不推算、不套默认 36 个月（到期日与质保金日期均为空）',
+          w is None and wd is None, '项目到期=%s 质保金due=%s' % (w, wd))
 
 
 def _contracts(s_admin, ct1):
