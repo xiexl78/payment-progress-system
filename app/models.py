@@ -227,6 +227,7 @@ class PaymentApplication(db.Model):
     apply_amount = db.Column(db.Numeric(14, 2), nullable=False, default=0)
     invoice_amount = db.Column(db.Numeric(14, 2), nullable=False, default=0)
     invoice_no = db.Column(db.String(128), nullable=True)
+    #: 已废弃（CR-05 需求③：说明字段取消）；列保留以兼容历史数据与回滚，代码不再读写。
     description = db.Column(db.Text, nullable=True)
     status = db.Column(db.String(16), nullable=False, default='未开票已申请')  # 未开票已申请/已申请/已付款
     applicant_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
@@ -240,7 +241,7 @@ class PaymentApplication(db.Model):
             'id': self.id, 'node_id': self.node_id,
             'apply_no': self.apply_no, 'apply_amount': float(self.apply_amount or 0),
             'invoice_amount': float(self.invoice_amount or 0), 'invoice_no': self.invoice_no,
-            'description': self.description, 'status': self.status,
+            'status': self.status,
             'applicant_name': self.applicant_name,
             'apply_time': self.apply_time.strftime('%Y-%m-%d %H:%M') if self.apply_time else None,
         }

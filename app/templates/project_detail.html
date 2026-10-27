@@ -192,8 +192,8 @@
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <input type="hidden" name="action" value="apply">
                     <input type="hidden" name="confirm_token" value="{{ node_tokens[n.id]['apply'] }}">
+                    <input type="text" name="apply_no" class="small" style="width:132px;" placeholder="单号 *" maxlength="64" required title="付款申请单号必填，≤64 字符（字母/数字/-/_//）">
                     <input type="number" name="apply_amount" class="small" step="0.01" min="0.01" style="width:92px;" placeholder="申请额">
-                    <input type="text" name="description" class="small" style="width:90px;" placeholder="说明">
                     <button type="submit" class="btn btn-outline btn-sm">申请</button>
                   </form>
                   <form method="post" action="{{ url_for('main.node_update', node_id=n.id) }}" class="row" style="gap:4px;">

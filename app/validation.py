@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
 
+import re
+
 from .money import CENT, MAX_MONEY, ZERO, allocate_tail, mul_ratio, parse_money, sum_money
 
 __all__ = [
@@ -30,6 +32,7 @@ __all__ = [
     'validate_project_ratios',
     'validate_contract_submission',
     'validate_node_action',
+    'validate_apply_no',
     'validate_contract_change_items',
     'node_base_amount',
 ]
@@ -395,6 +398,25 @@ def validate_node_action(node, action, form):
                                   % (_money(paid + amount), _money(due)))
         return {'amount': amount}
     raise ValidationError('未知操作：%s' % action)
+
+
+#: 付款申请单号字符集：字母、数字与 - _ /（CR-05 Q5，不强制格式）
+APPLY_NO_RE = re.compile(r'^[A-Za-z0-9_/\-]{1,64}$')
+
+
+def validate_apply_no(raw):
+    """付款申请单号（CR-05 需求③）：人工必填、去空白、≤64、限定字符集。
+
+    全局唯一性由路由层查库判定（``validation`` 不依赖 ORM）。
+    """
+    text = (raw or '').strip()
+    if not text:
+        raise ValidationError('请填写付款申请单号')
+    if len(text) > 64:
+        raise ValidationError('付款申请单号最多 64 个字符')
+    if not APPLY_NO_RE.match(text):
+        raise ValidationError('付款申请单号只能包含字母、数字和 - _ / 符号')
+    return text
 
 
 def _quantize(value):

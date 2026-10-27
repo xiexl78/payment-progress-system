@@ -39,7 +39,7 @@ NODE_HEADERS = ('科目', '节点名称', '节点类型', '比例', '计算基�
                 '应付金额', '已申请金额', '已开票金额', '已支付金额', '未付金额',
                 '状态', '应付日期', '触发日期')
 APPLICATION_HEADERS = ('申请单号', '科目', '节点', '申请金额', '已开票金额',
-                       '发票号', '说明', '状态', '申请人', '申请时间')
+                       '发票号', '状态', '申请人', '申请时间')
 RECORD_HEADERS = ('付款日期', '科目', '节点', '付款金额', '付款方式',
                   '凭证号', '经办人', '关联申请单号')
 ACCEPTANCE_HEADERS = ('验收日期', '验收人', '结论', '备注', '登记时间')
@@ -248,7 +248,6 @@ def _application_rows(project):
                 money_value(app.apply_amount),
                 money_value(app.invoice_amount),
                 app.invoice_no or '',
-                app.description or '',
                 app.status,
                 app.applicant_name or '',
                 _local_text(app.apply_time),

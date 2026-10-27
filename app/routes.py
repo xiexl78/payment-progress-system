@@ -33,7 +33,8 @@ from .nodes import (FLOW_STATUS as NODE_FLOW_STATUS, NODE_TYPE_LABELS,
                     node_progress_label, three_dim)
 from .validation import (DEFAULT_ACCOUNT_PASSWORDS, PROJECT_STATUSES, NODE_TYPES,
                          NODE_LABELS, TAX_RATES, ValidationError, parse_amount,
-                         parse_date, validate_contract_change_items,
+                         parse_date, validate_apply_no,
+                         validate_contract_change_items,
                          validate_contract_submission, validate_node_action,
                          validate_password, validate_project_dates,
                          validate_project_item_rows, validate_project_ratios,
@@ -167,61 +168,60 @@ def fmt_money(v):
 
 
 _APPLY_NO_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'  # 去掉易混淆的 I/O/0/1
-_APPLY_NO_RETRIES = 4
 
 
 def make_apply_no(suffix=None):
-    """申请单号：AP + UTC 秒级时间 + '-' + 6 位随机后缀（并发下唯一）。"""
+    """历史自动单号生成器（CR-05 起申请单号改为人工必填，仅保留供旧数据/工具复用）。"""
     now = timeutil.utcnow()
     tail = suffix or ''.join(secrets.choice(_APPLY_NO_ALPHABET) for _ in range(6))
     return 'AP' + now.strftime('%Y%m%d%H%M%S') + '-' + tail
 
 
-def _commit_application(node, amount, description, actor, before_snapshot):
-    """写入一笔申请单：CAS 累加 + 唯一单号冲突时有限次重试。
+def _commit_application(node, amount, apply_no, actor, before_snapshot):
+    """写入一笔申请单（CR-05 需求③：单号人工必填 + 全局唯一）。
 
-    返回 (app_obj, exhausted)：CAS 失败（累计将超应付/并发改动）返回 (None, False)；
-    单号重试耗尽返回 (None, True)，由调用方给出中文错误。
+    返回 (app_obj, error)：error 为 None / ``'duplicate'``（单号已存在）/
+    ``'cas'``（累计将超应付或并发改动），由调用方给出中文提示。
     """
-    for _ in range(_APPLY_NO_RETRIES):
-        result = db.session.execute(
-            update(PaymentNode)
-            .where(PaymentNode.id == node.id,
-                   PaymentNode.applied_amount + amount <= PaymentNode.due_amount)
-            .values(applied_amount=PaymentNode.applied_amount + amount,
-                    updated_at=_now_utc(), updated_by=actor.id))
-        if result.rowcount != 1:
-            db.session.rollback()
-            return None, False
-        db.session.refresh(node)
-        app_obj = PaymentApplication(
-            node_id=node.id, apply_no=make_apply_no(),
-            apply_amount=amount, invoice_amount=ZERO,
-            description=description or None, status='已申请',
-            applicant_id=actor.id, applicant_name=actor.display_name)
-        db.session.add(app_obj)
-        try:
-            db.session.flush()
-        except IntegrityError as exc:
-            db.session.rollback()
-            if 'apply_no' not in str(getattr(exc, 'orig', exc)):
-                raise
-            continue
-        node.status = derive_status(node.due_amount, node.applied_amount,
-                                    node.invoice_amount, node.paid_amount)
-        audit_record('node.apply', 'node', node.id, node.project_id,
-                     before=before_snapshot,
-                     after=dict(_node_snapshot(node), apply_no=app_obj.apply_no,
-                                apply_amount=format(amount, 'f')))
-        try:
-            db.session.commit()
-        except IntegrityError as exc:
-            db.session.rollback()
-            if 'apply_no' not in str(getattr(exc, 'orig', exc)):
-                raise
-            continue
-        return app_obj, False
-    return None, True
+    if PaymentApplication.query.filter_by(apply_no=apply_no).first() is not None:
+        return None, 'duplicate'
+    result = db.session.execute(
+        update(PaymentNode)
+        .where(PaymentNode.id == node.id,
+               PaymentNode.applied_amount + amount <= PaymentNode.due_amount)
+        .values(applied_amount=PaymentNode.applied_amount + amount,
+                updated_at=_now_utc(), updated_by=actor.id))
+    if result.rowcount != 1:
+        db.session.rollback()
+        return None, 'cas'
+    db.session.refresh(node)
+    app_obj = PaymentApplication(
+        node_id=node.id, apply_no=apply_no,
+        apply_amount=amount, invoice_amount=ZERO,
+        status='已申请',
+        applicant_id=actor.id, applicant_name=actor.display_name)
+    db.session.add(app_obj)
+    try:
+        db.session.flush()
+    except IntegrityError as exc:
+        db.session.rollback()
+        if 'apply_no' in str(getattr(exc, 'orig', exc)):
+            return None, 'duplicate'
+        raise
+    node.status = derive_status(node.due_amount, node.applied_amount,
+                                node.invoice_amount, node.paid_amount)
+    audit_record('node.apply', 'node', node.id, node.project_id,
+                 before=before_snapshot,
+                 after=dict(_node_snapshot(node), apply_no=app_obj.apply_no,
+                            apply_amount=format(amount, 'f')))
+    try:
+        db.session.commit()
+    except IntegrityError as exc:
+        db.session.rollback()
+        if 'apply_no' in str(getattr(exc, 'orig', exc)):
+            return None, 'duplicate'
+        raise
+    return app_obj, None
 
 
 @bp.app_template_filter('localtime')
@@ -470,17 +470,6 @@ def _login_throttle_config():
         'window_seconds': max(1, int(float(cfg.get('LOGIN_FAILURE_WINDOW_MINUTES', 5) or 5) * 60)),
         'lock_seconds': max(1, int(float(cfg.get('LOGIN_LOCK_MINUTES', 15) or 15) * 60)),
     }
-
-
-def _refresh_session_after_sensitive():
-    """业务操作后不再轮换 CSRF token（CR-05 需求⑤）。
-
-    CR-04 时期每笔业务操作后 rotate_csrf_token()，同一会话其它标签页/回退页面
-    的 CSRF 全部失效，用户只看到 403「请刷新页面」；令牌改无状态签名后，
-    CSRF 只在登录成功、登出、改密等账号级敏感操作时轮换（见 login 与
-    session_guard.revoke_* 路径），保持 Flask 标准做法。
-    """
-    return None
 
 
 def _must_change_password(user):
@@ -884,7 +873,6 @@ def item_add(project_id):
     audit_record('item.create', 'item', item.id, project.id,
                  after=_item_snapshot(item), critical=False)
     db.session.commit()
-    _refresh_session_after_sensitive()
     flash(f'科目「{item_name}」已添加，节点已生成', 'success')
     return redirect(url_for('main.project_detail', project_id=project.id))
 
@@ -970,17 +958,16 @@ def node_update(node_id):
         amount = parsed['amount']
 
         if action == 'apply':
-            description = (request.form.get('description') or '').strip()
-            app_obj, exhausted = _commit_application(node, amount, description,
-                                                     actor, before_snapshot)
-            if exhausted:
-                flash('申请单号生成冲突较多，请稍后重试（本次未登记）', 'danger')
+            apply_no = validate_apply_no(request.form.get('apply_no'))
+            app_obj, error = _commit_application(node, amount, apply_no,
+                                                 actor, before_snapshot)
+            if error == 'duplicate':
+                flash('申请单号 %s 已存在，请换一个单号' % apply_no, 'danger')
                 return redirect(detail_url)
             if app_obj is None:
                 flash('申请登记失败：累计申请将超过应付，或该节点已被他人修改，请刷新后重试', 'danger')
                 return redirect(detail_url)
-            _refresh_session_after_sensitive()
-            flash('%s 已登记申请 %s 元（%s）'
+            flash('%s 已登记申请 %s 元（单号 %s）'
                   % (node.node_name, fmt_money(amount), app_obj.apply_no), 'success')
 
         elif action == 'invoice':
@@ -1017,7 +1004,6 @@ def node_update(node_id):
                                     invoice_date=_date_str(invoice_date),
                                     duplicate_invoice_no=bool(duplicate)))
             db.session.commit()
-            _refresh_session_after_sensitive()
             if duplicate:
                 flash('发票 %s 已在本节点登记过（同一发票可覆盖多个节点，系统不阻断），'
                       '本次开票 %s 元已记录，请核对' % (invoice_no, fmt_money(amount)),
@@ -1058,7 +1044,6 @@ def node_update(node_id):
                                     pay_date=_date_str(rec.pay_date),
                                     pay_method=rec.pay_method))
             db.session.commit()
-            _refresh_session_after_sensitive()
             flash('%s 已登记付款 %s 元' % (node.node_name, fmt_money(amount)), 'success')
     except ValidationError as exc:
         db.session.rollback()
@@ -1698,7 +1683,6 @@ def contract_confirm_submit(contract_id):
                                              for k, v in submission.node_amounts.items()},
                             'diff': diff})
         db.session.commit()
-        _refresh_session_after_sensitive()
         for msg in submission.warnings:
             flash(msg, 'warning')
         flash('合同「%s」已更新（就地更新，付款节点与记录保持不变）'
