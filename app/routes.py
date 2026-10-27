@@ -376,14 +376,38 @@ def _operator_id():
 # 不写入 session（Cookie 体积恒定）；服务端用 node_action_tokens 表以 jti 主键
 # 登记消费记录做防重放，因此仍然「一次点击只能成功一次」。
 NODE_ACTIONS = ('apply', 'invoice', 'pay')
-#: 令牌有效期（秒）：与页面提示的「2 小时」一致
-NODE_TOKEN_TTL = 2 * 60 * 60
+#: 令牌有效期兜底（秒）：配置项 NODE_TOKEN_TTL_MINUTES 缺失时使用。
+#: 实际值优先读 current_app.config['NODE_TOKEN_TTL_MINUTES']（默认 30 分钟，可配）。
+NODE_TOKEN_TTL = 30 * 60
 NODE_TOKEN_SALT = 'payment-progress.node-action'
 
 NODE_TOKEN_OK = 'ok'
 NODE_TOKEN_REPLAY = 'replay'
 NODE_TOKEN_EXPIRED = 'expired'
 NODE_TOKEN_INVALID = 'invalid'
+
+
+def _node_token_ttl_seconds():
+    """节点操作令牌有效期（秒）：从配置读，缺失/非法时回退到常量。"""
+    minutes = current_app.config.get('NODE_TOKEN_TTL_MINUTES')
+    if minutes is None:
+        return NODE_TOKEN_TTL
+    try:
+        seconds = int(round(float(minutes) * 60))
+    except (TypeError, ValueError):
+        return NODE_TOKEN_TTL
+    return max(1, seconds)
+
+
+def _node_token_ttl_label():
+    """有效期的中文展示（提示语用），如「30 分钟」「1.5 分钟」「1 秒」。"""
+    seconds = _node_token_ttl_seconds()
+    if seconds >= 60:
+        minutes = seconds / 60.0
+        text = ('%d' % round(minutes)) if abs(minutes - round(minutes)) < 1e-9 \
+            else ('%.1f' % minutes)
+        return text + ' 分钟'
+    return '%d 秒' % seconds
 
 
 def _node_token_serializer():
@@ -402,7 +426,8 @@ def _issue_node_tokens(project):
     session.pop('node_tokens', None)  # 清理 CR-04 遗留在旧会话里的令牌表
     serializer = _node_token_serializer()
     sid_digest = _session_digest()
-    expires_at = int(timeutil.utcnow().timestamp()) + NODE_TOKEN_TTL
+    ttl = _node_token_ttl_seconds()
+    expires_at = int(timeutil.utcnow().timestamp()) + ttl
     issued = {}
     for node in project.nodes:
         per_node = {}
@@ -419,8 +444,9 @@ def _consume_node_token(token, node_id, action):
     token = (token or '').strip()
     if not token:
         return NODE_TOKEN_INVALID
+    ttl = _node_token_ttl_seconds()
     try:
-        data = _node_token_serializer().loads(token, max_age=NODE_TOKEN_TTL)
+        data = _node_token_serializer().loads(token, max_age=ttl)
     except SignatureExpired:
         return NODE_TOKEN_EXPIRED
     except BadSignature:
@@ -438,14 +464,14 @@ def _consume_node_token(token, node_id, action):
     if not jti or len(str(jti)) > 64:
         return NODE_TOKEN_INVALID
     now = timeutil.utcnow()
-    # 顺带清理一天前过期的历史消费记录（单条 DELETE，量很小）
+    # 清理已过期的历史消费记录（expires_at 已含 TTL 余量，可直接按 now 判断）
     try:
         NodeActionToken.query.filter(
-            NodeActionToken.expires_at < now - timedelta(days=1)
+            NodeActionToken.expires_at < now
         ).delete(synchronize_session=False)
     except Exception:
         db.session.rollback()
-    expires_at = now + timedelta(seconds=NODE_TOKEN_TTL)
+    expires_at = now + timedelta(seconds=ttl)
     if data.get('e'):
         try:
             expires_at = datetime.utcfromtimestamp(int(data['e']))
@@ -966,11 +992,12 @@ def project_restore(project_id):
 def _flash_node_token_failure(token_status):
     """节点一次性令牌校验失败的统一中文提示（CR-05 需求⑤）。"""
     if token_status == NODE_TOKEN_REPLAY:
-        flash('该操作已提交（请不要重复点击），请刷新页面查看最新状态', 'warning')
+        flash('该操作已提交（请不要重复点击），请重新打开项目详情页查看最新状态', 'warning')
     elif token_status == NODE_TOKEN_EXPIRED:
-        flash('操作令牌已过期（页面停留超过 2 小时），请刷新页面后重试', 'danger')
+        flash('操作令牌已过期（页面停留超过 %s），请重新打开项目详情页后再试'
+              % _node_token_ttl_label(), 'danger')
     else:
-        flash('操作已失效（页面已过期或链接无效），请刷新页面后重试', 'danger')
+        flash('操作已失效（页面已过期或链接无效），请重新打开项目详情页后再试', 'danger')
 
 
 @bp.route('/nodes/<int:node_id>/update', methods=['POST'])

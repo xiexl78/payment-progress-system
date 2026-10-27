@@ -178,6 +178,13 @@ def load_config(base_dir, config_file=None, explicit=False):
     trusted_proxy = _parse_number(_raw(file_values, 'TRUSTED_PROXY_COUNT'),
                                   key='TRUSTED_PROXY_COUNT', errors=errors,
                                   default=0, minimum=0, maximum=2, cast=int)
+    #: 节点操作令牌有效期（分钟），默认 30，范围 1~1440。
+    #: 测试可通过 create_app(config={'NODE_TOKEN_TTL_MINUTES': 1/60}) 注入
+    #: 更短的值（显式 config 不走本文件的取值范围校验）。
+    node_token_ttl_minutes = _parse_number(
+        _raw(file_values, 'NODE_TOKEN_TTL_MINUTES'),
+        key='NODE_TOKEN_TTL_MINUTES', errors=errors,
+        default=30, minimum=1, maximum=1440)
 
     cfg = {
         'APP_ENV': app_env,
@@ -201,6 +208,7 @@ def load_config(base_dir, config_file=None, explicit=False):
         'LOGIN_LOCK_MINUTES': int(lockout_minutes),
         'LOGIN_FAILURE_WINDOW_MINUTES': int(failure_window),
         'TRUSTED_PROXY_COUNT': int(trusted_proxy),
+        'NODE_TOKEN_TTL_MINUTES': float(node_token_ttl_minutes),
         'CSRF_ENABLED': True,
         'TESTING': False,
         'FORCE_DEFAULT_PASSWORD_CHANGE': (app_env == 'production'),
