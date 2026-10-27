@@ -419,13 +419,10 @@ def validate_node_action(node, action, form):
     raise ValidationError('未知操作：%s' % action)
 
 
-#: 付款申请单号字符集：字母、数字与 - _ /（CR-05 Q5，不强制格式）
-APPLY_NO_RE = re.compile(r'^[A-Za-z0-9_/\-]{1,64}$')
-
-
 def validate_apply_no(raw):
-    """付款申请单号（CR-05 需求③）：人工必填、去空白、≤64、限定字符集。
+    """付款申请单号（CR-05 需求③）：人工必填、去首尾空白、≤64、不限字符集。
 
+    Q3 口径：只要求非空且长度不超过 64，允许中文等任意字符（单号格式由单位自定）。
     全局唯一性由路由层查库判定（``validation`` 不依赖 ORM）。
     """
     text = (raw or '').strip()
@@ -433,8 +430,6 @@ def validate_apply_no(raw):
         raise ValidationError('请填写付款申请单号')
     if len(text) > 64:
         raise ValidationError('付款申请单号最多 64 个字符')
-    if not APPLY_NO_RE.match(text):
-        raise ValidationError('付款申请单号只能包含字母、数字和 - _ / 符号')
     return text
 
 
