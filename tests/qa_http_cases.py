@@ -2287,6 +2287,26 @@ def _cr05_final_cases(s_admin):
         check('CR05⑤', '已消费令牌登记到 node_action_tokens（jti 防重放表有记录）', cnt >= 2,
               'rows=%s' % cnt)
 
+        # Chief 追补：同一 token 换单号二次提交也必须被拒（防重放与业务字段无关）
+        tok_swap = C.node_tokens(s_admin, BASE, pt).get((nid, 'apply'))
+        applied_swap0 = _node_vals(nid)['applied']
+        apps_swap0 = q1(DB, 'SELECT COUNT(*) FROM payment_applications WHERE node_id=?', (nid,))
+        C.post(s_admin, BASE, '/nodes/%d/update' % nid,
+               {'action': 'apply', 'apply_amount': '10',
+                'apply_no': C.next_apply_no('QA-SWAPA'), 'confirm_token': tok_swap},
+               allow_redirects=True)
+        rs = C.post(s_admin, BASE, '/nodes/%d/update' % nid,
+                    {'action': 'apply', 'apply_amount': '10',
+                     'apply_no': C.next_apply_no('QA-SWAPB'), 'confirm_token': tok_swap},
+                    allow_redirects=True)
+        apps_swap1 = q1(DB, 'SELECT COUNT(*) FROM payment_applications WHERE node_id=?', (nid,))
+        check('CR05⑤', '同一令牌换单号二次提交也被拒（防重放与业务字段无关，无新增申请单）',
+              _node_vals(nid)['applied'] == applied_swap0 + d2(10)
+              and apps_swap1 == apps_swap0 + 1 and '已提交' in rs.text,
+              'applied=%s 申请单 %s→%s 提示=%s' % (
+                  _node_vals(nid)['applied'], apps_swap0, apps_swap1,
+                  '有' if '已提交' in rs.text else '无'))
+
         # 过期：注入 1 秒 TTL（Chief 口径：配置项 NODE_TOKEN_TTL_MINUTES，默认 30 分钟；不改系统时间）
         import time as _time
         from app import routes as R
@@ -2355,12 +2375,12 @@ def _cr05_final_cases(s_admin):
         check('CR05⑥', '申请单剩余可付足够但超节点应付时仍被拒（节点口径优先）',
               paid == d2(250) and rc.status_code in (302, 400),
               'paid=%s code=%s' % (paid, rc.status_code))
-        # 导出申请单列：已付金额/付款笔数、无「说明」
+        # 导出申请单列：已付金额/付款笔数、无「说明」（申请单明细在项目导出里）
         try:
             from openpyxl import load_workbook
-            resp = s_admin.get(BASE + '/reports/export.xlsx', timeout=120)
+            resp = s_admin.get(BASE + '/projects/%d/export.xlsx' % ps, timeout=120)
             if resp.status_code != 200:
-                resp = s_admin.get(BASE + '/reports/export', timeout=120)
+                resp = s_admin.get(BASE + '/reports/export.xlsx', timeout=120)
             wb = load_workbook(io.BytesIO(resp.content))
             rows = [list(r) for ws in wb.worksheets for r in ws.iter_rows(values_only=True)]
             app_head = next((r for r in rows if any(v == '申请单号' for v in r)), None)
