@@ -982,19 +982,39 @@ def node_update(node_id):
     if action not in NODE_ACTIONS:
         flash('未知的节点操作', 'danger')
         return redirect(detail_url)
+    before_snapshot = _node_snapshot(node)
+    # 先做完全部入参校验、再消费令牌：校验失败时令牌不烧掉，用户改对后可直接重提
+    # （CR-05 T2b：原实现先消费后校验，改一次金额就变成「已失效」，与原 bug 同症状）。
+    try:
+        parsed = validate_node_action(node, action, request.form)
+        amount = parsed['amount']
+        if action == 'apply':
+            apply_no = validate_apply_no(request.form.get('apply_no'))
+        elif action == 'invoice':
+            invoice_no = validate_text(request.form.get('invoice_no'),
+                                       field='发票号', required=True, max_len=128)
+            invoice_date = parse_date(request.form.get('invoice_date'),
+                                      field='开票日期', required=False)
+            remark = (request.form.get('invoice_remark') or '').strip()
+        elif action == 'pay':
+            pay_date = (parse_date(request.form.get('pay_date'), field='付款日期')
+                        or timeutil.local_today())
+            pay_method = (request.form.get('pay_method') or '').strip()
+            voucher = (request.form.get('voucher_no') or '').strip()
+    except ValidationError as exc:
+        db.session.rollback()
+        for msg in exc.errors:
+            flash(msg, 'danger')
+        return redirect(detail_url)
+
     token_status = _consume_node_token(request.form.get('confirm_token'),
-                                      node.id, action)
+                                       node.id, action)
     if token_status != NODE_TOKEN_OK:
         _flash_node_token_failure(token_status)
         return redirect(detail_url)
 
-    before_snapshot = _node_snapshot(node)
     try:
-        parsed = validate_node_action(node, action, request.form)
-        amount = parsed['amount']
-
         if action == 'apply':
-            apply_no = validate_apply_no(request.form.get('apply_no'))
             app_obj, error = _commit_application(node, amount, apply_no,
                                                  actor, before_snapshot)
             if error == 'duplicate':
@@ -1007,11 +1027,6 @@ def node_update(node_id):
                   % (node.node_name, fmt_money(amount), app_obj.apply_no), 'success')
 
         elif action == 'invoice':
-            invoice_no = validate_text(request.form.get('invoice_no'),
-                                       field='发票号', required=True, max_len=128)
-            invoice_date = parse_date(request.form.get('invoice_date'),
-                                      field='开票日期', required=False)
-            remark = (request.form.get('invoice_remark') or '').strip()
             duplicate = PaymentInvoice.query.filter_by(
                 node_id=node.id, invoice_no=invoice_no).first()
             result = db.session.execute(
@@ -1049,9 +1064,6 @@ def node_update(node_id):
                       % (node.node_name, fmt_money(amount), invoice_no), 'success')
 
         elif action == 'pay':
-            pay_date = parse_date(request.form.get('pay_date'), field='付款日期') or timeutil.local_today()
-            pay_method = (request.form.get('pay_method') or '').strip()
-            voucher = (request.form.get('voucher_no') or '').strip()
             result = db.session.execute(
                 update(PaymentNode)
                 .where(PaymentNode.id == node.id,
@@ -1107,21 +1119,30 @@ def application_payment(app_id):
     if guard:
         return guard
     detail_url = url_for('main.project_detail', project_id=node.project_id)
+    actor = current_user()
+    before_snapshot = _node_snapshot(node)
+    before_app = dict(application.to_dict())
+    # 先校验后消费令牌（CR-05 T2b）：金额/上限校验失败时不烧令牌，改对后可原样重提
+    try:
+        parsed = validate_application_payment(application, request.form)
+        amount = parsed['amount']
+        pay_date = (parse_date(request.form.get('pay_date'), field='付款日期')
+                    or timeutil.local_today())
+        pay_method = (request.form.get('pay_method') or '').strip()
+        voucher = (request.form.get('voucher_no') or '').strip()
+    except ValidationError as exc:
+        db.session.rollback()
+        for msg in exc.errors:
+            flash(msg, 'danger')
+        return redirect(detail_url)
+
     token_status = _consume_node_token(request.form.get('confirm_token'),
                                        node.id, 'pay')
     if token_status != NODE_TOKEN_OK:
         _flash_node_token_failure(token_status)
         return redirect(detail_url)
 
-    actor = current_user()
-    before_snapshot = _node_snapshot(node)
-    before_app = dict(application.to_dict())
     try:
-        parsed = validate_application_payment(application, request.form)
-        amount = parsed['amount']
-        pay_date = parse_date(request.form.get('pay_date'), field='付款日期') or timeutil.local_today()
-        pay_method = (request.form.get('pay_method') or '').strip()
-        voucher = (request.form.get('voucher_no') or '').strip()
         result = db.session.execute(
             update(PaymentNode)
             .where(PaymentNode.id == node.id,
