@@ -5,11 +5,38 @@
 
 {% if current_user.role in ('admin', 'operator') %}
 <div class="card">
-  <div class="card-title">上传合同<span class="sub">系统自动提取合同金额、税率、付款条件与节点比例，识别结果需人工确认后生成付款节点</span></div>
+  <div class="card-title">按模板上传关键信息截图<span class="sub">上传合同里的三处关键截图，系统分类型 OCR 后填入付款节点；识别结果需对照原图人工确认</span></div>
+  <form method="post" action="{{ url_for('main.contract_shots_upload') }}" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div class="flex" style="gap:12px;flex-wrap:wrap;">
+      <label style="flex:1;min-width:220px;">
+        <div><strong>① 合同金额截图</strong> <span class="text-danger">*必传</span></div>
+        <div class="src-text">合同总额、税率所在页面</div>
+        <input type="file" name="shot_amount" accept=".jpg,.jpeg,.png,.bmp,.webp" required>
+      </label>
+      <label style="flex:1;min-width:220px;">
+        <div><strong>② 付款条件/付款方式截图</strong> <span class="text-danger">*必传</span></div>
+        <div class="src-text">付款方式与各节点付款比例</div>
+        <input type="file" name="shot_payment" accept=".jpg,.jpeg,.png,.bmp,.webp" required>
+      </label>
+      <label style="flex:1;min-width:220px;">
+        <div><strong>③ 维保/质保金条款截图</strong> <span class="src-text">（选传）</span></div>
+        <div class="src-text">质保期（月）与质保金比例</div>
+        <input type="file" name="shot_warranty" accept=".jpg,.jpeg,.png,.bmp,.webp">
+      </label>
+    </div>
+    <div class="flex" style="gap:12px;margin-top:10px;align-items:center;">
+      <button type="submit" class="btn btn-primary">上传并识别</button>
+      <span class="src-text">支持 JPG / PNG / BMP / WEBP，单张不超过 10MB；原图会保留，项目详情可直接对照查看。</span>
+    </div>
+  </form>
+</div>
+<div class="card">
+  <div class="card-title">兜底：上传整份合同文件<span class="sub">截图不全或合同为 PDF/Word 时，仍可按原方式上传整份文件识别</span></div>
   <form method="post" action="{{ url_for('main.contract_upload') }}" enctype="multipart/form-data" class="flex" style="gap:12px;">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <input type="file" name="file" accept=".pdf,.docx,.txt,.md,.jpg,.jpeg,.png,.bmp,.webp" style="flex:1;" required>
-    <button type="submit" class="btn btn-primary">上传并识别</button>
+    <input type="file" name="file" accept=".pdf,.docx,.txt,.md,.jpg,.jpeg,.png,.bmp,.webp" style="flex:1;">
+    <button type="submit" class="btn btn-outline">上传并识别</button>
   </form>
   <div class="src-text" style="margin-top:8px;">支持格式：PDF（文字版）、Word（.docx）、TXT / Markdown、图片（JPG/PNG/BMP/WEBP，使用本机 OCR）。文本提取与规则识别全程在本机完成；如需大模型识别，可配置环境变量后自动启用（见 README）。</div>
 </div>

@@ -21,6 +21,40 @@
     {% endif %}
   </div>
 
+  {% if shots %}
+  <div style="border:1px solid var(--line,#e5e7eb);border-radius:8px;padding:10px;margin-bottom:14px;">
+    <b>合同截图（共 {{ shots|length }} 张，可点开原图对照填写）</b>
+    <div class="flex" style="gap:12px;flex-wrap:wrap;margin-top:8px;">
+      {% for shot in shots %}
+      <div style="width:32%;min-width:220px;">
+        {% if can_edit %}
+        <a href="{{ url_for('main.contract_shot_image', shot_id=shot.id) }}" target="_blank" rel="noopener">
+          <img src="{{ url_for('main.contract_shot_image', shot_id=shot.id) }}" alt="{{ shot_labels.get(shot.shot_type, shot.shot_type) }}" style="width:100%;height:160px;object-fit:contain;background:#f8fafc;border:1px solid var(--line,#e5e7eb);border-radius:6px;">
+        </a>
+        {% else %}
+        <div class="src-text">（只读角色不可查看截图原图）</div>
+        {% endif %}
+        <div style="margin-top:4px;">
+          <b>{{ shot_labels.get(shot.shot_type, shot.shot_type) }}</b>
+          {% if shot.ocr_status == 'ok' %}<span class="badge badge-green">已识别</span>
+          {% elif shot.ocr_status == 'failed' %}<span class="badge badge-red">识别失败</span>
+          {% else %}<span class="badge badge-gray">待识别</span>{% endif %}
+        </div>
+        {% if shot.ocr_status == 'ok' %}
+        <div class="src-text">OCR 文本 {{ shot.ocr_text|length }} 字，见下方表单；原图：{{ shot.file_name }}</div>
+        {% else %}
+        <div class="src-text text-danger">{{ shot.ocr_msg or '未识别到文字，请手工填写' }}</div>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    {% set failed_required = shots|selectattr('shot_type', 'in', ['amount', 'payment'])|rejectattr('ocr_status', 'equalto', 'ok')|list|length %}
+    {% if failed_required >= 2 %}
+    <div class="src-text text-danger" style="margin-top:8px;">截图①②均未识别到文字：请对照原图手工填写下方字段，并勾选「以上内容为人工录入，已对照原图核对」后再提交。</div>
+    {% endif %}
+  </div>
+  {% endif %}
+
   {% if errors %}
   <div class="flash danger" style="background:var(--danger-bg,#fee2e2);color:var(--danger,#b91c1c);border-color:#fecaca;margin-bottom:12px;">
     <b>提交未通过校验：</b>
@@ -227,6 +261,13 @@
         </table>
       </div>
     </div>
+
+    {% if shots %}
+    <div class="flex mt-16" style="gap:8px;align-items:center;">
+      <input type="checkbox" name="manual_confirm" id="manual_confirm" value="1">
+      <label for="manual_confirm" style="cursor:pointer;">以上内容为人工录入，已对照原图核对</label>
+    </div>
+    {% endif %}
 
     <!-- 底部操作 -->
     <div class="flex mt-16" style="gap:12px;">

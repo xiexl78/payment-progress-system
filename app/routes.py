@@ -18,7 +18,8 @@ from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
 from . import NODE_TEMPLATES, FLOW_STATUS, STATUS_LABELS, login_guard, session_guard, timeutil
 from .audit import action_options, record as audit_record, snapshot as audit_snapshot
-from .contract_engine import extract_text, recognize_contract
+from .contract_engine import (extract_text, merge_shot_texts, recognize_contract,
+                              recognize_shots, SHOT_LABELS, SHOT_TYPES)
 from .dbhealth import database_status
 from .exporter import (audit_csv_bytes, build_project_workbook,
                        build_reports_workbook, export_filename,
@@ -813,12 +814,19 @@ def project_detail(project_id):
     applications.sort(key=lambda row: (
         row['app'].apply_time is None, row['app'].apply_time or datetime.min, row['app'].id),
         reverse=True)
+    shot_rows = []
+    for contract in sorted(project.contracts, key=lambda c: c.id):
+        shots = sorted(contract.screenshots, key=lambda s: SHOT_TYPES.index(s.shot_type)) \
+            if contract.file_type == 'img' else []
+        if shots:
+            shot_rows.append({'contract': contract, 'shots': shots})
     return render_template('project_detail.html', project=project, node_groups=node_groups,
                            acceptances=acceptances, templates=NODE_TEMPLATES,
                            applications=applications,
                            node_three=node_three, node_tokens=_issue_node_tokens(project),
                            totals_dim=totals_dim, status_labels=STATUS_LABELS,
                            flow_status=NODE_FLOW_STATUS,
+                           shot_rows=shot_rows, shot_labels=SHOT_LABELS,
                            overpaid_total=overpaid_total)
 
 
@@ -1297,6 +1305,13 @@ ALLOWED_CONTRACT_EXTS = {
 CONTRACT_NODE_ORDER = ('first', 'progress', 'acceptance', 'warranty')
 CALC_BASE_LABELS = {'first': '按总金额', 'progress': '按总金额', 'acceptance': '按总金额', 'warranty': '按总金额'}
 
+# CR-05 需求①：三张关键信息截图（①②必传、③选传），单张 ≤10MB
+SHOT_REQUIRED = ('amount', 'payment')
+SHOT_EXTS = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
+             'bmp': 'image/bmp', 'webp': 'image/webp'}
+MAX_SHOT_BYTES = 10 * 1024 * 1024
+
+
 
 def contract_upload_dir():
     """上传目录：优先取配置的 UPLOAD_DIR（DATA_DIR/uploads），测试可 monkeypatch。"""
@@ -1448,6 +1463,184 @@ def contract_upload():
     db.session.commit()
     flash('合同识别完成：%s' % (file.filename), 'success')
     return redirect(url_for('main.contract_confirm', contract_id=contract.id))
+
+
+# ---------- CR-05 需求①：按模板上传关键信息截图 ----------
+
+def screenshot_storage_path(shot):
+    """截图原图绝对路径（``stored_path`` 相对 UPLOAD_DIR，兼容历史绝对路径）。"""
+    raw = (shot.stored_path or '').replace('\\', '/').strip()
+    if not raw:
+        return None
+    if os.path.isabs(raw):
+        return raw
+    name = raw.split('/', 1)[1] if raw.startswith('uploads/') else raw
+    return os.path.join(contract_upload_dir(), name)
+
+
+def _shot_file_error(file_obj, shot_type):
+    """校验单张截图扩展名与大小，返回 (ext, mime, size, error)。"""
+    name = file_obj.filename or ''
+    ext = (name.rsplit('.', 1)[-1] if '.' in name else '').lower()
+    if ext not in SHOT_EXTS:
+        return ext, None, 0, '%s：不支持的图片格式（支持 JPG / PNG / BMP / WEBP）' \
+            % SHOT_LABELS[shot_type]
+    try:
+        file_obj.stream.seek(0, os.SEEK_END)
+        size = file_obj.stream.tell()
+        file_obj.stream.seek(0)
+    except (OSError, AttributeError):
+        size = 0
+    if size > MAX_SHOT_BYTES:
+        return ext, None, size, '%s：图片超过 10MB，请压缩后重传' % SHOT_LABELS[shot_type]
+    return ext, SHOT_EXTS[ext], size, None
+
+
+def _read_shot_text(shot):
+    """OCR 单张截图并回写 ocr_status/ocr_text/ocr_msg，返回文本（失败 None）。"""
+    path = screenshot_storage_path(shot)
+    if not path or not os.path.isfile(path):
+        shot.ocr_status = 'failed'
+        shot.ocr_msg = '截图文件不存在或已丢失'
+        return None
+    try:
+        text, msg = extract_text(path, 'img')
+    except Exception as exc:  # noqa: BLE001 - OCR 失败一律降级为人工填写
+        shot.ocr_status = 'failed'
+        shot.ocr_msg = 'OCR 异常：%s' % exc
+        return None
+    if text is None:
+        shot.ocr_status = 'failed'
+        shot.ocr_msg = msg or 'OCR 未识别到文字'
+        return None
+    shot.ocr_text = text
+    shot.ocr_status = 'ok'
+    shot.ocr_msg = None
+    return text
+
+
+def _shot_meta(shots):
+    return [{'shot_type': s.shot_type, 'shot_id': s.id,
+             'ocr_status': s.ocr_status, 'ocr_msg': s.ocr_msg,
+             'text_len': len(s.ocr_text or '')} for s in shots]
+
+
+@bp.route('/contracts/shots', methods=['POST'])
+@login_required
+@role_required('admin', 'operator')
+def contract_shots_upload():
+    """三张截图上传 + 分类型 OCR + 定向识别（CR-05 需求①）。"""
+    files = {t: request.files.get('shot_' + t) for t in SHOT_TYPES}
+    missing = [SHOT_LABELS[t] for t in SHOT_REQUIRED
+               if not (files[t] and files[t].filename)]
+    if missing:
+        flash('请上传：%s（截图①金额、②付款条件为必传项）' % '、'.join(missing), 'danger')
+        return redirect(url_for('main.contracts'))
+
+    prepared = []
+    for shot_type in SHOT_TYPES:
+        file_obj = files[shot_type]
+        if not (file_obj and file_obj.filename):
+            continue
+        ext, mime, size, error = _shot_file_error(file_obj, shot_type)
+        if error:
+            flash(error, 'danger')
+            return redirect(url_for('main.contracts'))
+        prepared.append((shot_type, file_obj, ext, mime, size))
+
+    actor = current_user()
+    file_name = '截图识别：' + '、'.join(
+        (file_obj.filename or '') for _, file_obj, _, _, _ in prepared)
+    contract = ContractFile(
+        file_name=file_name[:256], stored_path='', file_type='img',
+        file_size=sum(p[4] for p in prepared), engine='rules',
+        status='uploaded', source='shots', created_by=actor.id,
+    )
+    db.session.add(contract)
+    db.session.flush()
+
+    shot_dir = os.path.join(contract_upload_dir(), 'shots', str(contract.id))
+    os.makedirs(shot_dir, exist_ok=True)
+    sections = {}
+    shots = []
+    for shot_type, file_obj, ext, mime, size in prepared:
+        unique = secrets.token_hex(4)
+        safe_name = '%s-%s.%s' % (shot_type, unique, ext)
+        stored = os.path.join(shot_dir, safe_name)
+        file_obj.save(stored)
+        rel_path = 'uploads/shots/%d/%s' % (contract.id, safe_name)
+        shot = ContractScreenshot(
+            contract_id=contract.id, shot_type=shot_type,
+            file_name=(file_obj.filename or safe_name)[:256],
+            stored_path=rel_path, mime=mime, file_size=size or None,
+            ocr_status='pending', created_by=actor.id,
+        )
+        db.session.add(shot)
+        db.session.flush()
+        text = _read_shot_text(shot)
+        if text:
+            sections[shot_type] = text
+        shots.append(shot)
+        audit_record('contract.shot.ocr', 'contract', contract.id, None,
+                     result=shot.ocr_status,
+                     after={'shot_id': shot.id, 'shot_type': shot_type,
+                            'ocr_status': shot.ocr_status,
+                            'text_len': len(text or ''),
+                            'error_code': (shot.ocr_msg or '')[:80]},
+                     critical=False)
+
+    merged = merge_shot_texts(sections)
+    meta = [{'shot_type': s.shot_type, 'shot_id': s.id,
+             'ocr_status': s.ocr_status, 'ocr_msg': s.ocr_msg,
+             'text_len': len(s.ocr_text or '')} for s in shots]
+    result = recognize_shots(sections, file_name, shot_meta=meta)
+    contract.raw_text = merged
+    contract.result_json = json.dumps(result, ensure_ascii=False)
+    contract.engine = result.get('engine', 'rules')
+    contract.status = 'recognized'
+    contract.error_msg = None
+    failed = [t for t in SHOT_TYPES
+              if any(s.shot_type == t and s.ocr_status != 'ok' for s in shots)]
+    if failed:
+        contract.error_msg = '截图 OCR 失败：%s（可在确认页手工填写）' % '、'.join(
+            SHOT_LABELS[t] for t in failed)
+    audit_record('contract.shots.upload', 'contract', contract.id, None,
+                 after={'shot_types': [s.shot_type for s in shots],
+                        'sizes': {s.shot_type: s.file_size for s in shots},
+                        'mimes': {s.shot_type: s.mime for s in shots},
+                        'ocr_status': {s.shot_type: s.ocr_status for s in shots}},
+                 critical=False)
+    db.session.commit()
+    flash('截图识别完成，请对照原图核对识别结果后确认', 'success')
+    return redirect(url_for('main.contract_confirm', contract_id=contract.id))
+
+
+@bp.route('/contracts/shots/<int:shot_id>/image')
+@login_required
+def contract_shot_image(shot_id):
+    """截图原图回显（Q9：仅 admin/operator 可看，viewer 403；禁缓存）。"""
+    shot = db.session.get(ContractScreenshot, shot_id)
+    if not shot:
+        abort(404)
+    user = current_user()
+    if not user or user.role not in ('admin', 'operator'):
+        audit_record('contract.shot.image_access', 'contract', shot.contract_id, None,
+                     result='403', after={'shot_id': shot_id,
+                                          'user_id': getattr(user, 'id', None)},
+                     critical=False)
+        db.session.commit()
+        abort(403)
+    path = screenshot_storage_path(shot)
+    if not path or not os.path.isfile(path):
+        audit_record('contract.shot.image_access', 'contract', shot.contract_id, None,
+                     result='404', after={'shot_id': shot_id},
+                     critical=False)
+        db.session.commit()
+        abort(404, description='截图文件不存在或已丢失')
+    response = send_file(path, mimetype=shot.mime or 'application/octet-stream',
+                         as_attachment=False, download_name=shot.file_name)
+    response.headers['Cache-Control'] = 'no-store, max-age=0'
+    return response
 
 
 # ---------- 合同确认：现值回填 / 差异二次确认 / 就地更新 ----------
@@ -1711,11 +1904,14 @@ def _create_contract_project(submission, contract):
 
 def _render_confirm(contract, result, *, values, is_update, project=None,
                     errors=None, diff=None, blockers=None, confirm_token=''):
+    shots = sorted(contract.screenshots, key=lambda s: SHOT_TYPES.index(s.shot_type)) \
+        if contract.file_type == 'img' else []
     return render_template('contract_confirm.html', contract=contract,
                            result=result, values=values, is_update=is_update,
                            project=project, errors=errors or [], diff=diff or [],
                            blockers=blockers or [], confirm_token=confirm_token,
-                           node_order=CONTRACT_NODE_ORDER)
+                           node_order=CONTRACT_NODE_ORDER, shots=shots,
+                           shot_labels=SHOT_LABELS, shot_types=SHOT_TYPES)
 
 
 @bp.route('/contracts/<int:contract_id>/confirm', methods=['GET'])
@@ -1777,6 +1973,18 @@ def contract_confirm_submit(contract_id):
             flash('关联项目已归档（只读），不能修改合同；请先解除归档', 'danger')
             return redirect(url_for('main.contracts'))
 
+    # ①② 截图均未识别出文字：必须人工对照原图核对后勾选确认，否则不生成项目
+    shots = list(contract.screenshots) if contract.file_type == 'img' else []
+    if shots:
+        failed_types = {s.shot_type for s in shots if s.ocr_status != 'ok'}
+        if all(t in failed_types for t in SHOT_REQUIRED) \
+                and not (request.form.get('manual_confirm') or '').strip():
+            return _render_confirm(
+                contract, result,
+                values=_raw_contract_form_values(request.form),
+                is_update=is_update, project=project,
+                errors=['截图①②均未能识别，请勾选「以上内容为人工录入，已对照原图核对」后再提交'])
+
     try:
         # CR-04：确认页不再有增补输入；回改保留项目当前增补合计，不清零。
         submission = validate_contract_submission(
@@ -1824,6 +2032,8 @@ def contract_confirm_submit(contract_id):
         before_values = _project_contract_values(project)
         _apply_contract_values(project, submission, contract,
                                update_amounts=bool(financial))
+        for shot in shots:
+            shot.project_id = project.id
         contract.contract_name = submission.contract_name
         contract.project_id = project.id
         contract.status = 'confirmed'
@@ -1856,6 +2066,8 @@ def contract_confirm_submit(contract_id):
                                values=_raw_contract_form_values(request.form),
                                is_update=False)
     project = _create_contract_project(submission, contract)
+    for shot in shots:
+        shot.project_id = project.id
     contract.project_id = project.id
     contract.contract_name = submission.contract_name
     contract.status = 'confirmed'
@@ -1889,6 +2101,40 @@ def contract_rerun(contract_id):
     contract = db.session.get(ContractFile, contract_id)
     if not contract:
         abort(404)
+    shots = list(contract.screenshots) if contract.file_type == 'img' else []
+    if shots:
+        # 只重跑失败/待识别的截图；已成功的不重复 OCR（4.7.3）
+        sections = {}
+        for shot in sorted(shots, key=lambda s: SHOT_TYPES.index(s.shot_type)):
+            if shot.ocr_status == 'ok' and shot.ocr_text:
+                sections[shot.shot_type] = shot.ocr_text
+                continue
+            text = _read_shot_text(shot)
+            if text:
+                sections[shot.shot_type] = text
+            audit_record('contract.shot.ocr', 'contract', contract.id,
+                         contract.project_id, result=shot.ocr_status,
+                         after={'shot_id': shot.id, 'shot_type': shot.shot_type,
+                                'ocr_status': shot.ocr_status,
+                                'text_len': len(text or ''),
+                                'error_code': (shot.ocr_msg or '')[:80]},
+                         critical=False)
+        result = recognize_shots(sections, contract.file_name,
+                                 shot_meta=_shot_meta(shots))
+        contract.raw_text = merge_shot_texts(sections)
+        contract.result_json = json.dumps(result, ensure_ascii=False)
+        contract.engine = result.get('engine', 'rules')
+        if contract.status != 'confirmed':
+            contract.status = 'recognized'
+        contract.error_msg = None
+        audit_record('contract.rerun', 'contract', contract.id, contract.project_id,
+                     after={'status': contract.status,
+                            'shot_ocr': {s.shot_type: s.ocr_status for s in shots}},
+                     critical=False)
+        db.session.commit()
+        flash('已重新识别失败/待识别的截图（已成功的图未重复 OCR）', 'success')
+        return redirect(url_for('main.contract_confirm', contract_id=contract.id))
+
     storage = contract_storage_path(contract)
     if not storage or not os.path.exists(storage):
         flash('合同文件已丢失，无法重新识别', 'danger')

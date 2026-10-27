@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+from decimal import Decimal
 
 # ---------- OCR 文本清理 ----------
 
@@ -567,6 +568,207 @@ def recognize_by_rules(text, file_name=''):
         'nodes': nodes,
         'sources': sources,
         'warnings': warnings,
+    }
+
+
+# ---------- 截图式识别（CR-05 需求①：三张截图各管一段） ----------
+
+SHOT_TYPES = ('amount', 'payment', 'warranty')
+SHOT_LABELS = {'amount': '合同金额',
+               'payment': '付款条件/付款方式',
+               'warranty': '维保/质保金条款'}
+SHOT_MARKERS = {'amount': '=== 截图①：合同金额 ===',
+                'payment': '=== 截图②：付款条件/付款方式 ===',
+                'warranty': '=== 截图③：维保/质保金条款 ==='}
+SHOT_HINTS = {
+    'amount': '合同总金额、税率',
+    'payment': '付款方式、各节点付款比例',
+    'warranty': '质保期（月）、质保金比例',
+}
+
+
+def merge_shot_texts(sections):
+    """把三张截图的 OCR 文本拼成带分隔标记的整段文本（LLM/复核用）。"""
+    chunks = []
+    for shot_type in SHOT_TYPES:
+        text = ((sections or {}).get(shot_type) or '').strip()
+        if text:
+            chunks.append(SHOT_MARKERS[shot_type] + '\n' + text)
+    return '\n\n'.join(chunks)
+
+
+def _shot_confidence(value, source):
+    if value in (None, ''):
+        return 'low'
+    return 'high' if source else 'medium'
+
+
+def recognize_shots(sections, file_name='', shot_meta=None):
+    """按截图类型定向识别（Q4：金额只认①，比例/付款方式只认②，质保认③）。
+
+    规则引擎优先、LLM 兜底；识别不到就留空，绝不补默认值。
+    返回结构与 ``recognize_by_rules`` 一致，另加 ``shots`` / ``fields`` /
+    ``ratios`` / ``low_confidence_fields``。
+    """
+    sections = {k: ((sections or {}).get(k) or '') for k in SHOT_TYPES}
+    amount, amount_src = extract_amount(sections['amount'])
+    tax_rate, tax_src = extract_tax_rate(sections['amount'])
+    pay_method, pay_src = extract_payment_method(sections['payment'])
+    ratios = extract_ratios(sections['payment'])
+    warranty_months, warranty_src = extract_warranty_months(sections['warranty'])
+
+    warnings = []
+    llm_used = False
+    merged = merge_shot_texts(sections)
+    missing = (amount is None or tax_rate is None or pay_method is None
+               or warranty_months is None
+               or any(ratios[nt][0] is None for nt in
+                      ('first', 'progress', 'acceptance', 'warranty')))
+    if missing and merged:
+        llm, llm_msg = recognize_with_llm(merged, file_name)
+        if llm:
+            llm_used = True
+            if amount is None and llm.get('contract_amount'):
+                try:
+                    amount = float(llm['contract_amount'])
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    amount_src = 'llm'
+            if tax_rate is None and llm.get('tax_rate'):
+                tax_rate = llm['tax_rate']
+                tax_src = 'llm'
+            if pay_method is None and llm.get('payment_method'):
+                pay_method = llm['payment_method']
+                pay_src = 'llm'
+            if warranty_months is None and llm.get('warranty_months'):
+                try:
+                    wm = int(str(llm['warranty_months']).strip())
+                except (TypeError, ValueError):
+                    wm = None
+                if wm and wm > 0:
+                    warranty_months = wm
+                    warranty_src = 'llm'
+            if llm.get('nodes'):
+                by_type = {nd.get('node_type'): nd for nd in llm['nodes']
+                           if isinstance(nd, dict)}
+                ratios = dict(ratios)
+                for nt, nd in by_type.items():
+                    if nt not in ratios or ratios[nt][0] is not None:
+                        continue
+                    raw = nd.get('ratio')
+                    try:
+                        ratio = None if raw in (None, '') else float(raw)
+                    except (TypeError, ValueError):
+                        ratio = None
+                    if ratio is not None:
+                        ratios[nt] = (ratio, 'llm', True)
+        elif llm_msg:
+            warnings.append(llm_msg)
+
+    nodes = []
+    total = amount or 0.0
+    for nt in ('first', 'progress', 'acceptance', 'warranty'):
+        ratio, src, from_text = ratios[nt]
+        due = round(total * ratio, 2) if ratio is not None else None
+        nodes.append({
+            'node_type': nt,
+            'node_name': _rule_node_name(nt, ratio),
+            'ratio': ratio,
+            'calc_base': CALC_BASES[nt],
+            'amount': due,
+            'source_text': src or '',
+            'from_text': from_text,
+            'confidence': _shot_confidence(ratio, src),
+        })
+
+    sources = {}
+    for key, val in (('contract_amount', amount_src), ('tax_rate', tax_src),
+                     ('payment_method', pay_src),
+                     ('warranty_months', warranty_src)):
+        if val:
+            sources[key] = val
+    for nd in nodes:
+        if nd['source_text']:
+            sources.setdefault(nd['node_type'], nd['source_text'])
+
+    fields = {
+        'contract_amount': amount,
+        'tax_rate': tax_rate,
+        'payment_method': pay_method,
+        'warranty_months': warranty_months,
+    }
+    low_confidence = [k for k, v in fields.items() if v in (None, '')]
+    if amount is None:
+        warnings.append('截图①未识别到合同金额，请人工填写')
+    if not amount_src:
+        warnings.append('合同金额未定位到原文出处，请核对')
+    if tax_rate is None:
+        warnings.append('未识别到税率，请核对合同')
+    if pay_method is None:
+        warnings.append('截图②未识别到付款方式，请人工填写')
+    un_ratio = [NODE_NAMES[nt] for nt in ('first', 'progress', 'acceptance', 'warranty')
+                if ratios[nt][0] is None]
+    if un_ratio:
+        warnings.append('截图②未识别到%s比例，请按合同人工填写（系统不提供默认比例）'
+                        % '/'.join(un_ratio))
+    if warranty_months is None:
+        warnings.append('截图③未识别到质保期，可人工填写（留空则不推算质保到期日）')
+
+    known_ratios = [ratios[nt][0] for nt in ('first', 'progress', 'acceptance', 'warranty')
+                    if ratios[nt][0] is not None]
+    ratio_sum = sum(known_ratios) if known_ratios else None
+    if known_ratios and abs(ratio_sum - 1.0) > 0.0001:
+        warnings.append('识别到的节点比例合计 %s，不等于 100%%，请人工核对'
+                        % ('%.2f%%' % (ratio_sum * 100)))
+
+    def _field_text(key, value):
+        """金额/月数转纯数字文本；税率/付款方式等保持原文。"""
+        if value in (None, ''):
+            return value
+        if key in ('contract_amount', 'warranty_months'):
+            try:
+                return format(Decimal(str(value)), 'f')
+            except Exception:  # noqa: BLE001 - 非数字则原样展示
+                return value
+        return value
+
+    fields_meta = {}
+    for key, meta_src in (('contract_amount', amount_src), ('tax_rate', tax_src),
+                          ('payment_method', pay_src),
+                          ('warranty_months', warranty_src)):
+        value = fields[key]
+        fields_meta[key] = {
+            'value': _field_text(key, value),
+            'confidence': _shot_confidence(value, meta_src),
+            'source': meta_src or '',
+        }
+    ratios_meta = {
+        nt: {'value': ratios[nt][0],
+             'confidence': _shot_confidence(ratios[nt][0], ratios[nt][1]),
+             'source': ratios[nt][1] or ''}
+        for nt in ('first', 'progress', 'acceptance', 'warranty')
+    }
+
+    return {
+        'engine': 'rules',
+        'recognize_mode': 'shots',
+        'llm_fallback': llm_used,
+        'contract_amount': amount,
+        'tax_rate': tax_rate,
+        'payment_method': pay_method,
+        'warranty_months': warranty_months,
+        'nodes': nodes,
+        'sources': sources,
+        'warnings': warnings,
+        'fields': fields_meta,
+        'ratios': ratios_meta,
+        'ratio_sum': ratio_sum,
+        'low_confidence_fields': low_confidence + [
+            nt for nt in ('first', 'progress', 'acceptance', 'warranty')
+            if ratios[nt][0] is None],
+        'shots': shot_meta or [],
+        'manual_fallback': False,
     }
 
 
