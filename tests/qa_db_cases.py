@@ -580,6 +580,76 @@ def _case_cr04_draft_db(tmp):
     _dispose(app)
 
 
+def _case_cr06_derived(tmp):
+    """CR-06 派生口径：未付=max(0,applied-paid)、未申请=max(0,due-applied)、异常备注。
+
+    全部为纯展示派生（不写库、不改 status），历史异常数据只展示不阻断。
+    """
+    print('\n########## 7c. CR-06 付款口径派生值（未付 / 未申请 / 异常备注） ##########')
+    dbp = os.path.join(tmp, 'cr06_derived.db')
+    seed_db(dbp)
+    nid = q1(dbp, 'SELECT id FROM payment_nodes ORDER BY id LIMIT 1')
+
+    # label, due, applied, invoice, paid, 期望未付, 期望未申请, 备注必须包含的片段
+    scenarios = [
+        ('正常已付清', '300000', '300000', '0', '300000', '0', '0', ()),
+        ('申请已付清', '300000', '300000', '0', '100000', '200000', '0', ()),
+        ('有付款无申请', '300000', '0', '0', '100000', '0', '300000',
+         ('超付申请', '100,000.00')),
+        ('申请超应付（历史）', '300000', '320000', '0', '0', '320000', '0',
+         ('超额申请', '20,000.00')),
+        ('超付且超申请', '300000', '320000', '0', '340000', '0', '0',
+         ('超付申请', '20,000.00', '超额申请', '20,000.00')),
+        ('未触发节点', '0', '0', '0', '0', '0', '0', ()),
+    ]
+
+    def _set(conn, due, applied, invoice, paid):
+        conn.execute('UPDATE payment_nodes SET due_amount=?, applied_amount=?, '
+                     'invoice_amount=?, paid_amount=?, updated_at=? WHERE id=?',
+                     (due, applied, invoice, paid, '2026-01-01 00:00:00', nid))
+        conn.commit()
+
+    app = make_app(dbp)
+    with app.app_context():
+        from app.models import PaymentNode
+        sess = C.db.session
+        conn = sqlite3.connect(dbp)
+        for label, due, applied, invoice, paid, exp_unpaid, exp_unapplied, notes in scenarios:
+            _set(conn, due, applied, invoice, paid)
+            sess.expire_all()
+            node = sess.get(PaymentNode, nid)
+            try:
+                got = (float(node.unpaid_amount), float(node.unapplied_amount),
+                       (node.unpaid_note or ''))
+                over_applied = float(node.over_applied)
+                over_paid_app = float(node.over_paid_application)
+            except AttributeError as exc:
+                check('CR06派生', '%s：未付/未申请/异常备注属性可用' % label, False,
+                      '缺少派生属性：%s' % (exc,), xfail='CR06-②')
+                continue
+            ok_vals = (abs(got[0] - float(exp_unpaid)) < 0.005
+                       and abs(got[1] - float(exp_unapplied)) < 0.005)
+            ok_note = all(n in got[2] for n in notes) if notes else (got[2] == '')
+            check('CR06派生', '%s：未付=%s 未申请=%s 备注=%r' % (label, exp_unpaid, exp_unapplied, got[2]),
+                  ok_vals and ok_note,
+                  '实际=(%.2f, %.2f, %r)' % got, xfail=None if (ok_vals and ok_note) else 'CR06-②')
+            check('CR06派生', '%s：异常分量正确（超额申请=%s 超付申请=%s）' % (label, over_applied, over_paid_app),
+                  abs(over_applied - max(0.0, float(applied) - float(due))) < 0.005
+                  and abs(over_paid_app - max(0.0, float(paid) - float(applied))) < 0.005,
+                  '实际=(%.2f, %.2f)' % (over_applied, over_paid_app))
+            # 派生值纯展示：读取后金额列与 updated_at 不得被改写
+            row = conn.execute('SELECT due_amount, applied_amount, paid_amount, updated_at '
+                               'FROM payment_nodes WHERE id=?', (nid,)).fetchone()
+            check('CR06派生', '%s：派生值不写库（金额与 updated_at 不变）' % label,
+                  abs(float(row[0]) - float(due)) < 0.005
+                  and abs(float(row[1]) - float(applied)) < 0.005
+                  and abs(float(row[2]) - float(paid)) < 0.005
+                  and str(row[3]) == '2026-01-01 00:00:00',
+                  'row=%s' % (row,))
+        conn.close()
+    _dispose(app)
+
+
 def run():
     tmp = tempfile.mkdtemp(prefix='payment_qa_db_')
     print('数据库专项临时目录: %s' % tmp)
@@ -593,6 +663,7 @@ def run():
         _case_schema_upgrade(tmp)
         _case_cr04_draft_db(tmp)
         _case_cr05_migration(tmp)
+        _case_cr06_derived(tmp)
         _case_config_and_health(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

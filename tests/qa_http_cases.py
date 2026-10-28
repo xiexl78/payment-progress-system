@@ -1473,8 +1473,13 @@ def _batch8_change_cases(s_admin):
     check('变更', '变更增加：未付节点按原应付比例分摊（85800:24750:4950）',
           all(abs(a - b) < 0.02 for a, b in zip(spread, expected))
           and abs(sum(spread) - rem) < 0.01, '%s 期望≈%s' % (spread, expected))
-    check('变更', '变更增加：差额体现为未付（合计-已付=135,500）',
-          abs(d2(q1(DB, 'SELECT SUM(due_amount-paid_amount) FROM payment_nodes WHERE project_id=?', (pid,))) - 135500) < 0.01)
+    check('变更', '变更增加：差额体现为未申请 135,500（应付-已申请）且未付=0',
+          abs(d2(q1(DB, 'SELECT SUM(CASE WHEN due_amount-applied_amount>0 '
+                          'THEN due_amount-applied_amount ELSE 0 END) '
+                          'FROM payment_nodes WHERE project_id=?', (pid,))) - 135500) < 0.01
+          and abs(d2(q1(DB, 'SELECT SUM(CASE WHEN applied_amount-paid_amount>0 '
+                           'THEN applied_amount-paid_amount ELSE 0 END) '
+                           'FROM payment_nodes WHERE project_id=?', (pid,)))) < 0.01)
     check('变更', '变更增加：合同总额=原金额+增补=185,000',
           d2(q1(DB, 'SELECT SUM(original_amount+additional_amount) FROM project_items WHERE project_id=?', (pid,))) == d2('185000'))
 
@@ -2484,6 +2489,265 @@ def _cr05_final_cases(s_admin):
           '字段=%s' % ('有' if 'name="warranty_months"' in page_c else '无'))
 
 
+def _cr06_cases(s_admin):
+    """CR-06 付款口径（未付=申请-已付、未申请=应付-申请）与合同变更冻结口径。
+
+    口径见 `docs/change-request-06.md` v1.0：冻结对象改为 has_business
+    （申请/开票/付款任一发生）；三个异常数（超付申请/超应付/超额申请）互不替代。
+    """
+    import io as _io
+    import shutil as _shutil
+    from openpyxl import load_workbook
+
+    def node_sum(pid):
+        return d2(q1(DB, 'SELECT SUM(due_amount) FROM payment_nodes WHERE project_id=?', (pid,)) or 0)
+
+    def due_of(pid, nt):
+        return _node_vals(node_ids(pid, nt)[0])['due']
+
+    def sql_exec(sql, args=()):
+        conn = sqlite3.connect(DB)
+        conn.execute(sql, args)
+        conn.commit()
+        conn.close()
+
+    def excel_header(resp, keys):
+        """返回 xlsx 中含 keys 的 sheet 的第一行表头（按子串匹配）。"""
+        wb = load_workbook(_io.BytesIO(resp.content))
+        for ws in wb.worksheets:
+            rows = list(ws.iter_rows(values_only=True))
+            for row in rows[:3]:
+                vals = [str(c) if c is not None else '' for c in row]
+                if all(any(k in v for v in vals) for k in keys):
+                    return vals
+        return []
+
+    # ---------- ① 仅申请未付款的节点也冻结（due/status/applied/paid 不动、不承接差额） ----------
+    _, p1 = create_project(s_admin, 'QA-CR06-APPLY', 'QA仅申请冻结', [('合同价款', '100000', '0')])
+    if p1:
+        iid1 = item_ids(p1)[0]
+        nf1 = node_ids(p1, 'first')[0]
+        C.post(s_admin, BASE, '/nodes/%d/update' % nf1,
+               {'action': 'apply', 'apply_amount': '30000', 'apply_no': C.next_apply_no('QA-CR06-A')})
+        frozen_before = _node_vals(nf1)
+        r1, r2 = contract_change(s_admin, p1, {iid1: '110000'})
+        frozen_after = _node_vals(nf1)
+        check('CR06', '仅申请未付款的节点在合同变更时冻结（due/status/applied/paid 全不变）',
+              r2 is not None and r2.status_code == 302 and frozen_after == frozen_before,
+              'r2=%s before=%s after=%s' % (getattr(r2, 'status_code', None), frozen_before, frozen_after))
+        spread = {nt: due_of(p1, nt) for nt in ('progress', 'acceptance', 'warranty')}
+        expected = {'progress': d2('59428.57'), 'acceptance': d2('17142.86'), 'warranty': d2('3428.57')}
+        check('CR06', '仅申请冻结：差额 80,000 只分给未冻结节点（按原应付比例）',
+              all(abs(spread[nt] - expected[nt]) < 0.02 for nt in expected)
+              and abs(sum(spread.values()) - 80000) < 0.01,
+              '实际=%s 期望≈%s' % (spread, expected))
+        check('CR06', '仅申请冻结：节点应付合计=新总额 110,000（守恒）',
+              abs(node_sum(p1) - 110000) < 0.01, '合计=%.2f' % node_sum(p1))
+
+    # ---------- ② 仅开票的节点也冻结 ----------
+    _, p2 = create_project(s_admin, 'QA-CR06-INV', 'QA仅开票冻结', [('合同价款', '10000', '0')])
+    if p2:
+        iid2, np2 = item_ids(p2)[0], node_ids(p2, 'progress')[0]
+        C.post(s_admin, BASE, '/nodes/%d/update' % np2,
+               {'action': 'invoice', 'invoice_amount': '2000', 'invoice_no': C.next_apply_no('QA-CR06-FP')})
+        inv_before = _node_vals(np2)
+        r1, r2 = contract_change(s_admin, p2, {iid2: '12000'})
+        inv_after = _node_vals(np2)
+        check('CR06', '仅开票的节点在合同变更时冻结（应付/开票额/状态不变）',
+              r2 is not None and r2.status_code == 302 and inv_after == inv_before,
+              'r2=%s before=%s after=%s' % (getattr(r2, 'status_code', None), inv_before, inv_after))
+        check('CR06', '仅开票冻结：节点合计=12,000 且冻结节点未承接差额',
+              abs(node_sum(p2) - 12000) < 0.01 and abs(inv_after['due'] - inv_before['due']) < 0.005,
+              '合计=%.2f 冻结应付=%.2f' % (node_sum(p2), inv_after['due']))
+
+    # ---------- ③ 全部节点已冻结：变更总额≠冻结应付合计时阻断 ----------
+    _, p3 = create_project(s_admin, 'QA-CR06-ALL', 'QA全冻结阻断', [('合同价款', '10000', '0')])
+    if p3:
+        iid3 = item_ids(p3)[0]
+        for nt, data in (('first', {'action': 'apply', 'apply_amount': '100',
+                                    'apply_no': C.next_apply_no('QA-CR06-F')}),
+                         ('progress', {'action': 'invoice', 'invoice_amount': '100',
+                                       'invoice_no': C.next_apply_no('QA-CR06-I')}),
+                         ('acceptance', {'action': 'pay', 'paid_amount': '100',
+                                         'pay_date': '2026-10-28'}),
+                         ('warranty', {'action': 'apply', 'apply_amount': '100',
+                                       'apply_no': C.next_apply_no('QA-CR06-W')})):
+            C.post(s_admin, BASE, '/nodes/%d/update' % node_ids(p3, nt)[0], data)
+        sum_before3 = node_sum(p3)
+        r1, r2 = contract_change(s_admin, p3, {iid3: '20000'})
+        check('CR06', '全部节点已冻结时，变更总额≠冻结应付合计被阻断（库不变）',
+              r2 is None and abs(node_sum(p3) - sum_before3) < 0.005,
+              'r2=%s 合计=%.2f' % (getattr(r2, 'status_code', None), node_sum(p3)))
+
+    # ---------- ④ 新总额 < 冻结应付合计（仅申请冻结也算） ----------
+    _, p4 = create_project(s_admin, 'QA-CR06-LOW', 'QA低于冻结额', [('合同价款', '100000', '0')])
+    if p4:
+        iid4, nf4 = item_ids(p4)[0], node_ids(p4, 'first')[0]
+        C.post(s_admin, BASE, '/nodes/%d/update' % nf4,
+               {'action': 'apply', 'apply_amount': '30000', 'apply_no': C.next_apply_no('QA-CR06-L')})
+        sum_before4 = node_sum(p4)
+        r1, r2 = contract_change(s_admin, p4, {iid4: '20000'})
+        check('CR06', '新总额小于冻结节点应付合计时阻断（库不变）',
+              r2 is None and abs(node_sum(p4) - sum_before4) < 0.005,
+              'r2=%s 合计=%.2f' % (getattr(r2, 'status_code', None), node_sum(p4)))
+
+    # ---------- ⑤ 设计 §2.3 数字例子：100 万 → 110 万 ----------
+    _, p5 = create_project(s_admin, 'QA-CR06-1100K', 'QA一百万变更', [('合同价款', '1000000', '0')])
+    if p5:
+        iid5, nf5 = item_ids(p5)[0], node_ids(p5, 'first')[0]
+        C.post(s_admin, BASE, '/nodes/%d/update' % nf5,
+               {'action': 'apply', 'apply_amount': '300000', 'apply_no': C.next_apply_no('QA-CR06-11A')})
+        C.post(s_admin, BASE, '/nodes/%d/update' % nf5,
+               {'action': 'pay', 'paid_amount': '300000', 'pay_date': '2026-10-28'})
+        r1, r2 = contract_change(s_admin, p5, {iid5: '1100000'})
+        got = {nt: due_of(p5, nt) for nt in ('first', 'progress', 'acceptance', 'warranty')}
+        exp = {'first': d2('300000'), 'progress': d2('594285.71'),
+               'acceptance': d2('171428.57'), 'warranty': d2('34285.72')}
+        check('CR06', '110 万例子：冻结 300,000、分摊 594,285.71/171,428.57/34,285.72（尾差归质保）',
+              r2 is not None and all(abs(got[k] - exp[k]) < 0.02 for k in exp)
+              and abs(node_sum(p5) - 1100000) < 0.01,
+              '实际=%s 期望=%s 合计=%.2f' % (got, exp, node_sum(p5)))
+        chg = [x for x in _audit_rows(0) if 'contract_change' in str(x.get('action', ''))
+               and str(x.get('object_id')) == str(p5)]
+        check('CR06', '110 万例子：变更写 project.contract_change 审计（含 before/after）',
+              bool(chg), '审计行=%d' % len(chg))
+
+    # ---------- ⑥ 详情页：未付/未申请列 + 冻结标签 + 两类红标 ----------
+    _, p6 = create_project(s_admin, 'QA-CR06-PAGE', 'QA口径页面', [('合同价款', '100000', '0')])
+    if p6:
+        nf6 = node_ids(p6, 'first')[0]
+        C.post(s_admin, BASE, '/nodes/%d/update' % nf6,
+               {'action': 'apply', 'apply_amount': '30000', 'apply_no': C.next_apply_no('QA-CR06-P')})
+        page6 = s_admin.get(BASE + '/projects/%d' % p6, timeout=60).text
+        check('CR06', '详情主表含「未付」「未申请」列',
+              '未付' in page6 and '未申请' in page6, '页面缺列')
+        check('CR06', '仅申请节点在详情页标「已冻结」',
+              '已冻结' in page6, '页面无冻结标签')
+        # 直接改库模拟历史异常数据：paid>applied（超付申请）、applied>due（超额申请）
+        sql_exec('UPDATE payment_nodes SET applied_amount=?, paid_amount=? WHERE id=?',
+                 ('320000', '340000', node_ids(p6, 'progress')[0]))
+        page6b = s_admin.get(BASE + '/projects/%d' % p6, timeout=60).text
+        check('CR06', '详情页显示「超付申请」红标（paid>applied）', '超付申请' in page6b,
+              '未出现超付申请标记')
+        check('CR06', '详情页显示「超额申请」红标（applied>due）', '超额申请' in page6b,
+              '未出现超额申请标记')
+
+    # ---------- ⑦ 报表：列名「超应付金额」、异常备注、未申请、提醒口径 ----------
+    _, prem = create_project(s_admin, 'QA-CR06-REM', 'QA提醒项目', [('QA-CR06提醒科目', '10000', '0')])
+    _, pfull = create_project(s_admin, 'QA-CR06-FULL', 'QA已付清项目', [('QA-CR06付清科目', '10000', '0')])
+    if prem and pfull:
+        n_rem = node_ids(prem, 'first')[0]
+        C.post(s_admin, BASE, '/nodes/%d/update' % n_rem,
+               {'action': 'apply', 'apply_amount': '3000', 'apply_no': C.next_apply_no('QA-CR06-R1')})
+        C.post(s_admin, BASE, '/nodes/%d/update' % n_rem,
+               {'action': 'pay', 'paid_amount': '1000', 'pay_date': '2026-10-28'})
+        n_full = node_ids(pfull, 'first')[0]
+        C.post(s_admin, BASE, '/nodes/%d/update' % n_full,
+               {'action': 'apply', 'apply_amount': '3000', 'apply_no': C.next_apply_no('QA-CR06-R2')})
+        C.post(s_admin, BASE, '/nodes/%d/update' % n_full,
+               {'action': 'pay', 'paid_amount': '3000', 'pay_date': '2026-10-28'})
+        rep = s_admin.get(BASE + '/reports', timeout=60).text
+        check('CR06', '报表列含「超应付金额」「未付异常备注」「未申请」',
+              all(k in rep for k in ('超应付金额', '未付异常备注', '未申请')), '报表缺列')
+        block = rep.split('待办提醒', 1)[-1].split('付款台账总览', 1)[0]
+        check('CR06', '提醒按真实欠付（applied-paid>0）：部分付款项目在提醒中',
+              'QA-CR06提醒科目' in block, '提醒块未包含部分付款节点')
+        check('CR06', '提醒不含已付清项目（applied-paid=0）',
+              'QA-CR06付清科目' not in block, '提醒块错误包含已付清节点')
+
+    # ---------- ⑧ 导出：列顺序/异常备注/合计，两处导出口径一致 ----------
+    _, p8 = create_project(s_admin, 'QA-CR06-EXP', 'QA导出项目', [('QA-CR06导出科目', '30000', '0')])
+    if p8:
+        n8 = node_ids(p8, 'first')[0]
+        sql_exec('UPDATE payment_nodes SET applied_amount=?, paid_amount=? WHERE id=?',
+                 ('32000', '34000', n8))
+        resp8 = s_admin.get(BASE + '/projects/%d/export.xlsx' % p8, timeout=60)
+        hdr8 = []
+        note8 = ''
+        try:
+            wb8 = load_workbook(_io.BytesIO(resp8.content))
+            for ws in wb8.worksheets:
+                rows8 = list(ws.iter_rows(values_only=True))
+                if not rows8:
+                    continue
+                if any('未付金额' in str(c) for c in rows8[0] if c is not None):
+                    hdr8 = [str(c) for c in rows8[0]]
+                    idx_note = hdr8.index('未付异常备注') if '未付异常备注' in hdr8 else None
+                    if idx_note is not None:
+                        for row in rows8[1:]:
+                            if any('QA-CR06导出科目' in str(c) for c in row if c is not None):
+                                note8 = str(row[idx_note] or '')
+                                break
+                    break
+        except Exception as e:
+            check('CR06', '项目导出 xlsx 可解析', False,
+                  'status=%s %r' % (resp8.status_code, e))
+        need8 = ['应付金额', '已申请金额', '已开票金额', '已支付金额', '未付金额',
+                 '未申请金额', '未付异常备注', '付款状态', '发票状态']
+        check('CR06', '项目导出表头含新列（未付/未申请/未付异常备注/付款状态/发票状态）',
+              all(k in hdr8 for k in need8), '表头=%s' % (hdr8,))
+        check('CR06', '项目导出「未付异常备注」同时写超付申请与超额申请',
+              '超付申请' in note8 and '超额申请' in note8, '备注=%r' % note8)
+        order_ok = all(k in hdr8 for k in ('未付金额', '未申请金额', '未付异常备注', '状态'))
+        if order_ok:
+            order_ok = (hdr8.index('未付金额') < hdr8.index('未申请金额')
+                        < hdr8.index('未付异常备注') < hdr8.index('状态'))
+        check('CR06', '项目导出节点顺序：未付金额 → 未申请金额 → 未付异常备注 → 状态',
+              order_ok, '表头=%s' % (hdr8,))
+
+        resp_rep = s_admin.get(BASE + '/reports/export.xlsx', timeout=60)
+        hdr_rep = excel_header(resp_rep, ['项目名称', '未付']) if resp_rep.status_code == 200 else []
+        check('CR06', '报表导出表头含「未申请金额」「未付异常备注」「超应付金额」',
+              all(any(k in v for v in hdr_rep) for k in ('未申请金额', '未付异常备注', '超应付金额')),
+              'status=%s 表头=%s' % (resp_rep.status_code, hdr_rep))
+
+        # scripts/export_excel.py 与 app/exporter.py 的列名/口径必须一致
+        tmpd = tempfile.mkdtemp(prefix='qa_cr06_exp_')
+        try:
+            dbcopy = os.path.join(tmpd, 'copy.db')
+            _shutil.copyfile(DB, dbcopy)
+            outdir = os.path.join(tmpd, 'out')
+            os.makedirs(outdir, exist_ok=True)
+            env = os.environ.copy()
+            env['PYTHONIOENCODING'] = 'utf-8'
+            env['PYTHONUTF8'] = '1'
+            proc = subprocess.run(
+                [sys.executable, os.path.join(PROJECT_ROOT, 'scripts', 'export_excel.py'),
+                 '--db', dbcopy, '--out', outdir, '--no-audit'],
+                cwd=PROJECT_ROOT, capture_output=True, text=True,
+                encoding='utf-8', errors='replace', timeout=180, env=env)
+            script_hdr = []
+            for name in sorted(os.listdir(outdir)):
+                if not name.lower().endswith('.xlsx'):
+                    continue
+                wb2 = load_workbook(os.path.join(outdir, name))
+                for ws2 in wb2.worksheets:
+                    first = next(ws2.iter_rows(values_only=True), None)
+                    cells = [str(c) for c in first if c is not None] if first else []
+                    # 项目明细 sheet 的节点表头以「科目/节点/应付金额」开头；
+                    # 报表汇总 sheet 只有「应付金额」没有「节点」列，需跳过。
+                    if '科目' in cells and '节点' in cells and '未付金额' in cells:
+                        script_hdr = cells
+                        break
+                if script_hdr:
+                    break
+            from app.exporter import NODE_HEADERS as _NH
+            check('CR06', 'scripts/export_excel.py 导出成功且节点表头与 app/exporter 一致',
+                  proc.returncode == 0 and list(script_hdr) == list(_NH),
+                  'rc=%s 脚本表头=%s app=%s err=%s' % (
+                      proc.returncode, script_hdr, list(_NH), (proc.stderr or '')[-200:]))
+        finally:
+            _shutil.rmtree(tmpd, ignore_errors=True)
+
+    # ---------- ⑨ 无迁移：派生值全部即时计算，不新增列/不回写 ----------
+    cols = {row[1] for row in q(DB, 'PRAGMA table_info(payment_nodes)')}
+    check('CR06', '旧库不迁移：payment_nodes 不新增未付/未申请列（纯派生）',
+          not ({'unpaid_amount', 'unapplied_amount'} & cols), '多出列=%s' % (
+              {'unpaid_amount', 'unapplied_amount'} & cols))
+    check('CR06', '旧库不迁移：历史 applied/paid 数据仍按新公式即时展示（详情页不报错）',
+          p6 is not None and s_admin.get(BASE + '/projects/%d' % p6, timeout=60).status_code == 200)
+
+
 def run(server):
     global DB, BASE, APP, UPLOAD_DIR
     DB, BASE, APP, UPLOAD_DIR = server.db_path, server.base, server.app, server.upload_dir
@@ -2522,5 +2786,6 @@ def run(server):
     section('########## 11i. 单号·多笔付款·字段改名（CR-05 ③④⑥） ##########', lambda: _cr05_cases(s_admin))
     section('########## 11j. 按模板上传关键信息截图（CR-05 需求①） ##########', lambda: _shot_cases(s_admin))
     section('########## 11k. CR-05 最终补充（②质保/③单号/⑤令牌/⑥上限/①兜底） ##########', lambda: _cr05_final_cases(s_admin))
+    section('########## 11l. CR-06 付款/未付口径与冻结范围 ##########', lambda: _cr06_cases(s_admin))
     section('########## 12. 导出（批次 6a） ##########', lambda: _batch6_export_import(s_admin))
     section('########## 12. 审计补充（批次 3 补测，末项会删临时库 audit_logs） ##########', lambda: _audit_extras(s_admin))
