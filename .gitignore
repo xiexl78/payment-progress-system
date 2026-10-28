@@ -17,3 +17,8 @@ backups/
 qa_*.json
 qa_cookie.txt
 scripts/samples/scan_e2e.*
+
+# GitNexus 本机工具生成的智能体说明与技能（不入库）
+AGENTS.md
+CLAUDE.md
+.claude/
