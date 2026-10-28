@@ -2748,6 +2748,162 @@ def _cr06_cases(s_admin):
           p6 is not None and s_admin.get(BASE + '/projects/%d' % p6, timeout=60).status_code == 200)
 
 
+_C06_TAG_RE = re.compile(r'<[^>]+>')
+
+
+def _c06_text(fragment):
+    return re.sub(r'\s+', ' ', _C06_TAG_RE.sub(' ', fragment)).strip()
+
+
+def _c06_tables(html):
+    """按 <table> 切分，返回 [(headers, [(cells, attrs), ...]), ...]。"""
+    out = []
+    for tbl in re.findall(r'<table\b.*?</table>', html, re.S):
+        trs = re.findall(r'<tr\b.*?</tr>', tbl, re.S)
+        if not trs:
+            continue
+        hdr_cells = re.findall(r'<(th|td)\b([^>]*)>(.*?)</\1>', trs[0], re.S)
+        headers = [_c06_text(c[2]) for c in hdr_cells]
+        rows = []
+        for tr in trs[1:]:
+            cells = re.findall(r'<(td|th)\b([^>]*)>(.*?)</\1>', tr, re.S)
+            if not cells:
+                continue
+            rows.append(([_c06_text(c[2]) for c in cells], [c[1] for c in cells]))
+        out.append((headers, rows))
+    return out
+
+
+def _cr06_review_cases(s_admin):
+    """CR-06 评审修正验收：冻结文案统一 / 未付异常归位 / 详情 N+1 消除。"""
+    # ---------- ⑴ 运行时文案：app/ 与 scripts/ 不再出现旧说法 ----------
+    runtime_files = []
+    for sub in ('app', 'scripts'):
+        for root, _dirs, files in os.walk(os.path.join(PROJECT_ROOT, sub)):
+            for fn in files:
+                if fn.endswith(('.py', '.html')):
+                    runtime_files.append(os.path.join(root, fn))
+    legacy = []
+    for fp in runtime_files:
+        try:
+            with open(fp, encoding='utf-8', errors='replace') as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        rel = os.path.relpath(fp, PROJECT_ROOT)
+        for bad in ('已付款节点', '已付节点'):
+            if bad in text:
+                legacy.append('%s:%s' % (rel, bad))
+    check('CR06评审', '运行时文案（app/、scripts/）无「已付款节点/已付节点」旧说法',
+          not legacy, '命中=%s' % (legacy[:5],))
+
+    tpl = os.path.join(PROJECT_ROOT, 'app', 'templates')
+    with open(os.path.join(tpl, 'contract_change.html'), encoding='utf-8') as fh:
+        cc_html = fh.read()
+    with open(os.path.join(tpl, 'project_detail.html'), encoding='utf-8') as fh:
+        pd_html = fh.read()
+    with open(os.path.join(tpl, 'project_form.html'), encoding='utf-8') as fh:
+        pf_html = fh.read()
+    with open(os.path.join(PROJECT_ROOT, 'app', 'routes.py'), encoding='utf-8') as fh:
+        rt_src = fh.read()
+    check('CR06评审', '冻结文案统一为「已发生业务节点」（变更页两处 + 变更 flash）',
+          cc_html.count('已发生业务节点') >= 2 and '已发生业务节点冻结未改' in rt_src,
+          '变更页=%d flash=%s' % (cc_html.count('已发生业务节点'),
+                                  '已发生业务节点冻结未改' in rt_src))
+    check('CR06评审', '详情页/新建页冻结口径同步为「已发生任一业务（申请/开票/付款）」',
+          '已发生任一业务' in pd_html and '已发生任一业务' in pf_html)
+
+    # ---------- ⑵ 未付格：异常备注同格标红，状态列不再承载备注 ----------
+    def sql_exec(sql, args=()):
+        conn = sqlite3.connect(DB)
+        try:
+            conn.execute(sql, args)
+            conn.commit()
+        finally:
+            conn.close()
+
+    create_project(s_admin, 'QA-CR06-REV1M', 'CR06评审未付格', [('评审科目', '1000000')])
+    pid = q1(DB, "SELECT id FROM projects WHERE project_no='QA-CR06-REV1M'")
+    n_first = q1(DB, "SELECT id FROM payment_nodes WHERE project_id=? AND node_type='first'", (pid,))
+    n_prog = q1(DB, "SELECT id FROM payment_nodes WHERE project_id=? AND node_type='progress'", (pid,))
+    sql_exec("UPDATE payment_nodes SET applied_amount=320000, paid_amount=340000, status='已付款' WHERE id=?", (n_first,))
+    sql_exec('UPDATE payment_nodes SET applied_amount=100 WHERE id=?', (n_prog,))
+    page = s_admin.get(BASE + '/projects/%d' % pid, timeout=60)
+    html = page.text
+
+    headers, rows = [], []
+    node_tables = []
+    for hdr, rws in _c06_tables(html):
+        if '未付' in hdr and '未申请' in hdr:
+            node_tables.append((hdr, rws))
+            if not headers:
+                headers, rows = hdr, rws
+    check('CR06评审', '详情页节点表存在未付列且表头改为「状态/异常」（不再叫「进度」）',
+          bool(headers) and '未付' in headers and '状态/异常' in headers and '进度' not in headers,
+          'headers=%s' % (headers,))
+
+    def row_of(amount_text):
+        """跨节点类型分组的所有表找金额所在行，返回 (headers, texts, attrs)。"""
+        for hdr, rws in node_tables:
+            for texts, attrs in rws:
+                if any(amount_text in t for t in texts):
+                    return hdr, texts, attrs
+        return None, None, None
+
+    h_bad, t_bad, a_bad = row_of('300,000.00')
+    i_unpaid = h_bad.index('未付') if h_bad and '未付' in h_bad else -1
+    i_state = h_bad.index('状态/异常') if h_bad and '状态/异常' in h_bad else -1
+    bad_unpaid = t_bad[i_unpaid] if t_bad and i_unpaid >= 0 else ''
+    bad_state = t_bad[i_state] if t_bad and i_state >= 0 else ''
+    bad_cls = a_bad[i_unpaid] if a_bad and i_unpaid >= 0 else ''
+    check('CR06评审', '未付为 0 但存在超付申请/超额申请时，备注落在未付格内',
+          '超付申请' in bad_unpaid and '超额申请' in bad_unpaid and '20,000.00' in bad_unpaid,
+          '未付格=%s' % bad_unpaid)
+    check('CR06评审', '未付为 0 且有异常时未付格标红（text-danger）',
+          'text-danger' in bad_cls and bad_unpaid.startswith('￥0.00'),
+          '未付格=%r class=%r' % (bad_unpaid, bad_cls))
+    check('CR06评审', '状态/异常列不再承载未付异常备注（备注只在未付格）',
+          '超付申请' not in bad_state and '超额申请' not in bad_state,
+          '状态格=%s' % bad_state)
+
+    h_ok, t_ok, _a_ok = row_of('520,000.00')
+    i_ok = h_ok.index('未付') if h_ok and '未付' in h_ok else -1
+    ok_unpaid = t_ok[i_ok] if t_ok and i_ok >= 0 else ''
+    check('CR06评审', '正常未付（未付>0）格显示金额且不带异常备注',
+          '100.00' in ok_unpaid and '超付申请' not in ok_unpaid and '超额申请' not in ok_unpaid,
+          '未付格=%s' % ok_unpaid)
+
+    # ---------- ⑶ 查询次数：详情页不随节点数线性增长；报表无逐节点 N+1 ----------
+    from sqlalchemy import event as _sa_event
+    from sqlalchemy.engine import Engine as _Engine
+
+    def count_queries(fn):
+        counter = {'n': 0}
+
+        def _rec(*_a, **_k):
+            counter['n'] += 1
+
+        _sa_event.listen(_Engine, 'before_cursor_execute', _rec)
+        try:
+            resp = fn()
+        finally:
+            _sa_event.remove(_Engine, 'before_cursor_execute', _rec)
+        return counter['n'], resp
+
+    create_project(s_admin, 'QA-CR06-REV12', 'CR06评审12节点', [('甲', '10000'), ('乙', '20000'), ('丙', '30000')])
+    create_project(s_admin, 'QA-CR06-REV4', 'CR06评审4节点', [('丁', '10000')])
+    pid12 = q1(DB, "SELECT id FROM projects WHERE project_no='QA-CR06-REV12'")
+    pid4 = q1(DB, "SELECT id FROM projects WHERE project_no='QA-CR06-REV4'")
+    q12, r12 = count_queries(lambda: s_admin.get(BASE + '/projects/%d' % pid12, timeout=60))
+    q4, r4 = count_queries(lambda: s_admin.get(BASE + '/projects/%d' % pid4, timeout=60))
+    check('CR06评审', '详情页查询数不随节点数线性增长（12 节点 vs 4 节点 SQL 差 ≤ 3）',
+          r12.status_code == 200 and r4.status_code == 200 and (q12 - q4) <= 3,
+          'q12=%d q4=%d delta=%d' % (q12, q4, q12 - q4))
+    qrep, rrep = count_queries(lambda: s_admin.get(BASE + '/reports', timeout=120))
+    check('CR06评审', '报表页无逐节点 N+1（整库渲染 SQL < 30 条）',
+          rrep.status_code == 200 and qrep < 30, 'q=%d status=%s' % (qrep, rrep.status_code))
+
+
 def run(server):
     global DB, BASE, APP, UPLOAD_DIR
     DB, BASE, APP, UPLOAD_DIR = server.db_path, server.base, server.app, server.upload_dir
@@ -2787,5 +2943,6 @@ def run(server):
     section('########## 11j. 按模板上传关键信息截图（CR-05 需求①） ##########', lambda: _shot_cases(s_admin))
     section('########## 11k. CR-05 最终补充（②质保/③单号/⑤令牌/⑥上限/①兜底） ##########', lambda: _cr05_final_cases(s_admin))
     section('########## 11l. CR-06 付款/未付口径与冻结范围 ##########', lambda: _cr06_cases(s_admin))
+    section('########## 11m. CR-06 评审修正（文案/未付异常归位/N+1） ##########', lambda: _cr06_review_cases(s_admin))
     section('########## 12. 导出（批次 6a） ##########', lambda: _batch6_export_import(s_admin))
     section('########## 12. 审计补充（批次 3 补测，末项会删临时库 audit_logs） ##########', lambda: _audit_extras(s_admin))
