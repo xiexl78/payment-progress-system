@@ -86,17 +86,17 @@
       <table class="table">
         <thead>
           <tr><th>费用科目</th><th class="num">原金额</th><th class="num">增补</th><th class="num">当前总额</th>
-            <th class="num">已付节点应付合计</th><th class="num">已开票合计</th><th class="num" style="width:180px;">变更后总额 *</th></tr>
+            <th class="num">冻结节点应付合计</th><th class="num">已开票合计</th><th class="num" style="width:180px;">变更后总额 *</th></tr>
         </thead>
         <tbody>
           {% for item in items %}
-          {% set paid_due = item.nodes|selectattr('paid_amount', 'gt', 0)|map(attribute='due_amount')|sum %}
+          {% set frozen_due = item.nodes|selectattr('has_business')|map(attribute='due_amount')|sum %}
           <tr>
             <td>{{ item.item_name }}</td>
             <td class="num">￥{{ '{:,.2f}'.format(item.original_amount) }}</td>
             <td class="num">￥{{ '{:,.2f}'.format(item.additional_amount) }}</td>
             <td class="num">￥{{ '{:,.2f}'.format(item.total_amount) }}</td>
-            <td class="num">{{ '{:,.2f}'.format(paid_due) }}</td>
+            <td class="num">{{ '{:,.2f}'.format(frozen_due) }}</td>
             <td class="num">{{ '{:,.2f}'.format(item.nodes|map(attribute='invoice_amount')|sum) }}</td>
             <td class="num"><input type="number" name="item_total_{{ item.id }}" step="0.01" min="0.01"
                                    value="{{ values[item.id] }}" style="width:150px;" required></td>
@@ -107,12 +107,12 @@
     </div>
 
     <div class="flash info" style="margin-top:12px;">
-      <b>变更口径（CR-04）：</b>
+      <b>变更口径（CR-06）：</b>
       <ul style="margin:6px 0 0 18px;">
         <li>逐科目填写变更后总额（= 新原金额 + 新增补金额），不必按统一比例。</li>
-        <li>已付款节点（已付 &gt; 0）的应付/已付/状态 <b>全部冻结</b>，不参与重算。</li>
-        <li>科目差额 = 新总额 − 已付节点应付合计，按该科目未付节点原应付比例分摊；尾差按 质保金→验收→进度→首付 归集。</li>
-        <li>新总额 &lt; 已付节点应付合计、或任一节点已开票 &gt; 新应付 → 阻断并逐项列出，不允许保存。</li>
+        <li>已发生业务节点（任一申请/开票/付款，唯一冻结口径）的应付/已付/状态 <b>全部冻结</b>，不参与重算，仅记录变更备注。</li>
+        <li>科目差额 = 新总额 − 冻结节点应付合计，按该科目未冻结节点原应付比例分摊；尾差按 质保金→验收→进度→首付 归集。</li>
+        <li>新总额 &lt; 冻结节点应付合计、或任一节点已开票 &gt; 新应付 → 阻断并逐项列出，不允许保存。</li>
         <li>变更前后金额差异写入节点备注；提交后先出差异清单，二次确认才写库并记审计。</li>
       </ul>
     </div>

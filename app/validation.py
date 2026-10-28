@@ -488,16 +488,17 @@ def validate_contract_change_items(project, form):
                    + Decimal(item.additional_amount or 0)).quantize(CENT)
         if value != current:
             all_same = False
-        frozen = [n for n in item.nodes
-                  if Decimal(n.paid_amount or 0) > 0 or n.status == '已付款']
+        # CR-06：唯一的冻结口径——节点已有任一业务（申请/开票/付款/申请单/开票单）
+        # 即冻结，不再只看 paid_amount > 0 或 status == '已付款'。
+        frozen = [n for n in item.nodes if n.has_business]
         frozen_due = sum((Decimal(n.due_amount or 0) for n in frozen), ZERO).quantize(CENT)
         if value < frozen_due:
-            errors.append('%s %s 小于已有付款节点应付合计 %s，无法在冻结已有付款节点的前提下变更'
-                          % (label, _money(value), _money(frozen_due)))
-        unfrozen = [n for n in item.nodes if n not in frozen]
+            errors.append('%s %s 小于冻结节点应付合计 %s，无法在冻结已发生业务节点'
+                          '的前提下变更' % (label, _money(value), _money(frozen_due)))
+        unfrozen = [n for n in item.nodes if not n.has_business]
         if not unfrozen and value != frozen_due:
-            errors.append('%s 的科目已无未付节点，变更后总额必须等于已付款节点应付合计 %s'
-                          % (label, _money(frozen_due)))
+            errors.append('%s 的科目节点均已发生业务并冻结，变更后总额必须等于冻结节点'
+                          '应付合计 %s' % (label, _money(frozen_due)))
         for node in item.nodes:
             if node.status == '超付待处理':
                 errors.append('科目「%s」存在历史超付节点「%s」，请先处理后再做合同变更'

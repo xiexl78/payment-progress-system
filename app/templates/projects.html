@@ -74,6 +74,14 @@
           <div class="v text-success">￥{{ '{:,.2f}'.format(p.nodes|sum(attribute='paid_amount')|float) }}</div>
           <div class="l">已付金额</div>
         </div>
+        <div class="amt">
+          <div class="v {{ 'text-danger' if p.unpaid_amount > 0 else '' }}">￥{{ '{:,.2f}'.format(p.unpaid_amount) }}</div>
+          <div class="l">未付金额</div>
+        </div>
+        <div class="amt">
+          <div class="v {{ 'text-danger' if p.unapplied_amount > 0 else '' }}">￥{{ '{:,.2f}'.format(p.unapplied_amount) }}</div>
+          <div class="l">未申请金额</div>
+        </div>
       </div>
       <div>
         {% set due_all = p.nodes|sum(attribute='due_amount')|float %}

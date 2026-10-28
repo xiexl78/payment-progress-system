@@ -25,7 +25,6 @@ from openpyxl.utils import get_column_letter
 from .money import CENT
 from .nodes import invoice_state, payment_state
 from .timeutil import to_local, utcnow
-from .validation import NODE_LABELS
 
 __all__ = [
     'ITEM_HEADERS', 'NODE_HEADERS', 'APPLICATION_HEADERS', 'RECORD_HEADERS',
@@ -36,16 +35,17 @@ __all__ = [
 
 #: 列定义（与页面表头保持一致；供页面/文档/测试引用）
 ITEM_HEADERS = ('科目名称', '税率', '原金额', '增补金额', '科目总额')
-NODE_HEADERS = ('科目', '节点名称', '节点类型', '比例', '计算基数',
-                '应付金额', '已申请金额', '已开票金额', '已支付金额', '未付金额',
+NODE_HEADERS = ('科目', '节点', '应付金额', '已申请金额', '已开票金额', '已支付金额',
+                '未付金额', '未申请金额', '未付异常备注',
                 '状态', '付款状态', '发票状态', '应付日期', '触发日期')
 APPLICATION_HEADERS = ('申请单号', '科目', '节点', '申请金额', '已开票金额',
                        '发票号', '已付金额', '付款笔数', '状态', '申请人', '申请时间')
 RECORD_HEADERS = ('付款日期', '科目', '节点', '付款金额', '付款方式',
                   '凭证号', '经办人', '关联申请单号')
 ACCEPTANCE_HEADERS = ('验收日期', '验收人', '结论', '备注', '登记时间')
-REPORT_HEADERS = ('项目名称', '项目编号', '状态', '应付金额', '申请金额', '开票金额', '付款金额',
-                  '未付金额', '超付金额', '付款进度(%)')
+REPORT_HEADERS = ('项目名称', '项目编号', '合同金额', '应付金额', '申请金额',
+                  '开票金额', '付款金额', '未付金额', '未申请金额', '未付异常备注',
+                  '超应付金额', '付款进度(%)')
 AUDIT_HEADERS = ('时间', '操作人', '角色', '动作', '对象类型', '对象ID',
                  '项目ID', '结果', 'IP', '浏览器', '变更前', '变更后')
 
@@ -219,19 +219,19 @@ def _ordered_nodes(project):
 
 
 def _node_rows(project):
+    """付款节点明细（CR-06：未付/未申请/未付异常备注与页面同口径）。"""
     rows = []
     for node in _ordered_nodes(project):
         rows.append((
             node.item.item_name if node.item else '',
             node.node_name,
-            NODE_LABELS.get(node.node_type, node.node_type),
-            pct_text(node.ratio),
-            '原金额' if node.calc_base == 'original' else '科目总额',
             money_value(node.due_amount),
             money_value(getattr(node, 'applied_amount', 0) or 0),
             money_value(node.invoice_amount),
             money_value(node.paid_amount),
-            money_value(node.remaining_amount),
+            money_value(node.unpaid_amount),
+            money_value(node.unapplied_amount),
+            node.unpaid_note,
             node.status,
             payment_state(node.due_amount, getattr(node, 'applied_amount', 0) or 0,
                           node.paid_amount),
@@ -310,16 +310,17 @@ def build_project_workbook(project):
                money_cols=(3, 4, 5), total_row=item_total)
 
     nodes = _node_rows(project)
-    node_total = ('合计', '', '', '', '',
+    node_total = ('合计', '',
                   money_value(sum(Decimal(n.due_amount or 0) for n in project.nodes)),
                   money_value(sum(Decimal(getattr(n, 'applied_amount', 0) or 0)
                                    for n in project.nodes)),
                   money_value(sum(Decimal(n.invoice_amount or 0) for n in project.nodes)),
                   money_value(sum(Decimal(n.paid_amount or 0) for n in project.nodes)),
-                  money_value(sum(Decimal(n.remaining_amount) for n in project.nodes)),
-                  '', '', '', '', '')
+                  money_value(project.unpaid_amount),
+                  money_value(project.unapplied_amount),
+                  '', '', '', '', '', '')
     _add_sheet(workbook, '付款节点', NODE_HEADERS, nodes,
-               money_cols=(6, 7, 8, 9, 10), total_row=node_total)
+               money_cols=(3, 4, 5, 6, 7, 8), total_row=node_total)
 
     _add_sheet(workbook, '付款申请', APPLICATION_HEADERS, _application_rows(project),
                money_cols=(4, 5, 7))
@@ -339,28 +340,34 @@ def build_reports_workbook(rows, totals, reminders=None):
     """
     workbook = _new_workbook('付款台账报表汇总')
     body = [
-        (row['project'].name, row['project'].project_no, row['project'].status,
+        (row['project'].name, row['project'].project_no,
+         money_value(row.get('contract', row['project'].total_amount())),
          money_value(row['due']), money_value(row.get('applied', 0)),
          money_value(row['invoice']),
          money_value(row['paid']), money_value(row['unpaid']),
-         money_value(row.get('overpaid', 0)), _pct_value(row['progress']))
+         money_value(row.get('unapplied', 0)),
+         row.get('unpaid_note', ''),
+         money_value(row.get('overpaid_due', 0)), _pct_value(row['progress']))
         for row in rows
     ]
-    # 合计列：应付 / 已开票 / 已付 / 未付 / 超付；进度按已付/应付重算
+    # 合计列：合同/应付/申请/开票/付款/未付/未申请/超应付；进度按已付/应付重算
     due_total = Decimal(str(totals.get('due', 0) or 0))
     paid_total = Decimal(str(totals.get('paid', 0) or 0))
     invoice_total = Decimal(str(totals.get('invoice', 0) or 0))
     applied_total = Decimal(str(totals.get('applied', 0) or 0))
     progress_total = ((paid_total / due_total * Decimal('100')).quantize(Decimal('0.1'))
                       if due_total else Decimal('0'))
-    total_row = ('合计', '', '',
+    total_row = ('合计', '',
+                 money_value(totals.get('contract', 0)),
                  money_value(due_total), money_value(applied_total),
                  money_value(invoice_total),
                  money_value(paid_total), money_value(totals.get('unpaid', 0)),
-                 money_value(totals.get('overpaid', 0)),
+                 money_value(totals.get('unapplied', 0)), '',
+                 money_value(totals.get('overpaid_due', 0)),
                  _pct_value(progress_total))
     _add_sheet(workbook, '付款台账总览', REPORT_HEADERS, body,
-               money_cols=(4, 5, 6, 7, 8, 9), pct_cols=(10,), total_row=total_row)
+               money_cols=(3, 4, 5, 6, 7, 8, 9, 11), pct_cols=(12,),
+               total_row=total_row)
 
     if reminders:
         reminder_rows = []

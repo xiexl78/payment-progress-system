@@ -160,10 +160,13 @@ def role_required(*roles):
     return deco
 
 
-def fmt_money(v):
-    """格式化金额：Decimal + 千分位 + 两位小数（统一走 money 模块）。"""
+def fmt_money(v, **kwargs):
+    """格式化金额：Decimal + 千分位 + 两位小数（统一走 money 模块）。
+
+    ``money_fmt`` 支持 ``symbol=True``；这里透传，兼容两参数调用。
+    """
     try:
-        return money_fmt(v)
+        return money_fmt(v, **kwargs)
     except (TypeError, ValueError):
         return '0.00'
 
@@ -788,7 +791,8 @@ def project_detail(project_id):
     # 按节点类型聚合展示，便于跨科目合计（Decimal 口径）
     node_groups = {t['node_type']: {'meta': t, 'nodes': [], 'sum_due': ZERO,
                                     'sum_applied': ZERO, 'sum_invoice': ZERO,
-                                    'sum_paid': ZERO}
+                                    'sum_paid': ZERO, 'sum_unpaid': ZERO,
+                                    'sum_unapplied': ZERO}
                    for t in NODE_TEMPLATES}
     node_three = {}
     for node in project.nodes:
@@ -802,14 +806,26 @@ def project_detail(project_id):
         g['sum_applied'] += dims['applied']
         g['sum_invoice'] += dims['invoice']
         g['sum_paid'] += dims['paid']
+        g['sum_unpaid'] += dims['unpaid']
+        g['sum_unapplied'] += dims['unapplied']
 
-    # 三维合计（CR-04：申请/开票/付款并列）
+    # 三维合计（CR-04：申请/开票/付款并列；CR-06 增加未付/未申请）
     totals_dim = {
         'due': sum_money(n.due_amount for n in project.nodes),
         'applied': sum_money(n.applied_amount for n in project.nodes),
         'invoice': sum_money(n.invoice_amount for n in project.nodes),
         'paid': sum_money(n.paid_amount for n in project.nodes),
+        'unpaid': project.unpaid_amount,
+        'unapplied': project.unapplied_amount,
     }
+
+    # 直接付款（未关联申请单）提示：历史数据/线下直付，不阻断但需显式标出
+    unlinked_payments = []
+    for node in project.nodes:
+        direct = sum_money(r.paid_amount for r in PaymentRecord.query.filter_by(
+            node_id=node.id, application_id=None))
+        if direct > 0:
+            unlinked_payments.append({'node': node, 'amount': direct})
 
     # 超付（合同变更后已付 > 新应付）：详情/报表展示，禁止再付款（批次 8）
     overpaid_total = sum(((Decimal(node.paid_amount or 0)
@@ -855,6 +871,7 @@ def project_detail(project_id):
                            totals_dim=totals_dim, status_labels=STATUS_LABELS,
                            flow_status=NODE_FLOW_STATUS,
                            shot_rows=shot_rows, shot_labels=SHOT_LABELS,
+                           unlinked_payments=unlinked_payments,
                            overpaid_total=overpaid_total)
 
 
@@ -2259,12 +2276,13 @@ def _split_amount(total, weights):
 
 
 def _build_contract_change_plan(project, new_totals):
-    """CR-04 逐科目合同变更计划。
+    """CR-04/CR-06 逐科目合同变更计划。
 
-    - 已付款节点（paid_amount > 0）的 due/paid/status 全部冻结不动；
-    - 科目内差额（新总额 − 已付节点应付合计）按未付节点原应付比例分摊；
+    - 冻结判定唯一口径 ``node.has_business``（任一申请/开票/付款即冻结）：
+      其 due/paid/status/applied/invoice 全部不动，仅允许写 change_note；
+    - 科目内可分配额（新总额 − 冻结节点应付合计）按未冻结节点原应付分摊；
     - 尾差按 质保金→验收→进度→首付 归集，保证科目节点合计 = 科目新总额；
-    - 新总额 < 已付合计 / 已开票 > 新应付 → 逐科目列出缺口并阻断。
+    - 新总额 < 冻结节点应付合计 / 已开票 > 新应付 → 逐科目列出缺口并阻断。
     """
     items = list(project.items)
     if not items:
@@ -2288,14 +2306,14 @@ def _build_contract_change_plan(project, new_totals):
                              '、'.join(NODE_LABELS[nt] for nt in missing)))
             continue
 
-        frozen = [n for n in item.nodes if Decimal(n.paid_amount or 0) > 0]
+        frozen = [n for n in item.nodes if n.has_business]
         frozen_due = sum((Decimal(n.due_amount or 0) for n in frozen), ZERO).quantize(CENT)
         if new_total < frozen_due:
             errors.append(
-                '科目「%s」变更后总额 %s 小于已付节点应付合计 %s'
-                '（已付节点冻结，不能下调到该金额以下）'
+                '科目「%s」变更后总额 %s 小于冻结节点应付合计 %s'
+                '（已发生申请/开票/付款的节点冻结，不能下调到该金额以下）'
                 % (item.item_name, fmt_money(new_total), fmt_money(frozen_due)))
-        unfrozen = [n for n in item.nodes if n not in frozen]
+        unfrozen = [n for n in item.nodes if not n.has_business]
         remaining = (new_total - frozen_due).quantize(CENT)
 
         share_map = {n.node_type: ZERO for n in unfrozen}
@@ -2314,8 +2332,8 @@ def _build_contract_change_plan(project, new_totals):
                 errors.extend(exc.errors if isinstance(exc, ValidationError)
                               else [str(exc)])
         elif remaining != 0:
-            errors.append('科目「%s」已无未付节点，变更后总额必须等于已付节点应付合计 %s'
-                          % (item.item_name, fmt_money(frozen_due)))
+            errors.append('科目「%s」节点均已发生业务并冻结，变更后总额必须等于冻结节点'
+                          '应付合计 %s' % (item.item_name, fmt_money(frozen_due)))
 
         for node in item.nodes:
             old_due = Decimal(node.due_amount or 0)
@@ -2381,8 +2399,10 @@ def _contract_change_token(project, new_totals):
     for item in project.items:
         state.append([item.id, format(item.total_amount, 'f'), [
             [n.id, format(Decimal(n.due_amount or 0), 'f'),
+             format(Decimal(n.applied_amount or 0), 'f'),
              format(Decimal(n.paid_amount or 0), 'f'),
-             format(Decimal(n.invoice_amount or 0), 'f')]
+             format(Decimal(n.invoice_amount or 0), 'f'),
+             n.status, len(n.applications), len(n.invoices)]
             for n in item.nodes]])
     payload = {'project_id': project.id, 'state': state,
                'new': [[iid, format(value, 'f')]
@@ -2420,7 +2440,15 @@ def _apply_contract_change(project, plan):
     for row in plan['node_plan']:
         node = row['node']
         if row['frozen']:
-            # 已付款节点：due/paid/status 一律冻结
+            # CR-06：唯一冻结口径（has_business）——金额/状态/日期一律不动，
+            # 仅允许追加 change_note 记录本次变更（§2.2 第 8 步）。
+            note = '合同变更：节点已冻结（已申请/开票/付款），应付 %s 未变' % (
+                fmt_money(row['old_due']))
+            node.change_note = (note if not node.change_note
+                                else (node.change_note + '；' + note))[:255]
+            after_nodes[node.id] = {'due': format(row['old_due'], 'f'),
+                                    'status': node.status,
+                                    'frozen': True}
             continue
         note = '合同变更：应付 %s → %s（%s）' % (
             fmt_money(row['old_due']), fmt_money(row['new_due']),
@@ -2529,32 +2557,49 @@ def _reports_data():
     rows = []
     for p in projects:
         due = sum_money(n.due_amount for n in p.nodes)
-        applied = sum_money(Decimal(n.applied_amount or 0) for n in p.nodes)
+        applied = sum_money(n.applied_amount for n in p.nodes)
         invoice = sum_money(n.invoice_amount for n in p.nodes)
         paid = sum_money(n.paid_amount for n in p.nodes)
-        unpaid = (due - paid).quantize(CENT)
-        if unpaid < 0:
-            unpaid = ZERO   # 超付部分单列 overpaid，未付不出现负数
-        overpaid = sum_money(
+        # CR-06：未付/未申请按申请口径；超付与超额申请分列，不混用
+        unpaid = p.unpaid_amount
+        unapplied = p.unapplied_amount
+        overpaid_due = sum_money(
             [(Decimal(n.paid_amount or 0) - Decimal(n.due_amount or 0)).quantize(CENT)
              for n in p.nodes
              if Decimal(n.paid_amount or 0) > Decimal(n.due_amount or 0)])
+        over_paid_application = p.over_paid_application
+        over_applied = p.over_applied
+        note_parts = []
+        if over_paid_application > 0:
+            note_parts.append('超付申请 %s' % fmt_money(over_paid_application, symbol=True))
+        if over_applied > 0:
+            note_parts.append('超额申请 %s' % fmt_money(over_applied, symbol=True))
         progress = ((paid / due * Decimal('100')).quantize(Decimal('0.1'))
                     if due else ZERO)
         rows.append({
-            'project': p, 'due': due, 'applied': applied,
+            'project': p, 'contract': p.total_amount(),
+            'due': due, 'applied': applied,
             'invoice': invoice, 'paid': paid,
-            'unpaid': unpaid, 'progress': progress, 'overpaid': overpaid,
+            'unpaid': unpaid, 'unapplied': unapplied,
+            'unpaid_note': '；'.join(note_parts),
+            'progress': progress,
+            'overpaid_due': overpaid_due,
+            'over_paid_application': over_paid_application,
+            'over_applied': over_applied,
         })
     totals = {
+        'contract': sum_money(r['contract'] for r in rows),
         'due': sum_money(r['due'] for r in rows),
         'applied': sum_money(r['applied'] for r in rows),
         'invoice': sum_money(r['invoice'] for r in rows),
         'paid': sum_money(r['paid'] for r in rows),
         'unpaid': sum_money(r['unpaid'] for r in rows),
-        'overpaid': sum_money(r['overpaid'] for r in rows),
+        'unapplied': sum_money(r['unapplied'] for r in rows),
+        'overpaid_due': sum_money(r['overpaid_due'] for r in rows),
+        'over_paid_application': sum_money(r['over_paid_application'] for r in rows),
+        'over_applied': sum_money(r['over_applied'] for r in rows),
     }
-    # 待办提醒：质保到期、已申请待付款
+    # 待办提醒：质保到期、已申请未付清（CR-06：未付 = 已申请 − 已付）
     today = timeutil.local_today()
     reminders = []
     for p in projects:
@@ -2563,7 +2608,7 @@ def _reports_data():
             if days <= 60:
                 reminders.append(('warranty', p, days))
         for n in p.nodes:
-            if n.status in ('未开票已申请', '已申请'):
+            if n.unpaid_amount > 0:
                 reminders.append(('pending_pay', n, None))
     return projects, rows, totals, reminders
 
@@ -2572,11 +2617,8 @@ def _reports_data():
 @login_required
 def reports():
     _projects, rows, totals, reminders = _reports_data()
-    return render_template('reports.html', rows=rows,
-                           total_due=totals['due'], total_applied=totals['applied'],
-                           total_paid=totals['paid'],
-                           total_unpaid=totals['unpaid'],
-                           total_overpaid=totals['overpaid'], reminders=reminders)
+    return render_template('reports.html', rows=rows, totals=totals,
+                           reminders=reminders)
 
 
 # ---------- 导出（批次 6a） ----------

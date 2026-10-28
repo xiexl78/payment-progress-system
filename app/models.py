@@ -6,7 +6,7 @@ from decimal import Decimal
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 
-from .money import CENT, ZERO, mul_ratio
+from .money import CENT, ZERO, fmt_money, mul_ratio
 
 db = SQLAlchemy()
 
@@ -71,6 +71,27 @@ class Project(db.Model):
 
     def total_amount(self):
         return (self.total_original() + self.total_additional()).quantize(CENT)
+
+    # CR-06：项目级派生金额（只读，纯展示；不写库）
+    @property
+    def unpaid_amount(self):
+        """未付 = Σ max(0, 已申请 − 已付)（CR-06 新口径）。"""
+        return sum((n.unpaid_amount for n in self.nodes), ZERO).quantize(CENT)
+
+    @property
+    def unapplied_amount(self):
+        """未申请 = Σ max(0, 应付 − 已申请)。"""
+        return sum((n.unapplied_amount for n in self.nodes), ZERO).quantize(CENT)
+
+    @property
+    def over_paid_application(self):
+        """超付申请 = Σ max(0, 已付 − 已申请)。"""
+        return sum((n.over_paid_application for n in self.nodes), ZERO).quantize(CENT)
+
+    @property
+    def over_applied(self):
+        """超额申请 = Σ max(0, 已申请 − 应付)。"""
+        return sum((n.over_applied for n in self.nodes), ZERO).quantize(CENT)
 
     def to_dict(self):
         return {
@@ -153,14 +174,54 @@ class PaymentNode(db.Model):
 
     @property
     def remaining_amount(self):
-        """未付应付 = 应付 - 已付（Decimal，两位小数）"""
+        """@deprecated CR-06 起弃用：旧「未付 = 应付 − 已付」。
+
+        仅为兼容旧导出/脚本保留；页面与报表请用 ``unpaid_amount`` /
+        ``unapplied_amount``（申请口径）。
+        """
         return (Decimal(self.due_amount or 0) - Decimal(self.paid_amount or 0)).quantize(CENT)
+
+    # CR-06 派生金额：只读、非负、不写库
+    @property
+    def unpaid_amount(self):
+        """未付 = max(0, 已申请 − 已付)。"""
+        value = (Decimal(self.applied_amount or 0) - Decimal(self.paid_amount or 0))
+        return value.quantize(CENT) if value > 0 else ZERO
+
+    @property
+    def unapplied_amount(self):
+        """未申请 = max(0, 应付 − 已申请)。"""
+        value = (Decimal(self.due_amount or 0) - Decimal(self.applied_amount or 0))
+        return value.quantize(CENT) if value > 0 else ZERO
+
+    @property
+    def over_paid_application(self):
+        """超付申请 = max(0, 已付 − 已申请)（付款超出申请，历史/直付场景）。"""
+        value = (Decimal(self.paid_amount or 0) - Decimal(self.applied_amount or 0))
+        return value.quantize(CENT) if value > 0 else ZERO
+
+    @property
+    def over_applied(self):
+        """超额申请 = max(0, 已申请 − 应付)（仅展示，不阻断）。"""
+        value = (Decimal(self.applied_amount or 0) - Decimal(self.due_amount or 0))
+        return value.quantize(CENT) if value > 0 else ZERO
+
+    @property
+    def unpaid_note(self):
+        """未付异常备注：超付申请/超额申请分别标注，无异常返回空串。"""
+        from .money import fmt_money
+        parts = []
+        if self.over_paid_application > 0:
+            parts.append('超付申请 ' + fmt_money(self.over_paid_application, symbol=True))
+        if self.over_applied > 0:
+            parts.append('超额申请 ' + fmt_money(self.over_applied, symbol=True))
+        return '；'.join(parts)
 
     @property
     def has_business(self):
         """节点是否已发生资金业务（付款/开票/状态变化/申请单）。
 
-        合同回改时这类节点必须冻结，不允许被口径变更改写。
+        合同变更时这类节点必须冻结，不允许被口径变更改写（CR-06：唯一冻结判定）。
         """
         return (self.status != '未触发'
                 or Decimal(self.applied_amount or 0) > 0
@@ -189,6 +250,10 @@ class PaymentNode(db.Model):
             'invoice_amount': float(self.invoice_amount or 0),
             'paid_amount': float(self.paid_amount or 0),
             'status': self.status,
+            # CR-06 只增不改：派生展示字段（不写库）
+            'unpaid_amount': float(self.unpaid_amount),
+            'unapplied_amount': float(self.unapplied_amount),
+            'unpaid_note': self.unpaid_note,
         }
 
 

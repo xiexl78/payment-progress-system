@@ -128,6 +128,10 @@ def three_dim(node):
         'applied': applied.quantize(CENT),
         'invoice': invoice.quantize(CENT),
         'paid': paid.quantize(CENT),
+        # CR-06 申请口径派生量（统一从模型属性取，模板不再自行计算）
+        'unpaid': node.unpaid_amount.quantize(CENT),
+        'unapplied': node.unapplied_amount.quantize(CENT),
+        'unpaid_note': node.unpaid_note,
         'apply_label': node_progress_label('apply', due, applied),
         'invoice_label': node_progress_label('invoice', due, invoice),
         'pay_label': node_progress_label('pay', due, paid),

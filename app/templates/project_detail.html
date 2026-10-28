@@ -188,7 +188,7 @@
           </span>
         </div>
         <span class="hint">{{ g.meta.trigger }}</span>
-        <span class="sum">合计应付 <b>￥{{ '{:,.2f}'.format(g.sum_due) }}</b> · 申请 <b>￥{{ '{:,.2f}'.format(g.sum_applied) }}</b> · 开票 <b>￥{{ '{:,.2f}'.format(g.sum_invoice) }}</b> · 付款 <b>￥{{ '{:,.2f}'.format(g.sum_paid) }}</b></span>
+        <span class="sum">合计应付 <b>￥{{ '{:,.2f}'.format(g.sum_due) }}</b> · 申请 <b>￥{{ '{:,.2f}'.format(g.sum_applied) }}</b> · 未付 <b>￥{{ '{:,.2f}'.format(g.sum_unpaid) }}</b> · 未申请 <b>￥{{ '{:,.2f}'.format(g.sum_unapplied) }}</b> · 开票 <b>￥{{ '{:,.2f}'.format(g.sum_invoice) }}</b> · 付款 <b>￥{{ '{:,.2f}'.format(g.sum_paid) }}</b></span>
       </div>
       <div class="table-wrap">
         <table class="table">
@@ -196,8 +196,11 @@
             <tr>
               <th>科目</th>
               <th class="num">应付金额</th>
-              <th class="num">付款</th>
+              <th class="num">申请</th>
+              <th class="num">未付</th>
+              <th class="num">未申请</th>
               <th class="num">发票</th>
+              <th class="num">付款</th>
               <th>进度</th>
               <th style="min-width:460px;">登记（申请 / 开票 / 付款）</th>
             </tr>
@@ -206,20 +209,28 @@
             {% for n in g.nodes %}
             {% set d = node_three[n.id] %}
             <tr>
-              <td>{{ n.item_name }}</td>
-              <td class="num">￥{{ '{:,.2f}'.format(n.due_amount) }}
+              <td>{{ n.item_name }}
+                {% if n.has_business %}<span class="badge badge-gray" title="已发生申请/开票/付款，合同变更时应付与状态冻结">已冻结</span>{% endif %}
                 {% if n.change_note %}<div class="text-muted" style="font-size:12px;">{{ n.change_note }}</div>{% endif %}
               </td>
-              <td class="num">
-                <span class="badge {{ 'badge-green' if d.payment_state == '已付款' else 'badge-orange' if d.payment_state == '部分付款' else 'badge-blue' if d.payment_state == '已申请' else 'badge-gray' }}">{{ d.payment_state }}</span>
-                <div class="text-muted" style="font-size:12px;">已付 ￥{{ '{:,.2f}'.format(d.paid) }} / 应付 ￥{{ '{:,.2f}'.format(d.due) }}</div>
-                {% if d.applied > 0 %}<div class="text-muted" style="font-size:12px;">申请 ￥{{ '{:,.2f}'.format(d.applied) }}</div>{% endif %}
+              <td class="num">￥{{ '{:,.2f}'.format(d.due) }}</td>
+              <td class="num">￥{{ '{:,.2f}'.format(d.applied) }}
+                <div class="text-muted" style="font-size:12px;">{{ d.apply_label }}</div>
               </td>
+              <td class="num {{ 'text-danger' if d.unpaid > 0 else 'text-success' }}">￥{{ '{:,.2f}'.format(d.unpaid) }}</td>
+              <td class="num {{ 'text-danger' if d.unapplied > 0 else '' }}">￥{{ '{:,.2f}'.format(d.unapplied) }}</td>
               <td class="num">
                 <span class="badge {{ 'badge-green' if d.invoice_state == '已开票' else 'badge-gray' }}">{{ d.invoice_state }}</span>
-                {% if d.invoice > 0 %}<div class="text-muted" style="font-size:12px;">￥{{ '{:,.2f}'.format(d.invoice) }} / ￥{{ '{:,.2f}'.format(d.due) }}</div>{% endif %}
+                <div class="text-muted" style="font-size:12px;">￥{{ '{:,.2f}'.format(d.invoice) }}</div>
               </td>
-              <td><span class="badge {{ 'badge-green' if d.status == '已付款' else 'badge-blue' if d.status != '未触发' else 'badge-gray' }}">{{ status_labels.get(d.status, d.status) }}</span></td>
+              <td class="num text-success">
+                <span class="badge {{ 'badge-green' if d.payment_state == '已付款' else 'badge-orange' if d.payment_state == '部分付款' else 'badge-blue' if d.payment_state == '已申请' else 'badge-gray' }}">{{ d.payment_state }}</span>
+                <div class="text-muted" style="font-size:12px;">￥{{ '{:,.2f}'.format(d.paid) }}</div>
+              </td>
+              <td>
+                <span class="badge {{ 'badge-green' if d.status == '已付款' else 'badge-blue' if d.status != '未触发' else 'badge-gray' }}">{{ status_labels.get(d.status, d.status) }}</span>
+                {% if d.unpaid_note %}<div class="text-danger" style="font-size:12px;">{{ d.unpaid_note }}</div>{% endif %}
+              </td>
               <td>
                 {% if current_user.role in ('admin', 'operator') and project.status != '已归档' and not project.deleted_at %}
                 <div class="flex" style="gap:8px;flex-wrap:wrap;">
@@ -258,12 +269,32 @@
             </tr>
             {% endfor %}
           </tbody>
+          <tfoot>
+            <tr>
+              <td><b>合计</b></td>
+              <td class="num"><b>￥{{ '{:,.2f}'.format(g.sum_due) }}</b></td>
+              <td class="num"><b>￥{{ '{:,.2f}'.format(g.sum_applied) }}</b></td>
+              <td class="num text-danger"><b>￥{{ '{:,.2f}'.format(g.sum_unpaid) }}</b></td>
+              <td class="num"><b>￥{{ '{:,.2f}'.format(g.sum_unapplied) }}</b></td>
+              <td class="num"><b>￥{{ '{:,.2f}'.format(g.sum_invoice) }}</b></td>
+              <td class="num text-success"><b>￥{{ '{:,.2f}'.format(g.sum_paid) }}</b></td>
+              <td></td><td></td>
+            </tr>
+          </tfoot>
         </table>
       </div>
     </div>
   </div>
   {% endfor %}
 </div>
+
+{# ---------- 直接付款提示（CR-06：未关联申请单的付款） ---------- #}
+{% if unlinked_payments %}
+<div class="flash warning" style="background:var(--warning-bg);color:var(--warning);border-color:#fde68a;">
+  存在未关联付款申请单的直接付款：{% for row in unlinked_payments %}「{{ row.node.node_name }}」￥{{ '{:,.2f}'.format(row.amount) }}{% if not loop.last %}、{% endif %}{% endfor %}。
+  这部分已付金额没有对应申请，节点「未付」会按申请口径显示为 0 或出现「超付申请」标记（仅提示，不阻断）。
+</div>
+{% endif %}
 
 {# ---------- 付款申请单（CR-05 需求④：一张申请可对应多笔付款） ---------- #}
 <div class="card">

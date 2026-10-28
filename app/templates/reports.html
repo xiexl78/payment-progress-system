@@ -6,7 +6,7 @@
 {# ---------- 待办提醒 ---------- #}
 {% if reminders %}
 <div class="card">
-  <div class="card-title">待办提醒 <span class="sub">质保到期 60 天内、待付款申请</span></div>
+  <div class="card-title">待办提醒 <span class="sub">质保到期 60 天内、已申请未付清（未付 = 已申请 − 已付）</span></div>
   {% for kind, obj, days in reminders %}
     {% if kind == 'warranty' %}
     <div class="flash {{ 'danger' if days is not none and days <= 0 else 'warning' }}" style="background:var(--warning-bg);color:var(--warning);border-color:#fde68a;margin-bottom:8px;">
@@ -16,7 +16,7 @@
     </div>
     {% else %}
     <div class="flash info">
-      节点「{{ obj.node_name }}」（{{ obj.item_name }}）处于{{ obj.status }}状态，应付 ￥{{ '{:,.2f}'.format(obj.due_amount) }}，待跟进付款。
+      节点「{{ obj.node_name }}」（{{ obj.item.item_name if obj.item else '' }}）已申请 ￥{{ '{:,.2f}'.format(obj.applied_amount or 0) }}、已付 ￥{{ '{:,.2f}'.format(obj.paid_amount or 0) }}，未付 ￥{{ '{:,.2f}'.format(obj.unpaid_amount) }}。
       <a href="{{ url_for('main.project_detail', project_id=obj.project_id) }}" class="btn btn-ghost btn-sm" style="margin-left:8px;">去处理</a>
     </div>
     {% endif %}
@@ -27,15 +27,18 @@
 {# ---------- 台账汇总 ---------- #}
 <div class="card">
   <div class="card-title">付款台账总览
-    <span class="sub">合计：应付 ￥{{ '{:,.2f}'.format(total_due) }} · 申请 ￥{{ '{:,.2f}'.format(total_applied) }} · 付款 ￥{{ '{:,.2f}'.format(total_paid) }} · 未付 ￥{{ '{:,.2f}'.format(total_unpaid) }}{% if total_overpaid and total_overpaid > 0 %} · <span class="text-danger">超付 ￥{{ '{:,.2f}'.format(total_overpaid) }}</span>{% endif %}</span>
+    <span class="sub">合同 ￥{{ '{:,.2f}'.format(totals.contract) }} · 应付 ￥{{ '{:,.2f}'.format(totals.due) }} · 申请 ￥{{ '{:,.2f}'.format(totals.applied) }} · 付款 ￥{{ '{:,.2f}'.format(totals.paid) }} · 未付 ￥{{ '{:,.2f}'.format(totals.unpaid) }} · 未申请 ￥{{ '{:,.2f}'.format(totals.unapplied) }}{% if totals.overpaid_due and totals.overpaid_due > 0 %} · <span class="text-danger">超应付 ￥{{ '{:,.2f}'.format(totals.overpaid_due) }}</span>{% endif %}</span>
     <a href="{{ url_for('main.reports_export') }}" class="btn btn-outline btn-sm">导出 Excel</a>
   </div>
   <div class="table-wrap">
     <table class="table">
       <thead>
         <tr>
-          <th>项目</th><th>编号</th><th>状态</th>
-          <th class="num">应付金额</th><th class="num">申请金额</th><th class="num">开票金额</th><th class="num">付款金额</th><th class="num">未付金额</th><th class="num">超付金额</th>
+          <th>项目</th>
+          <th>项目编号</th>
+          <th class="num">合同金额</th>
+          <th class="num">应付金额</th><th class="num">申请金额</th><th class="num">开票金额</th><th class="num">付款金额</th>
+          <th class="num">未付金额</th><th class="num">未申请金额</th><th>未付异常备注</th><th class="num">超应付金额</th>
           <th>付款进度</th><th>操作</th>
         </tr>
       </thead>
@@ -44,13 +47,15 @@
         <tr>
           <td><a href="{{ url_for('main.project_detail', project_id=r.project.id) }}">{{ r.project.name }}</a></td>
           <td>{{ r.project.project_no }}</td>
-          <td><span class="badge {{ 'badge-green' if r.project.status == '已完成' else 'badge-blue' if r.project.status == '进行中' else 'badge-gray' }}">{{ r.project.status }}</span></td>
+          <td class="num">￥{{ '{:,.2f}'.format(r.contract) }}</td>
           <td class="num">￥{{ '{:,.2f}'.format(r.due) }}</td>
           <td class="num">￥{{ '{:,.2f}'.format(r.applied) }}</td>
           <td class="num">￥{{ '{:,.2f}'.format(r.invoice) }}</td>
           <td class="num text-success">￥{{ '{:,.2f}'.format(r.paid) }}</td>
           <td class="num {{ 'text-danger' if r.unpaid > 0 else 'text-success' }}">￥{{ '{:,.2f}'.format(r.unpaid) }}</td>
-          <td class="num {{ 'text-danger' if r.overpaid and r.overpaid > 0 else '' }}">{{ '￥%s'|format('{:,.2f}'.format(r.overpaid)) if r.overpaid and r.overpaid > 0 else '—' }}</td>
+          <td class="num {{ 'text-danger' if r.unapplied > 0 else '' }}">￥{{ '{:,.2f}'.format(r.unapplied) }}</td>
+          <td class="{{ 'text-danger' if r.unpaid_note else 'text-muted' }}" style="font-size:12px;">{{ r.unpaid_note or '—' }}</td>
+          <td class="num {{ 'text-danger' if r.overpaid_due and r.overpaid_due > 0 else '' }}">{{ '￥%s'|format('{:,.2f}'.format(r.overpaid_due)) if r.overpaid_due and r.overpaid_due > 0 else '—' }}</td>
           <td>
             <div class="flex" style="gap:6px;">
               <div class="progress-bar" style="width:90px;"><div class="fill" style="width:{{ r.progress }}%;"></div></div>
@@ -60,7 +65,7 @@
           <td><a href="{{ url_for('main.project_detail', project_id=r.project.id) }}" class="btn btn-ghost btn-sm">详情</a></td>
         </tr>
         {% else %}
-        <tr><td colspan="9" class="empty">暂无数据</td></tr>
+        <tr><td colspan="13" class="empty">暂无数据</td></tr>
         {% endfor %}
       </tbody>
     </table>

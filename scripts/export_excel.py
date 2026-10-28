@@ -115,35 +115,49 @@ def _report_reminders(projects):
             if days <= 60:
                 reminders.append(('warranty', project, days))
         for node in project.nodes:
-            if node.status in ('未开票已申请', '已申请'):
+            # CR-06：申请口径——已申请未付清才提醒（不再看 status 文案）
+            if node.unpaid_amount > 0:
                 reminders.append(('pending_pay', node, None))
     return reminders
 
 
 def _export_reports(app, projects, out_dir):
+    """报表汇总数据与 /reports 页同口径（CR-06：未付=已申请−已付）。"""
     rows = []
     for project in projects:
         due = sum_money(n.due_amount for n in project.nodes)
+        applied = sum_money(Decimal(n.applied_amount or 0) for n in project.nodes)
         invoice = sum_money(n.invoice_amount for n in project.nodes)
         paid = sum_money(n.paid_amount for n in project.nodes)
-        unpaid = (due - paid).quantize(CENT)
-        if unpaid < 0:
-            unpaid = ZERO   # 超付单列，未付不为负
-        overpaid = sum_money(
+        unpaid = project.unpaid_amount
+        unapplied = project.unapplied_amount
+        overpaid_due = sum_money(
             [(Decimal(node.paid_amount or 0) - Decimal(node.due_amount or 0)).quantize(CENT)
              for node in project.nodes
              if Decimal(node.paid_amount or 0) > Decimal(node.due_amount or 0)])
+        note_parts = []
+        if project.over_paid_application > 0:
+            note_parts.append('超付申请 %s' % ('￥' + format(
+                project.over_paid_application, ',.2f')))
+        if project.over_applied > 0:
+            note_parts.append('超额申请 %s' % ('￥' + format(
+                project.over_applied, ',.2f')))
         progress = ((paid / due * Decimal('100')).quantize(Decimal('0.1'))
                     if due else Decimal('0'))
-        rows.append({'project': project, 'due': due, 'invoice': invoice,
-                     'paid': paid, 'unpaid': unpaid, 'overpaid': overpaid,
-                     'progress': progress})
+        rows.append({'project': project, 'contract': project.total_amount(),
+                     'due': due, 'applied': applied, 'invoice': invoice,
+                     'paid': paid, 'unpaid': unpaid, 'unapplied': unapplied,
+                     'unpaid_note': '；'.join(note_parts),
+                     'progress': progress, 'overpaid_due': overpaid_due})
     totals = {
+        'contract': sum_money(r['contract'] for r in rows),
         'due': sum_money(r['due'] for r in rows),
+        'applied': sum_money(r['applied'] for r in rows),
         'invoice': sum_money(r['invoice'] for r in rows),
         'paid': sum_money(r['paid'] for r in rows),
         'unpaid': sum_money(r['unpaid'] for r in rows),
-        'overpaid': sum_money(r['overpaid'] for r in rows),
+        'unapplied': sum_money(r['unapplied'] for r in rows),
+        'overpaid_due': sum_money(r['overpaid_due'] for r in rows),
     }
     workbook = build_reports_workbook(rows, totals, _report_reminders(projects))
     payload = workbook_bytes(workbook)
