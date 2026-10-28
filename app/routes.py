@@ -13,7 +13,7 @@ from functools import wraps
 from flask import (Blueprint, render_template, request, redirect, url_for, session,
                    flash, jsonify, abort, current_app, send_file)
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
-from sqlalchemy import or_, update
+from sqlalchemy import func, or_, update
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
 from . import NODE_TEMPLATES, FLOW_STATUS, STATUS_LABELS, login_guard, session_guard, timeutil
@@ -820,12 +820,21 @@ def project_detail(project_id):
     }
 
     # 直接付款（未关联申请单）提示：历史数据/线下直付，不阻断但需显式标出
-    unlinked_payments = []
-    for node in project.nodes:
-        direct = sum_money(r.paid_amount for r in PaymentRecord.query.filter_by(
-            node_id=node.id, application_id=None))
-        if direct > 0:
-            unlinked_payments.append({'node': node, 'amount': direct})
+    # CR-06：一次聚合查询按 node_id 分组，避免 24 节点 24 条 SQL（N+1）
+    node_ids = [node.id for node in project.nodes]
+    direct_rows = []
+    if node_ids:
+        direct_rows = (db.session.query(PaymentRecord.node_id,
+                                        func.sum(PaymentRecord.paid_amount))
+                       .filter(PaymentRecord.application_id.is_(None),
+                               PaymentRecord.node_id.in_(node_ids))
+                       .group_by(PaymentRecord.node_id)
+                       .all())
+    direct_map = {node_id: Decimal(str(amount or 0)).quantize(CENT)
+                  for node_id, amount in direct_rows}
+    unlinked_payments = [{'node': node, 'amount': direct_map[node.id]}
+                         for node in project.nodes
+                         if direct_map.get(node.id, ZERO) > 0]
 
     # 超付（合同变更后已付 > 新应付）：详情/报表展示，禁止再付款（批次 8）
     overpaid_total = sum(((Decimal(node.paid_amount or 0)
@@ -2423,7 +2432,7 @@ def _contract_change_values(project):
 
 
 def _apply_contract_change(project, plan):
-    """应用变更：科目增补金额 + 未付节点应付/状态 + 节点变更备注；已付节点不动。"""
+    """应用变更：科目增补金额 + 未付节点应付/状态 + 节点变更备注；已发生业务节点不动。"""
     operator_id = _operator_id()
     before = {'items': {c['item'].id: {'name': c['item'].item_name,
                                        'total': format(c['old_total'], 'f')}
@@ -2492,7 +2501,7 @@ def _render_contract_change(project, *, stage='form', plan=None, values=None,
 @login_required
 @role_required('admin', 'operator')
 def project_contract_change(project_id):
-    """合同变更（CR-04）：逐科目改总额，已付节点冻结，差额分摊到未付节点。"""
+    """合同变更（CR-04）：逐科目改总额，已发生业务节点冻结，差额分摊到未付节点。"""
     project = _get_project(project_id)
     guard = _guard_writable_project(project)
     if guard:
@@ -2521,7 +2530,7 @@ def project_contract_change(project_id):
                                        values=values, token=token)
 
     new_total = _apply_contract_change(project, plan)
-    flash('合同变更已保存：合同总额 %s 元；%d 个已付节点冻结未改，差额已分摊到未付节点'
+    flash('合同变更已保存：合同总额 %s 元；%d 个已发生业务节点冻结未改，差额已分摊到未付节点'
           % (fmt_money(new_total), plan['frozen_count']), 'success')
     return redirect(url_for('main.project_detail', project_id=project.id))
 

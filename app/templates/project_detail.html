@@ -174,7 +174,7 @@
 {# ---------- 付款节点分组：申请 / 开票 / 付款三本账并列 ---------- #}
 <div class="card">
   <div class="card-title">付款节点管理
-    <span class="sub">申请 / 开票 / 付款三本账并列，任意顺序、互不为前置；每本账各自累计不得超过应付。已付节点合同变更时冻结。</span>
+    <span class="sub">申请 / 开票 / 付款三本账并列，任意顺序、互不为前置；每本账各自累计不得超过应付。已发生任一业务（申请/开票/付款）的节点合同变更时冻结。</span>
   </div>
 
   {% for node_type, g in node_groups.items() %}
@@ -201,7 +201,7 @@
               <th class="num">未申请</th>
               <th class="num">发票</th>
               <th class="num">付款</th>
-              <th>进度</th>
+              <th>状态/异常</th>
               <th style="min-width:460px;">登记（申请 / 开票 / 付款）</th>
             </tr>
           </thead>
@@ -217,7 +217,10 @@
               <td class="num">￥{{ '{:,.2f}'.format(d.applied) }}
                 <div class="text-muted" style="font-size:12px;">{{ d.apply_label }}</div>
               </td>
-              <td class="num {{ 'text-danger' if d.unpaid > 0 else 'text-success' }}">￥{{ '{:,.2f}'.format(d.unpaid) }}</td>
+              <td class="num {{ 'text-danger' if d.unpaid > 0 or d.unpaid_note else 'text-success' }}">
+                ￥{{ '{:,.2f}'.format(d.unpaid) }}
+                {% if d.unpaid_note %}<div class="text-danger" style="font-size:12px;">{{ d.unpaid_note }}</div>{% endif %}
+              </td>
               <td class="num {{ 'text-danger' if d.unapplied > 0 else '' }}">￥{{ '{:,.2f}'.format(d.unapplied) }}</td>
               <td class="num">
                 <span class="badge {{ 'badge-green' if d.invoice_state == '已开票' else 'badge-gray' }}">{{ d.invoice_state }}</span>
@@ -229,7 +232,6 @@
               </td>
               <td>
                 <span class="badge {{ 'badge-green' if d.status == '已付款' else 'badge-blue' if d.status != '未触发' else 'badge-gray' }}">{{ status_labels.get(d.status, d.status) }}</span>
-                {% if d.unpaid_note %}<div class="text-danger" style="font-size:12px;">{{ d.unpaid_note }}</div>{% endif %}
               </td>
               <td>
                 {% if current_user.role in ('admin', 'operator') and project.status != '已归档' and not project.deleted_at %}

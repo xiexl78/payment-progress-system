@@ -66,7 +66,7 @@
         <div><label class="field-label">验收款 %</label><input type="number" name="ratio_acceptance" class="small" step="0.01" min="0" max="100" value="{{ form.get('ratio_acceptance', '') if form else '' }}" required></div>
         <div><label class="field-label">质保金 %</label><input type="number" name="ratio_warranty" class="small" step="0.01" min="0" max="100" value="{{ form.get('ratio_warranty', '') if form else '' }}" required></div>
       </div>
-      <div class="src-text">比例允许 0%；尾差归质保金，保证节点应付合计 = 科目总额。已付款节点合同变更时冻结。</div>
+      <div class="src-text">比例允许 0%；尾差归质保金，保证节点应付合计 = 科目总额。已发生任一业务（申请/开票/付款）的节点合同变更时冻结。</div>
     </div>
     <div class="form-row">
       <label class="field-label mt-8">费用科目（每个科目按上面的比例生成 4 个付款节点）</label>

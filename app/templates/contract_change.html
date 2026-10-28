@@ -17,7 +17,7 @@
 
   {% if stage == 'confirm' %}
   <div class="flash info" style="margin-bottom:12px;">
-    请核对以下变更，确认后立即按「科目新总额」重算未付节点应付；<b>已付款节点冻结不动</b>。此操作写审计，不可自动撤回。
+    请核对以下变更，确认后立即按「科目新总额」重算未付节点应付；<b>已发生业务节点（任一申请/开票/付款）冻结不动</b>。此操作写审计，不可自动撤回。
   </div>
 
   <div class="table-wrap">
@@ -45,7 +45,7 @@
   </div>
 
   <div class="mt-16">
-    <label class="field-label">节点应付差异（已付节点冻结，差额按未付节点原应付比例分摊；尾差按 质保金→验收→进度→首付 归集）</label>
+    <label class="field-label">节点应付差异（已发生业务节点冻结，差额按未付节点原应付比例分摊；尾差按 质保金→验收→进度→首付 归集）</label>
     <div class="table-wrap">
       <table class="table">
         <thead><tr><th>节点</th><th class="num">原应付</th><th class="num">新应付</th><th class="num">差额</th><th>处理</th></tr></thead>
