@@ -23,7 +23,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from .money import CENT
-from .nodes import invoice_state, payment_state
+from .nodes import active_nodes, invoice_state, payment_state
 from .timeutil import to_local, utcnow
 
 __all__ = [
@@ -213,7 +213,9 @@ def _item_rows(project):
 def _ordered_nodes(project):
     order = {'first': 0, 'progress': 1, 'acceptance': 2, 'warranty': 3}
     items_order = {item.id: index for index, item in enumerate(project.items)}
-    return sorted(project.nodes,
+    # CR-07 ②：未勾选即不存在——0 比例（历史脏数据）节点不进导出，与页面口径一致
+    nodes = active_nodes(project.nodes)
+    return sorted(nodes,
                   key=lambda n: (items_order.get(n.item_id, 999),
                                  order.get(n.node_type, 9), n.id))
 

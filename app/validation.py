@@ -31,6 +31,7 @@ __all__ = [
     'validate_project_dates',
     'validate_project_item_rows',
     'validate_project_ratios',
+    'validate_node_selection',
     'validate_contract_submission',
     'validate_node_action',
     'validate_apply_no',
@@ -188,6 +189,52 @@ def validate_project_ratios(form):
     if errors:
         raise ValidationError(errors)
     return ratios
+
+
+def validate_node_selection(form, node_types=None):
+    """CR-07 ②：校验「新建项目」勾选的节点类型与比例（未勾选即不存在）。
+
+    表单字段：``node_types``（可多个，勾选集合）、``ratio_first`` 等比例百分数。
+    ``node_types`` 参数用于「已知勾选集合」的场景（如加科目沿用项目现有类型），
+    传入后忽略表单里的 ``node_types``。
+
+    Returns: ``(node_types, ratios)``——前者为按固定顺序排好的已勾选类型元组，
+    后者为 ``{node_type: Decimal(百分数)}``（只含已勾选类型）。
+    Raises ``ValidationError``（一次收集全部错误）。
+    """
+    errors = []
+    if node_types is None:
+        raw_selected = form.getlist('node_types')
+        # 未勾选类型的误传值一律忽略（兼容旧表单/前端残留），只认固定 4 类
+        selected = [nt for nt in NODE_TYPES if nt in raw_selected]
+    else:
+        selected = [nt for nt in NODE_TYPES if nt in set(node_types)]
+    if not selected:
+        errors.append('请至少勾选一个付款节点类型（首付款 / 进度款 / 验收款 / 质保金）')
+        raise ValidationError(errors)
+
+    ratios = {}
+    for nt in selected:
+        raw = form.get('ratio_' + nt)
+        try:
+            value = parse_ratio_pct(raw, field=NODE_LABELS[nt] + '比例')
+        except ValidationError as exc:
+            errors.extend(exc.errors)
+            continue
+        if value <= 0:
+            errors.append('%s比例必须大于 0（未勾选请取消该节点）' % NODE_LABELS[nt])
+            continue
+        ratios[nt] = value
+    if errors:
+        raise ValidationError(errors)
+
+    total = sum(ratios.values(), Decimal('0'))
+    if abs(total - Decimal('100')) > RATIO_SUM_TOLERANCE:
+        errors.append('已勾选节点比例合计应为 100%%（容差 ±%.2f%%），当前为 %s'
+                      % (RATIO_SUM_TOLERANCE, _plain_pct(total)))
+    if errors:
+        raise ValidationError(errors)
+    return tuple(selected), ratios
 
 
 def validate_project_item_rows(form):

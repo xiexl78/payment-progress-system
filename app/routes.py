@@ -30,7 +30,8 @@ from .models import (db, User, Project, ProjectItem, PaymentNode, PaymentApplica
 from .money import (CENT, MAX_MONEY, ZERO, allocate_tail, fmt_money as money_fmt,
                     mul_ratio, parse_money, sum_money)
 from .nodes import (FLOW_STATUS as NODE_FLOW_STATUS, NODE_TYPE_LABELS,
-                    derive_status, node_name as make_node_name,
+                    active_nodes, derive_status, node_exists,
+                    node_name as make_node_name,
                     node_progress_label, three_dim)
 from .validation import (DEFAULT_ACCOUNT_PASSWORDS, PROJECT_STATUSES, NODE_TYPES,
                          NODE_LABELS, TAX_RATES, ValidationError, parse_amount,
@@ -39,6 +40,7 @@ from .validation import (DEFAULT_ACCOUNT_PASSWORDS, PROJECT_STATUSES, NODE_TYPES
                          validate_apply_no,
                          validate_contract_change_items,
                          validate_contract_submission, validate_node_action,
+                         validate_node_selection,
                          validate_password, validate_project_dates,
                          validate_project_item_rows, validate_project_ratios,
                          validate_text)
@@ -692,23 +694,32 @@ def projects():
                            keyword=keyword, status=status, deleted_view=deleted_view)
 
 
-def _create_item_nodes(item, ratios, operator_id=None):
-    """为科目生成 4 个付款节点：科目总额 × 人工填写的比例，尾差归质保金。
+def _create_item_nodes(item, ratios, operator_id=None, node_types=None):
+    """为科目生成付款节点：科目总额 × 人工填写的比例，尾差归质保金。
 
     CR-04：比例 100% 来自合同确认时的人工输入，函数不再读取任何默认值。
+    CR-07 ②：只生成 ``node_types`` 里勾选的类型（未勾选即不存在）；
+    ``node_types=None`` 时按全量 4 类生成（兼容内部调用与历史测试）。
     ``ratios``：``{node_type: Decimal(百分数)}``。
     """
+    types = [nt for nt in (node_types if node_types is not None else NODE_TYPES)
+             if nt in ratios]
+    if not types:
+        return []
     base_total = (Decimal(item.original_amount or 0)
                   + Decimal(item.additional_amount or 0)).quantize(CENT)
     frac = {nt: (Decimal(ratios[nt]) / Decimal('100')).quantize(Decimal('0.000001'))
-            for nt in NODE_TYPES}
+            for nt in types}
     raw_dues = {nt: mul_ratio(base_total, frac[nt]) for nt in frac}
     try:
-        dues = allocate_tail(raw_dues, base_total)
+        dues = allocate_tail(raw_dues, base_total,
+                             order=tuple(nt for nt in ('warranty', 'acceptance',
+                                                       'progress', 'first')
+                                         if nt in raw_dues))
     except ValueError:
         dues = raw_dues
     nodes = []
-    for nt in NODE_TYPES:
+    for nt in types:
         node = PaymentNode(project_id=item.project_id, item_id=item.id,
                            node_type=nt, node_name=make_node_name(nt, frac[nt]),
                            ratio=frac[nt], calc_base='total',
@@ -717,6 +728,18 @@ def _create_item_nodes(item, ratios, operator_id=None):
         db.session.add(node)
         nodes.append(node)
     return nodes
+
+
+def _project_node_types(project):
+    """项目当前「存在」的节点类型（按固定顺序），CR-07 ②：加科目只沿用这些类型。"""
+    existing = {n.node_type for n in active_nodes(project.nodes)}
+    return tuple(nt for nt in NODE_TYPES if nt in existing)
+
+
+def _remove_node(node, operator_id=None):
+    """删除一个「不存在」的节点（合同回改 0 比例且无业务），连带清理一次性令牌。"""
+    NodeActionToken.query.filter_by(node_id=node.id).delete(synchronize_session=False)
+    db.session.delete(node)
 
 
 @bp.route('/projects/new', methods=['GET', 'POST'])
@@ -737,7 +760,7 @@ def project_new():
 
         try:
             item_rows = validate_project_item_rows(request.form)
-            ratios = validate_project_ratios(request.form)
+            node_types, ratios = validate_node_selection(request.form)
             warranty_months = parse_warranty_months(request.form.get('warranty_months'))
         except ValidationError as exc:
             for msg in exc.errors:
@@ -764,9 +787,9 @@ def project_new():
                 items.append(item)
             db.session.flush()
 
-            # 为每个科目生成 4 个付款节点（人工比例 + 尾差归集）
+            # 为每个科目生成勾选的付款节点（人工比例 + 尾差归集），未勾选即不存在
             for it in items:
-                _create_item_nodes(it, ratios, current_user().id)
+                _create_item_nodes(it, ratios, current_user().id, node_types=node_types)
             sync_project_dates(project)
             audit_record('project.create', 'project', project.id, project.id,
                          after=_project_snapshot(project), critical=False)
@@ -795,7 +818,8 @@ def project_detail(project_id):
                                     'sum_unapplied': ZERO}
                    for t in NODE_TEMPLATES}
     node_three = {}
-    for node in project.nodes:
+    # CR-07 ②：只展示「存在」的节点（未勾选类型不建节点；历史 0 比例节点隐藏）
+    for node in active_nodes(project.nodes):
         g = node_groups.get(node.node_type)
         if g is None:
             continue
@@ -875,6 +899,7 @@ def project_detail(project_id):
             shot_rows.append({'contract': contract, 'shots': shots})
     return render_template('project_detail.html', project=project, node_groups=node_groups,
                            acceptances=acceptances, templates=NODE_TEMPLATES,
+                           project_node_types=(_project_node_types(project) or NODE_TYPES),
                            applications=applications,
                            node_three=node_three, node_tokens=_issue_node_tokens(project),
                            totals_dim=totals_dim, status_labels=STATUS_LABELS,
@@ -949,7 +974,13 @@ def item_add(project_id):
                                  required=False, max_len=32, allowed=TAX_RATES)
         original = parse_amount(request.form.get('original_amount'),
                                 field='原金额', allow_zero=True)
-        ratios = validate_project_ratios(request.form)
+        # CR-07 ②：加科目只沿用项目现有节点类型，不允许凭空多出未勾选类型
+        project_types = _project_node_types(project)
+        if project_types:
+            _selected, ratios = validate_node_selection(request.form,
+                                                        node_types=project_types)
+        else:
+            _selected, ratios = validate_node_selection(request.form)
     except ValidationError as exc:
         for msg in exc.errors:
             flash(msg, 'danger')
@@ -961,7 +992,8 @@ def item_add(project_id):
                        updated_by=current_user().id)
     db.session.add(item)
     db.session.flush()
-    _create_item_nodes(item, ratios, current_user().id)
+    _create_item_nodes(item, ratios, current_user().id,
+                       node_types=tuple(ratios.keys()))
     sync_project_dates(project)
     audit_record('item.create', 'item', item.id, project.id,
                  after=_item_snapshot(item), critical=False)
@@ -1896,7 +1928,12 @@ def _ratio_fraction(pct):
 
 
 def _apply_contract_values(project, submission, contract, *, update_amounts=True):
-    """就地更新项目口径：只改基线，不触碰节点状态/开票/付款，不删除任何节点。"""
+    """就地更新项目口径：只改基线，不触碰节点状态/开票/付款。
+
+    CR-07 ②（§2.6）：合同回改若把某类型从「未勾选」改为 >0 → 补建节点；
+    从 >0 改为 0 且节点无业务 → 删除节点；有业务时由 :func:`_contract_blockers`
+    在入口处整体阻断，这里不再做破坏性修改。
+    """
     operator_id = _operator_id()
     project.name = submission.contract_name
     project.remark = _contract_remark(submission, contract.file_name)
@@ -1907,18 +1944,34 @@ def _apply_contract_values(project, submission, contract, *, update_amounts=True
         sync_project_dates(project)
         return
     items = list(project.items)
-    if items:
-        item = items[0]
+    item = items[0] if items else None
+    if item is not None:
         item.original_amount = submission.original_amount
         item.additional_amount = submission.additional_amount
         item.tax_rate = submission.tax_rate or None
         item.updated_by = operator_id
-    node_map = {n.node_type: n for n in project.nodes}
+    # 合同口径只作用于主科目（items[0]，合同识别生成的就是唯一科目），
+    # 多科目项目的其他科目节点不因合同回改被改/删（CR-07 §2.6）
+    node_map = {n.node_type: n for n in item.nodes} if item is not None else {}
     for nt in NODE_TYPES:
         node = node_map.get(nt)
-        if node is None:
-            continue
         ratio = _ratio_fraction(submission.ratios_pct[nt])
+        if node is None:
+            # §2.6 补建：回改把未勾选类型改为 >0，按 submission 计算结果补出节点
+            if ratio <= 0 or item is None:
+                continue
+            node = PaymentNode(project_id=project.id, item_id=item.id, node_type=nt,
+                               node_name=make_node_name(nt, ratio), ratio=ratio,
+                               calc_base='total',
+                               due_amount=submission.node_amounts[nt], status='未触发',
+                               change_note='合同回改补建节点', updated_by=operator_id)
+            db.session.add(node)
+            continue
+        if ratio <= 0:
+            # §2.6 删除：改为 0 且无业务才删；有业务（历史超付等）保留冻结
+            if not node.has_business:
+                _remove_node(node, operator_id)
+            continue
         node.ratio = ratio
         node.node_name = make_node_name(nt, ratio)
         node.calc_base = 'total'   # 统一口径：首付款也按合同总额
@@ -1947,6 +2000,9 @@ def _create_contract_project(submission, contract):
     db.session.flush()
     for nt in NODE_TYPES:
         ratio = _ratio_fraction(submission.ratios_pct[nt])
+        if ratio <= 0:
+            # CR-07 ②：比例 0 = 该项目没有此节点，不建节点（等价未勾选）
+            continue
         node = PaymentNode(project_id=project.id, item_id=item.id, node_type=nt,
                            node_name=make_node_name(nt, ratio), ratio=ratio,
                            calc_base='total',
@@ -2616,7 +2672,7 @@ def _reports_data():
             days = (p.warranty_due_date - today).days
             if days <= 60:
                 reminders.append(('warranty', p, days))
-        for n in p.nodes:
+        for n in active_nodes(p.nodes):
             if n.unpaid_amount > 0:
                 reminders.append(('pending_pay', n, None))
     return projects, rows, totals, reminders

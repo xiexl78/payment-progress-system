@@ -58,18 +58,30 @@
     </div>
 
     {% if not project %}
+    {% set node_labels = {'first': '首付款', 'progress': '进度款', 'acceptance': '验收款', 'warranty': '质保金'} %}
+    {% set selected = (form.getlist('node_types') if form else []) %}
     <div class="form-row">
-      <label class="field-label mt-8">付款节点比例（百分数，四项合计必须 = 100%，系统不提供默认值）*</label>
-      <div class="row">
-        <div><label class="field-label">首付款 %</label><input type="number" name="ratio_first" class="small" step="0.01" min="0" max="100" value="{{ form.get('ratio_first', '') if form else '' }}" required></div>
-        <div><label class="field-label">进度款 %</label><input type="number" name="ratio_progress" class="small" step="0.01" min="0" max="100" value="{{ form.get('ratio_progress', '') if form else '' }}" required></div>
-        <div><label class="field-label">验收款 %</label><input type="number" name="ratio_acceptance" class="small" step="0.01" min="0" max="100" value="{{ form.get('ratio_acceptance', '') if form else '' }}" required></div>
-        <div><label class="field-label">质保金 %</label><input type="number" name="ratio_warranty" class="small" step="0.01" min="0" max="100" value="{{ form.get('ratio_warranty', '') if form else '' }}" required></div>
+      <label class="field-label mt-8">付款节点 *（勾选本项目要用的节点，未勾选的不生成、不展示；勾选比例合计必须 = 100%）</label>
+      <div class="node-pick">
+        {% for t in templates %}
+        <div class="node-pick-row">
+          <label style="min-width:110px;">
+            <input type="checkbox" name="node_types" value="{{ t.node_type }}" class="node-type-chk"
+                   {{ 'checked' if t.node_type in selected }}> {{ node_labels[t.node_type] }}
+          </label>
+          <input type="number" name="ratio_{{ t.node_type }}" class="small node-ratio"
+                 step="0.01" min="0" max="100" placeholder="比例 %"
+                 value="{{ form.get('ratio_' + t.node_type, '') if form else '' }}"
+                 {{ '' if t.node_type in selected else 'disabled' }}>
+          <span class="muted" style="font-size:12px;">{{ t.trigger }}</span>
+        </div>
+        {% endfor %}
       </div>
-      <div class="src-text">比例允许 0%；尾差归质保金，保证节点应付合计 = 科目总额。已发生任一业务（申请/开票/付款）的节点合同变更时冻结。</div>
+      <div id="node-sum" class="src-text">已勾选合计：0%</div>
+      <div class="src-text">比例允许两位小数；尾差归质保金（未勾选质保金时按 验收→进度→首付 归集），保证节点应付合计 = 科目总额。</div>
     </div>
     <div class="form-row">
-      <label class="field-label mt-8">费用科目（每个科目按上面的比例生成 4 个付款节点）</label>
+      <label class="field-label mt-8">费用科目（每个科目按上面勾选的节点生成付款节点）</label>
       <div id="items-container">
         <div class="item-row form-panel">
           <div class="row">
@@ -95,21 +107,53 @@
 </div>
 
 <script>
-  document.getElementById('add-item').addEventListener('click', function () {
-    var container = document.getElementById('items-container');
-    var first = container.querySelector('.item-row');
-    var clone = first.cloneNode(true);
-    clone.querySelectorAll('input').forEach(function (i) { i.value = ''; });
-    clone.querySelectorAll('select').forEach(function (s) { s.value = s.querySelector('option') ? s.querySelector('option').value : ''; });
-    container.appendChild(clone);
-  });
-  document.getElementById('items-container').addEventListener('click', function (e) {
-    if (e.target.classList.contains('remove-item')) {
-      var rows = document.querySelectorAll('#items-container .item-row');
-      if (rows.length > 1) { e.target.closest('.item-row').remove(); }
-      else { alert('至少保留一个科目'); }
+  (function () {
+    var addBtn = document.getElementById('add-item');
+    if (addBtn) {
+      addBtn.addEventListener('click', function () {
+        var container = document.getElementById('items-container');
+        var first = container.querySelector('.item-row');
+        var clone = first.cloneNode(true);
+        clone.querySelectorAll('input').forEach(function (i) { i.value = ''; });
+        clone.querySelectorAll('select').forEach(function (s) { s.value = s.querySelector('option') ? s.querySelector('option').value : ''; });
+        container.appendChild(clone);
+      });
+      document.getElementById('items-container').addEventListener('click', function (e) {
+        if (e.target.classList.contains('remove-item')) {
+          var rows = document.querySelectorAll('#items-container .item-row');
+          if (rows.length > 1) { e.target.closest('.item-row').remove(); }
+          else { alert('至少保留一个科目'); }
+        }
+      });
     }
-  });
+
+    // CR-07 ②：勾选节点 → 启用/禁用比例输入，实时显示合计
+    var checks = Array.prototype.slice.call(document.querySelectorAll('.node-type-chk'));
+    if (!checks.length) { return; }
+    function refreshNodeSum() {
+      var sum = 0;
+      checks.forEach(function (chk) {
+        var input = document.querySelector('input[name="ratio_' + chk.value + '"]');
+        if (!input) { return; }
+        input.disabled = !chk.checked;
+        if (chk.checked) {
+          var v = parseFloat(input.value);
+          if (!isNaN(v)) { sum += v; }
+        }
+      });
+      var ok = Math.abs(sum - 100) <= 0.01;
+      var box = document.getElementById('node-sum');
+      if (box) {
+        box.textContent = '已勾选合计：' + sum.toFixed(2) + '%'
+          + (ok ? '（符合 100%）' : '（需勾选合计 = 100%）');
+        box.style.color = ok ? '' : '#c0392b';
+      }
+    }
+    checks.forEach(function (chk) { chk.addEventListener('change', refreshNodeSum); });
+    Array.prototype.forEach.call(document.querySelectorAll('.node-ratio'),
+      function (input) { input.addEventListener('input', refreshNodeSum); });
+    refreshNodeSum();
+  })();
 </script>
 
 {% endblock %}

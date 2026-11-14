@@ -17,7 +17,8 @@ from .money import CENT, ZERO
 
 __all__ = ['FLOW_STATUS', 'STATUS_LABELS', 'NODE_TYPE_LABELS',
            'derive_status', 'node_name', 'three_dim', 'status_label',
-           'node_progress_label', 'payment_state', 'invoice_state']
+           'node_progress_label', 'payment_state', 'invoice_state',
+           'node_exists', 'active_nodes']
 
 #: 兼容缓存列的全部取值（顺序即页面/筛选顺序）
 FLOW_STATUS = ['未触发', '未开票已申请', '已开票未申请', '已申请',
@@ -36,6 +37,26 @@ STATUS_LABELS = {
 
 NODE_TYPE_LABELS = {'first': '首付款', 'progress': '进度款',
                     'acceptance': '验收款', 'warranty': '质保金'}
+
+
+def node_exists(node):
+    """节点是否「存在」（CR-07 ②）。
+
+    CR-07 起新建项目按勾选生成节点：未勾选的类型**不建节点**；历史遗留的
+    0 比例节点等价于「未勾选」，只在展示层隐藏、数据保留（Q5 不删）。
+    """
+    if node is None:
+        return False
+    try:
+        return Decimal(node.ratio or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def active_nodes(nodes):
+    """过滤出不存在的节点（0 比例/无比例），保持传入顺序。"""
+    return [node for node in (nodes or []) if node_exists(node)]
+
 
 
 def derive_status(due, applied, invoice, paid):
