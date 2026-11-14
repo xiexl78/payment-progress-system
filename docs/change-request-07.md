@@ -2,7 +2,7 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 版本 | v1.2（2026-11-14，Q1~Q8 拍板后定稿） |
+| 版本 | v1.3（2026-11-14，采纳开发/测试实现反馈） |
 | 作者 | 架构师 |
 | 依据 | Chief 群派单 CR-07 + 后续拍板（② 勾选固定节点类型、不做自定义名称；④ 输入项目名、有付款业务只允许归档） |
 | 关联文档 | `docs/change-request-04.md`（付款口径/冻结）、`docs/change-request-05.md`（截图识别/令牌/质保期）、`docs/change-request-06.md`、`docs/qa-baseline.md`、`docs/qa-cr07-plan.md` |
@@ -10,6 +10,8 @@
 | 状态 | **已定稿**：Q1~Q8 已拍板，开发按 T1→T5 实施中 |
 
 **v1.1 变更**：② 从「比例 0 = 不存在」升级为「新建时勾选固定节点类型」的交互口径（模型仍 0 迁移）；④ 二次确认改为**输入项目名称**，并增加「有申请/发票/付款任一 → 禁止彻底删除、只允许归档」。
+
+**v1.3 变更**：明确合同回改补建/删除只作用主科目 `items[0]`（§2.6）；purge 的成对删除语句补脏数据兜底、回收站按钮预先禁用（§5.1/§5.3）；新增 A-19 无悬空引用用例（§5.8）。
 
 **v1.2 变更**：Chief 一次性拍板 Q1~Q8，§12 改为结论表；Q7 明确不新增归档入口（文案「保留在回收站即归档」）；Q8 改为 **purge 前自动备份 SQLite 到 `backups/`，保留 7 天，备份失败中止删除**（原 JSON 快照方案作废）；Q1 明确自定义名称/多个进度款另立 CR-08。
 
@@ -112,6 +114,12 @@
 | 合同回改把某类型从 >0 改为 0，节点**无业务** | 删除该节点（连带清理该 node 的 `node_action_tokens`），金额在剩余节点间重算尾差，审计留痕 |
 | 同上但节点**已有申请/开票/付款** | **阻断**，扩展 `_contract_blockers`（`app/routes.py:1869`）：「节点已有业务，金额已冻结，需走变更单」 |
 | 合同变更（`_build_contract_change_plan` / `project_contract_change`） | 分摊只按**现存节点**比例计算，缺失/0 节点不参与尾差 |
+
+**作用范围（实现口径，已确认）**：
+
+- 补建/删除节点只作用于**主科目 `items[0]`**（合同识别生成的项目只有「合同价款」一个科目）；多科目项目的其他科目节点一律不动。
+- 与现有约束一致：`_contract_blockers` 对「多科目项目」直接阻断合同回改（`app/routes.py:1873`），所以回改真正能执行时通常只有单科目；**禁止**按 `node_type` 跨科目匹配节点（会误伤其他科目）。
+- 加科目（`item_add`）继续沿用项目已有节点类型集合，不因回改/变更而新增类型。
 
 ### 2.7 历史数据兼容（不做破坏性改动）
 
@@ -274,6 +282,7 @@
   - **仅 admin**；operator/viewer → 403 + 审计 `project.purge.denied`。
   - 项目必须存在且 `deleted_at IS NOT NULL`（先软删进回收站）；否则 404/400 + flash。
   - **业务阻断**：项目存在任一申请（`payment_applications`）、发票（`payment_invoices`）、付款记录（`payment_records`）→ **拒绝**，flash「该项目已有申请/开票/付款记录，不可彻底删除，只能归档」，审计 `project.purge.blocked`。
+  - **回收站列表预先展示可用性**：渲染回收站时按项目聚合一次查询计算「是否有资金业务」（避免 N+1）；有业务的行直接渲染**禁用按钮** + 提示「已有资金业务，只能归档（保留在回收站）」，无业务才可点击；服务端仍按上面的规则二次校验（防绕过）。
   - CSRF：沿用全局校验。
 - 「只允许归档」（Q7 已拍板）：**不新增独立归档入口**，沿用现有软删除=归档语义（`deleted_at`/`deleted_by`，回收站可恢复）；拒绝时提示「该项目已有申请/开票/付款记录，不可彻底删除，保留在回收站即视为归档」。
 
@@ -294,9 +303,9 @@
 ### 5.3 级联范围与顺序（单事务）
 
 1. `node_action_tokens`：`node_id IN (SELECT id FROM payment_nodes WHERE project_id=?)`
-2. `payment_records`：`node_id IN (…)`（前置已保证为空，保留兜底）
+2. `payment_records`：`node_id IN (…) OR application_id IN (SELECT id FROM payment_applications WHERE node_id IN (…))`（前置已保证为空，保留兜底；后半个条件兜历史脏数据——记录挂在本项目申请单上但 `node_id` 属别的项目时也不留悬空 `application_id`）
 3. `payment_applications`：`node_id IN (…)`（同上）
-4. `payment_invoices`：`node_id IN (…)`（同上）
+4. `payment_invoices`：`node_id IN (…) OR project_id=?`（`project_id` 兜脏数据，防遗漏）
 5. `payment_nodes`：`project_id=?`
 6. `project_items`：`project_id=?`
 7. `acceptance_records`：`project_id=?`
@@ -339,7 +348,8 @@
 ### 5.8 ④ 的验收点
 
 - A-12：operator/viewer 调 purge → 403 + 审计 denied；未软删项目 → 400/404 且数据不变。
-- A-13：有申请/发票/付款任一的项目 → 拒绝并提示归档，数据不变（含回收站内项目）。
+- A-13：有申请/发票/付款任一的项目 → 回收站里按钮为**禁用态**并提示「已有资金业务，只能归档（保留在回收站）」；直接构造 POST 也被拒绝、数据不变（含回收站内项目）。
+- A-19：脏数据用例——`payment_records.application_id` 指向本项目申请单但 `node_id` 属别的项目时，purge 后也无悬空 `application_id`（无 FK 残留）。
 - A-14：项目名称不符或未勾选不可恢复 → 拒绝，数据不变。
 - A-15：admin 成功 purge 后：9 类关联数据该项目的行数为 0、附件文件与目录不存在、审计有 `project.purge` 且含计数/快照。
 - A-16：回收站列表不再出现该项目，详情 404，报表/导出不含；其他项目数据不受影响。
@@ -385,7 +395,7 @@
 | T2 | ② 勾选式节点：`validate_node_selection` + `_create_item_nodes(node_types)` + `project_new`/`item_add` + 展示/导出/提醒过滤 + 合同回改边界 | T1 | `app/validation.py`、`app/routes.py`、`app/nodes.py`、`app/exporter.py`、`app/templates/project_form.html` | A-07~A-11 |
 | T3 | ① 新建页识别：`/projects/new/recognize` + 草稿落盘 + 回填（含节点自动勾选）+ 绑定 + 放弃 + `manual_confirm` | T2（共用 `project_form.html`） | `app/routes.py`、`app/templates/project_form.html` | A-01~A-04 |
 | T4 | ① 旧入口收敛（导航/权限/横幅）+ `cleanup_contract_drafts.py` | T3 | `app/routes.py`、`app/templates/{base,contracts}.html`、`scripts/` | A-05/A-06 |
-| T5 | ④ purge 路由 + 级联 + 业务阻断 + 审计 + 文件清理 + **SQLite 备份（7 天保留、失败中止）** + 回收站按钮 | 无（可与 T2/T3 并行） | `app/routes.py`、`app/templates/projects.html`、`app/config.py`（备份目录） | A-12~A-18 |
+| T5 | ④ purge 路由 + 级联 + 业务阻断 + 审计 + 文件清理 + **SQLite 备份（7 天保留、失败中止）** + 回收站按钮 | 无（可与 T2/T3 并行） | `app/routes.py`、`app/templates/projects.html`、`app/config.py`（备份目录） | A-12~A-19 |
 | T6 | 测试补用例（③ 4 条、② 勾选组合/历史兼容、① 端到端、④ 安全/级联） | T1–T5 | `tests/` | 405 → 约 450–470 全绿 |
 | T7 | 文档：`docs/qa-baseline.md`/`roadmap.md`/部署手册（清理任务） | T6 | `docs/` | — |
 
@@ -425,7 +435,7 @@
 - ②：A-07~A-11 全过；勾选式新建在详情/列表/报表/导出/提醒五处一致；历史 4 节点项目无变化。
 - ①：A-01~A-06 全过；新建页是唯一识别入口；三张图在详情页可见；识别失败可降级且留痕。
 - ③：§4.4 四条全过，回归防复发。
-- ④：A-12~A-18 全过；仅 admin、仅回收站、输入项目名、业务项目只允许归档（提示「保留在回收站即归档」）、级联完整、审计可查、purge 前备份成功（失败则中止删除）。
+- ④：A-12~A-19 全过；仅 admin、仅回收站、输入项目名、业务项目只允许归档（提示「保留在回收站即归档」）、级联完整、审计可查、purge 前备份成功（失败则中止删除）。
 - 回归：全量用例两遍 0 FAIL/0 XFAIL/0 XPASS；干净工作区；文档/基线数字同步。
 
 ---
