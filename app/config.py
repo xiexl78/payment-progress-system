@@ -185,6 +185,12 @@ def load_config(base_dir, config_file=None, explicit=False):
         _raw(file_values, 'NODE_TOKEN_TTL_MINUTES'),
         key='NODE_TOKEN_TTL_MINUTES', errors=errors,
         default=30, minimum=1, maximum=1440)
+    #: CR-07 ①：未绑定项目的截图识别草稿保留天数，超期由
+    #: scripts/cleanup_contract_drafts.py 清理（默认 7，范围 1~365）。
+    draft_retention_days = _parse_number(
+        _raw(file_values, 'DRAFT_RETENTION_DAYS'),
+        key='DRAFT_RETENTION_DAYS', errors=errors,
+        default=7, minimum=1, maximum=365, cast=int)
 
     cfg = {
         'APP_ENV': app_env,
@@ -209,6 +215,7 @@ def load_config(base_dir, config_file=None, explicit=False):
         'LOGIN_FAILURE_WINDOW_MINUTES': int(failure_window),
         'TRUSTED_PROXY_COUNT': int(trusted_proxy),
         'NODE_TOKEN_TTL_MINUTES': float(node_token_ttl_minutes),
+        'DRAFT_RETENTION_DAYS': int(draft_retention_days),
         'CSRF_ENABLED': True,
         'TESTING': False,
         'FORCE_DEFAULT_PASSWORD_CHANGE': (app_env == 'production'),

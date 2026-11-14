@@ -3,33 +3,14 @@
 {% block page_title %}合同识别{% endblock %}
 {% block content %}
 
-{% if current_user.role in ('admin', 'operator') %}
-<div class="card">
-  <div class="card-title">按模板上传关键信息截图<span class="sub">上传合同里的三处关键截图，系统分类型 OCR 后填入付款节点；识别结果需对照原图人工确认</span></div>
-  <form method="post" action="{{ url_for('main.contract_shots_upload') }}" enctype="multipart/form-data">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <div class="flex" style="gap:12px;flex-wrap:wrap;">
-      <label style="flex:1;min-width:220px;">
-        <div><strong>① 合同金额截图</strong> <span class="text-danger">*必传</span></div>
-        <div class="src-text">合同总额、税率所在页面</div>
-        <input type="file" name="shot_amount" accept=".jpg,.jpeg,.png,.bmp,.webp" required>
-      </label>
-      <label style="flex:1;min-width:220px;">
-        <div><strong>② 付款条件/付款方式截图</strong> <span class="text-danger">*必传</span></div>
-        <div class="src-text">付款方式与各节点付款比例</div>
-        <input type="file" name="shot_payment" accept=".jpg,.jpeg,.png,.bmp,.webp" required>
-      </label>
-      <label style="flex:1;min-width:220px;">
-        <div><strong>③ 维保/质保金条款截图</strong> <span class="src-text">（选传）</span></div>
-        <div class="src-text">质保期（月）与质保金比例</div>
-        <input type="file" name="shot_warranty" accept=".jpg,.jpeg,.png,.bmp,.webp">
-      </label>
-    </div>
-    <div class="flex" style="gap:12px;margin-top:10px;align-items:center;">
-      <button type="submit" class="btn btn-primary">上传并识别</button>
-      <span class="src-text">支持 JPG / PNG / BMP / WEBP，单张不超过 10MB；原图会保留，项目详情可直接对照查看。</span>
-    </div>
-  </form>
+{% if current_user.role == 'admin' %}
+<div class="card" style="border-left:4px solid #2f80ed;">
+  <div class="card-title" style="margin:0;">合同识别已并入「新建项目」
+    <span class="sub">请在新项目页面按模板上传关键信息截图（①合同金额、②付款条件必传，③质保条款选传），识别结果直接填入项目表单。此页仅保留历史识别记录与整份合同文件兜底。</span>
+  </div>
+  <div class="flex" style="gap:10px;margin-top:8px;">
+    <a href="{{ url_for('main.project_new') }}" class="btn btn-primary btn-sm">去新建项目</a>
+  </div>
 </div>
 <div class="card">
   <div class="card-title">兜底：上传整份合同文件<span class="sub">截图不全或合同为 PDF/Word 时，仍可按原方式上传整份文件识别</span></div>

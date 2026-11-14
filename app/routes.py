@@ -6,6 +6,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 from datetime import date, timedelta, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from functools import wraps
@@ -1521,6 +1522,17 @@ def _pct_plain(value):
 @bp.route('/contracts')
 @login_required
 def contracts():
+    """CR-07 ①（§3.7）：识别入口已并入「新建项目」，此页仅 admin 查历史与整份合同兜底。"""
+    actor = current_user()
+    role = getattr(actor, 'role', None)
+    if role != 'admin':
+        if role == 'operator':
+            flash('合同识别已并入「新建项目」页面，请在新项目里上传关键信息截图', 'info')
+            return redirect(url_for('main.project_new'))
+        audit_record('contract.list.denied', 'contract', None, None,
+                     result='403', after={'role': role}, critical=False)
+        db.session.commit()
+        abort(403)
     contract_list = ContractFile.query.order_by(ContractFile.created_at.desc()).all()
     rows = []
     for c in contract_list:
@@ -1538,7 +1550,7 @@ def contracts():
 
 @bp.route('/contracts/upload', methods=['POST'])
 @login_required
-@role_required('admin', 'operator')
+@role_required('admin')
 def contract_upload():
     file = request.files.get('file')
     if not file or not file.filename:
@@ -1751,9 +1763,9 @@ def _create_shot_draft(prepared, actor):
 
 @bp.route('/contracts/shots', methods=['POST'])
 @login_required
-@role_required('admin', 'operator')
+@role_required('admin')
 def contract_shots_upload():
-    """三张截图上传 + 分类型 OCR + 定向识别（CR-05 需求①；旧入口保留给整份合同兜底）。"""
+    """三张截图上传 + 分类型 OCR + 定向识别（CR-05 需求①；CR-07 起收敛为 admin 历史兜底）。"""
     files = {t: request.files.get('shot_' + t) for t in SHOT_TYPES}
     try:
         prepared = _read_shot_uploads(files)
@@ -1786,6 +1798,69 @@ def project_new_recognize():
     else:
         flash('识别完成，识别结果已填入下方表单，请对照原图核对后保存', 'success')
     return redirect(url_for('main.project_new', contract_id=contract.id))
+
+
+def _draft_file_paths(draft):
+    """识别草稿待清理的文件与目录（截图原图 + 合同文件 + shots/<id>/ 目录）。"""
+    files = []
+    for shot in list(draft.screenshots):
+        path = screenshot_storage_path(shot)
+        if path and os.path.isfile(path):
+            files.append(path)
+    path = contract_storage_path(draft)
+    if path and os.path.isfile(path):
+        files.append(path)
+    shot_dir = os.path.join(contract_upload_dir(), 'shots', str(draft.id))
+    dirs = [shot_dir] if os.path.isdir(shot_dir) else []
+    return files, dirs
+
+
+def _best_effort_remove(files, dirs=()):
+    """best-effort 删除文件/目录，返回 (deleted, errors)；失败只记 warning，不抛。"""
+    deleted, errors = [], []
+    for path in files:
+        try:
+            os.remove(path)
+            deleted.append(path)
+        except OSError as exc:
+            current_app.logger.warning('删除文件失败：%s（%s）', path, exc)
+            errors.append({'path': path, 'error': str(exc)[:120]})
+    for directory in dirs:
+        try:
+            shutil.rmtree(directory)
+        except OSError as exc:
+            current_app.logger.warning('删除目录失败：%s（%s）', directory, exc)
+            errors.append({'path': directory, 'error': str(exc)[:120]})
+    return deleted, errors
+
+
+@bp.route('/projects/new/discard', methods=['POST'])
+@login_required
+@role_required('admin', 'operator')
+def project_new_discard():
+    """CR-07 ①（§3.6/§6）：放弃当前识别草稿——删行 + 删文件 + 审计。"""
+    draft = _load_shot_draft(request.form.get('contract_id', type=int))
+    if draft is None:
+        flash('识别草稿不存在或已被使用，请重新上传截图', 'warning')
+        return redirect(url_for('main.project_new'))
+    contract_id = draft.id
+    files, dirs = _draft_file_paths(draft)
+    counts = {'contract_screenshots': len(list(draft.screenshots)),
+              'contract_files': 1}
+    for shot in list(draft.screenshots):
+        db.session.delete(shot)
+    db.session.delete(draft)
+    db.session.flush()
+    deleted, errors = _best_effort_remove(files, dirs)
+    audit_record('contract.draft.purge', 'contract', contract_id, None,
+                 result='success',
+                 after={'reason': 'user_discard', 'counts': counts,
+                        'files': [f.replace('\\', '/') for f in files],
+                        'deleted': len(deleted), 'file_errors': errors},
+                 critical=False)
+    db.session.commit()
+    flash('已放弃本次识别结果，截图与草稿已删除，可重新上传', 'info')
+    return redirect(url_for('main.project_new'))
 
 
 def _load_shot_draft(contract_id):
