@@ -1818,7 +1818,10 @@ def contracts():
     rows = []
     for c in contract_list:
         result = _parse_contract_result(c)
-        amount = float((result or {}).get('contract_amount') or 0)
+        try:  # 识别结果可能是数字或带千分位的字符串，展示用，解析不了就不显示
+            amount = float((result or {}).get('contract_amount') or 0)
+        except (TypeError, ValueError):
+            amount = 0
         creator = db.session.get(User, c.created_by) if c.created_by else None
         rows.append({
             'contract': c,
@@ -2321,8 +2324,11 @@ def _project_contract_values(project):
 
 def _recognized_contract_values(contract, result):
     """首次确认：用识别结果预填表单（识别是草稿，提交后以服务端校验为准）。"""
+    # 识别引擎给的是 JSON 数字（float），parse_amount 只接受字符串/Decimal（CR07-01）。
+    raw_amount = result.get('contract_amount')
     try:
-        original = parse_amount(result.get('contract_amount'), field='识别金额', required=False)
+        original = parse_amount('' if raw_amount is None else str(raw_amount),
+                                field='识别金额', required=False)
     except ValidationError:
         original = ZERO
     node_map = {nd.get('node_type'): nd for nd in (result.get('nodes') or [])}
