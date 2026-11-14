@@ -176,13 +176,16 @@ def _permissions(s_admin):
     # --- viewer ---
     s_view, rv = C.login(BASE, 'viewer', '123456')
     check('权限', 'viewer 登录成功', rv.status_code == 302)
-    for p in ['/projects', '/projects/%d' % pid_a, '/reports', '/contracts',
+    for p in ['/projects', '/projects/%d' % pid_a, '/reports',
               '/contracts/%d/confirm' % ct1, '/contracts/%d/raw' % ct1]:
         rr = s_view.get(BASE + p, allow_redirects=False)
         check('权限', 'viewer 只读页面 %s' % p, rr.status_code == 200, 'code=%s' % rr.status_code)
     for p in ['/projects/new', '/projects/%d/edit' % pid_a, '/admin/users']:
         rr = s_view.get(BASE + p, allow_redirects=False)
         check('权限', 'viewer GET %s 被拒' % p, rr.status_code == 302)
+    rr = s_view.get(BASE + '/contracts', allow_redirects=False)
+    check('权限', 'viewer 访问 /contracts 被拒（403，CR-07 §6）',
+          rr.status_code == 403, 'code=%s' % rr.status_code)
     proj_cnt = q1(DB, 'SELECT COUNT(*) FROM projects')
     rr = C.post(s_view, BASE, '/projects/new', {'project_no': 'QA-VIEW-NEW', 'name': 'x', 'item_name': ['a'], 'original_amount': ['1']})
     check('权限', 'viewer 建项目被拒', rr.status_code == 302 and q1(DB, 'SELECT COUNT(*) FROM projects') == proj_cnt)
@@ -249,12 +252,17 @@ def _permissions(s_admin):
           q1(DB, 'SELECT status FROM projects WHERE id=?', (pid_a,)) != '已归档')
     rc0 = q1(DB, 'SELECT COUNT(*) FROM contract_files')
     _, ct_op = upload(s_op, SAMPLE_TXT, 'op合同.txt')
-    check('权限', 'operator 上传合同允许', q1(DB, 'SELECT COUNT(*) FROM contract_files') == rc0 + 1)
-    pc0 = q1(DB, 'SELECT COUNT(*) FROM projects')
-    confirm_ct(s_op, ct_op, {'project_no': 'QA-OP-CT', 'contract_name': '经办确认合同项目',
-                             'original_amount': '165000', 'additional_amount': '0', 'tax_rate': '13%',
-                             'ratio_first': '30', 'ratio_progress': '52', 'ratio_acceptance': '15', 'ratio_warranty': '3'})
-    check('权限', 'operator 合同确认生成项目允许', q1(DB, 'SELECT COUNT(*) FROM projects') == pc0 + 1)
+    check('权限', 'operator 上传合同被拒（CR-07 §6：入口仅 admin）',
+          ct_op is None and q1(DB, 'SELECT COUNT(*) FROM contract_files') == rc0,
+          'ct=%s' % ct_op)
+    rr = s_op.get(BASE + '/contracts', allow_redirects=False)
+    check('权限', 'operator 访问 /contracts 被引导到新建项目页（302）',
+          rr.status_code == 302 and '/projects/new' in rr.headers.get('Location', ''),
+          'code=%s loc=%s' % (rr.status_code, rr.headers.get('Location', '')))
+    rr = C.post(s_op, BASE, '/contracts/shots', {})
+    check('权限', 'operator 上传关键截图被拒（CR-07 §6：仅 admin）',
+          rr.status_code == 302,
+          'code=%s' % rr.status_code)
     # 越权 1：经办人删除项目
     C.post(s_op, BASE, '/projects/%d/delete' % pid_b)
     check('权限', '经办人不应能删除项目（README 未授权）',
