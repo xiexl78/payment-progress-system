@@ -2,6 +2,62 @@
 {% block title %}{{ '编辑项目' if project else '新建项目' }} - 付款进度管理系统{% endblock %}
 {% block page_title %}{{ '编辑项目' if project else '新建项目' }}{% endblock %}
 {% block content %}
+{% set pf = prefill if prefill is defined and prefill else {} %}
+{% set node_labels = {'first': '首付款', 'progress': '进度款', 'acceptance': '验收款', 'warranty': '质保金'} %}
+{% set selected = (pf.selected if pf.selected is defined and pf.selected else []) %}
+
+{% if not project %}
+<div class="card" style="max-width:1100px;">
+  <div class="card-title">合同截图识别
+    <span class="muted" style="font-size:12px;">①金额截图、②付款条件/付款方式截图为必传；③维保/质保金条款截图选传</span>
+  </div>
+  <form method="post" enctype="multipart/form-data" action="{{ url_for('main.project_new_recognize') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div class="form-grid">
+      <div class="form-row">
+        <label class="field-label">① 合同金额截图 *</label>
+        <input type="file" name="shot_amount" accept=".png,.jpg,.jpeg,.bmp,.webp" required>
+      </div>
+      <div class="form-row">
+        <label class="field-label">② 付款条件/付款方式截图 *</label>
+        <input type="file" name="shot_payment" accept=".png,.jpg,.jpeg,.bmp,.webp" required>
+      </div>
+      <div class="form-row">
+        <label class="field-label">③ 维保/质保金条款截图</label>
+        <input type="file" name="shot_warranty" accept=".png,.jpg,.jpeg,.bmp,.webp">
+      </div>
+    </div>
+    <div class="src-text">支持 PNG/JPG/BMP/WEBP，单张 ≤ 10MB。识别结果只用于预填，保存前请对照原图核对。</div>
+    <button type="submit" class="btn btn-primary mt-8">识别并填入</button>
+  </form>
+  {% if pf.shots %}
+  <div class="form-panel mt-8">
+    <div class="flex" style="justify-content:space-between;align-items:center;">
+      <span class="field-label" style="margin:0;">本次识别用的截图</span>
+      <a href="{{ url_for('main.project_new') }}" class="btn btn-ghost btn-sm">放弃识别结果</a>
+    </div>
+    <div class="row" style="gap:12px;flex-wrap:wrap;margin-top:8px;">
+      {% for shot in pf.shots %}
+      <div style="width:200px;">
+        <div class="src-text">{{ shot.label }}</div>
+        <a href="{{ url_for('main.contract_shot_image', shot_id=shot.shot_id) }}" target="_blank">
+          <img src="{{ url_for('main.contract_shot_image', shot_id=shot.shot_id) }}"
+               alt="{{ shot.label }}" style="width:200px;max-height:260px;object-fit:contain;border:1px solid #ddd;background:#fafafa;">
+        </a>
+        <div class="src-text">
+          {% if shot.ocr_status == 'ok' %}OCR 成功
+          {% else %}<span style="color:#c0392b;">OCR 失败（{{ shot.ocr_msg or '未识别出文字' }}）</span>{% endif %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% if pf.manual_required %}
+    <div class="src-text" style="color:#c0392b;">截图①②都没有识别出文字，请对照原图人工填写，并勾选下方「已对照原图人工核对」。</div>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+{% endif %}
 
 <div class="card" style="max-width:1100px;">
   <div class="card-title">{{ '编辑项目信息' if project else '新建项目' }}
@@ -10,15 +66,18 @@
 
   <form method="post" action="{{ url_for('main.project_edit', project_id=project.id) if project else url_for('main.project_new') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    {% if not project and pf.contract_id %}
+    <input type="hidden" name="contract_id" value="{{ pf.contract_id }}">
+    {% endif %}
     <div class="form-grid">
       <div class="form-row">
         <label class="field-label">项目编号 *</label>
-        <input type="text" name="project_no" value="{{ project.project_no if project else '' }}" style="width:100%;" {{ 'readonly' if project }} required
+        <input type="text" name="project_no" value="{{ project.project_no if project else pf.project_no }}" style="width:100%;" {{ 'readonly' if project }} required
                placeholder="如：PJ-2026-001">
       </div>
       <div class="form-row">
         <label class="field-label">项目名称 *</label>
-        <input type="text" name="name" value="{{ project.name if project else '' }}" style="width:100%;" required
+        <input type="text" name="name" value="{{ project.name if project else pf.name }}" style="width:100%;" required
                placeholder="如：新增动设备监测项目">
       </div>
     </div>
@@ -48,18 +107,16 @@
 
     <div class="form-row">
       <label class="field-label">备注</label>
-      <textarea name="remark" placeholder="项目说明、合同信息等">{{ project.remark if project else '' }}</textarea>
+      <textarea name="remark" placeholder="项目说明、合同信息等">{{ project.remark if project else pf.remark }}</textarea>
     </div>
 
     <div class="form-row">
       <label class="field-label">质保期（月） <span class="muted">留空 = 不推算质保到期日（不同项目可不同，1–600）</span></label>
       <input type="number" name="warranty_months" min="1" max="600" step="1" style="width:100%;"
-             value="{{ project.warranty_months if project and project.warranty_months else (form.get('warranty_months', '') if form else '') }}">
+             value="{{ project.warranty_months if project and project.warranty_months else ('' if project else pf.warranty_months) }}">
     </div>
 
     {% if not project %}
-    {% set node_labels = {'first': '首付款', 'progress': '进度款', 'acceptance': '验收款', 'warranty': '质保金'} %}
-    {% set selected = (form.getlist('node_types') if form else []) %}
     <div class="form-row">
       <label class="field-label mt-8">付款节点 *（勾选本项目要用的节点，未勾选的不生成、不展示；勾选比例合计必须 = 100%）</label>
       <div class="node-pick">
@@ -71,7 +128,7 @@
           </label>
           <input type="number" name="ratio_{{ t.node_type }}" class="small node-ratio"
                  step="0.01" min="0" max="100" placeholder="比例 %"
-                 value="{{ form.get('ratio_' + t.node_type, '') if form else '' }}"
+                 value="{{ pf.ratios[t.node_type] if pf.ratios is defined else '' }}"
                  {{ '' if t.node_type in selected else 'disabled' }}>
           <span class="muted" style="font-size:12px;">{{ t.trigger }}</span>
         </div>
@@ -83,18 +140,34 @@
     <div class="form-row">
       <label class="field-label mt-8">费用科目（每个科目按上面勾选的节点生成付款节点）</label>
       <div id="items-container">
+        {% set item_rows = pf.item_rows if pf.item_rows is defined and pf.item_rows else [{'item_name': '', 'tax_rate': '', 'original_amount': '0', 'additional_amount': '0'}] %}
+        {% for row in item_rows %}
         <div class="item-row form-panel">
           <div class="row">
-            <div><label class="field-label">科目名称 *</label><input type="text" name="item_name" class="mid" placeholder="如：设备费"></div>
-            <div><label class="field-label">税率</label><select name="tax_rate"><option value="">—</option><option>13%</option><option>9%</option><option>6%</option><option>3%</option><option>0%</option></select></div>
-            <div><label class="field-label">原金额（元）</label><input type="number" name="original_amount" class="mid" step="0.01" min="0" value="0"></div>
-            <div><label class="field-label">增补金额（元）</label><input type="number" name="additional_amount" class="mid" step="0.01" min="0" value="0"></div>
+            <div><label class="field-label">科目名称 *</label><input type="text" name="item_name" class="mid" placeholder="如：设备费" value="{{ row.item_name }}"></div>
+            <div><label class="field-label">税率</label><select name="tax_rate">
+              <option value="">—</option>
+              {% for rate in ['13%', '9%', '6%', '3%', '0%'] %}
+              <option {{ 'selected' if row.tax_rate == rate else '' }}>{{ rate }}</option>
+              {% endfor %}
+            </select></div>
+            <div><label class="field-label">原金额（元）</label><input type="number" name="original_amount" class="mid" step="0.01" min="0" value="{{ row.original_amount }}"></div>
+            <div><label class="field-label">增补金额（元）</label><input type="number" name="additional_amount" class="mid" step="0.01" min="0" value="{{ row.additional_amount }}"></div>
             <button type="button" class="btn btn-danger btn-sm remove-item">删除</button>
           </div>
         </div>
+        {% endfor %}
       </div>
       <button type="button" class="btn btn-ghost btn-sm mt-8" id="add-item">+ 添加科目</button>
     </div>
+    {% if pf.manual_required %}
+    <div class="form-row">
+      <label class="field-label">
+        <input type="checkbox" name="manual_confirm" value="1" {{ 'checked' if pf.manual_confirmed }}>
+        已对照原图人工核对（截图①②未能自动识别时必须勾选）
+      </label>
+    </div>
+    {% endif %}
     {% else %}
     <div class="info-item mt-8"><span class="l">科目与付款节点请在项目详情页中维护（新增科目将自动生成节点）</span></div>
     {% endif %}
@@ -114,7 +187,7 @@
         var container = document.getElementById('items-container');
         var first = container.querySelector('.item-row');
         var clone = first.cloneNode(true);
-        clone.querySelectorAll('input').forEach(function (i) { i.value = ''; });
+        clone.querySelectorAll('input[type="text"], input[type="number"]').forEach(function (i) { i.value = ''; });
         clone.querySelectorAll('select').forEach(function (s) { s.value = s.querySelector('option') ? s.querySelector('option').value : ''; });
         container.appendChild(clone);
       });

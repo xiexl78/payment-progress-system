@@ -742,21 +742,39 @@ def _remove_node(node, operator_id=None):
     db.session.delete(node)
 
 
+class _DraftAlreadyUsed(Exception):
+    """截图识别草稿已被其他请求绑定（并发双击/多标签页保存）。"""
+
+
 @bp.route('/projects/new', methods=['GET', 'POST'])
 @login_required
 @role_required('admin', 'operator')
 def project_new():
     templates = NODE_TEMPLATES
+    draft = _load_shot_draft(request.args.get('contract_id', type=int)
+                             or request.form.get('contract_id', type=int))
+    prefill = _draft_prefill(draft) if draft is not None else None
     if request.method == 'POST':
         project_no = (request.form.get('project_no') or '').strip()
         name = (request.form.get('name') or '').strip()
         remark = (request.form.get('remark') or '').strip()
         if not project_no or not name:
             flash('项目编号与项目名称必填', 'danger')
-            return render_template('project_form.html', templates=templates, project=None)
+            return render_template('project_form.html', templates=templates, project=None,
+                                   prefill=_form_prefill(request.form, draft))
         if Project.query.filter_by(project_no=project_no).first():
             flash('项目编号已存在', 'danger')
-            return render_template('project_form.html', templates=templates, project=None)
+            return render_template('project_form.html', templates=templates, project=None,
+                                   prefill=_form_prefill(request.form, draft))
+
+        # CR-07 ①：①② 均未识别出文字时必须人工核对后才能保存
+        if draft is not None:
+            _shot_rows, manual_required = _draft_shot_meta(draft)
+            if manual_required and not (request.form.get('manual_confirm') or '').strip():
+                flash('截图①②都没有识别出文字，请对照原图核对后勾选「已对照原图人工核对」'
+                      '再保存', 'danger')
+                return render_template('project_form.html', templates=templates, project=None,
+                                       prefill=_form_prefill(request.form, draft))
 
         try:
             item_rows = validate_project_item_rows(request.form)
@@ -766,7 +784,7 @@ def project_new():
             for msg in exc.errors:
                 flash(msg, 'danger')
             return render_template('project_form.html', templates=templates, project=None,
-                                   form=request.form)
+                                   prefill=_form_prefill(request.form, draft))
 
         project = Project(project_no=project_no, name=name, remark=remark,
                           warranty_months=warranty_months,
@@ -790,10 +808,40 @@ def project_new():
             # 为每个科目生成勾选的付款节点（人工比例 + 尾差归集），未勾选即不存在
             for it in items:
                 _create_item_nodes(it, ratios, current_user().id, node_types=node_types)
+
+            # 截图草稿绑定到新项目（CAS：未绑定的草稿只能使用一次）
+            if draft is not None:
+                bound = (db.session.query(ContractFile)
+                         .filter(ContractFile.id == draft.id,
+                                 ContractFile.project_id.is_(None),
+                                 ContractFile.file_type == 'img')
+                         .update({'project_id': project.id, 'status': 'confirmed',
+                                  'contract_name': name,
+                                  'engine': draft.engine or 'rules',
+                                  'confirmed_by': current_user().id,
+                                  'confirmed_at': _now_utc()},
+                                 synchronize_session=False))
+                if not bound:
+                    raise _DraftAlreadyUsed()
+                shot_ids = []
+                for shot in draft.screenshots:
+                    shot.project_id = project.id
+                    shot.contract_id = draft.id
+                    shot_ids.append(shot.id)
+                audit_record('contract.confirm', 'contract', draft.id, project.id,
+                             after={'project_id': project.id, 'source': 'shots',
+                                    'shot_ids': shot_ids, 'project_no': project_no},
+                             critical=False)
+
             sync_project_dates(project)
             audit_record('project.create', 'project', project.id, project.id,
                          after=_project_snapshot(project), critical=False)
             db.session.commit()
+        except _DraftAlreadyUsed:
+            db.session.rollback()
+            flash('该截图识别草稿已被其他页面用掉（草稿只能保存一次），请重新上传截图后再建项目',
+                  'danger')
+            return redirect(url_for('main.project_new'))
         except IntegrityError:
             # 并发创建同一项目编号：唯一索引兜底（flush 即触发），不能 500（P2-07）
             db.session.rollback()
@@ -802,7 +850,8 @@ def project_new():
             return redirect(url_for('main.projects'))
         flash('项目创建成功，已自动生成付款节点（编号：%s）' % project_no, 'success')
         return redirect(url_for('main.project_detail', project_id=project.id))
-    return render_template('project_form.html', templates=templates, project=None)
+    return render_template('project_form.html', templates=templates, project=None,
+                           prefill=prefill)
 
 
 @bp.route('/projects/<int:project_id>')
@@ -1612,18 +1661,15 @@ def _shot_meta(shots):
              'text_len': len(s.ocr_text or '')} for s in shots]
 
 
-@bp.route('/contracts/shots', methods=['POST'])
-@login_required
-@role_required('admin', 'operator')
-def contract_shots_upload():
-    """三张截图上传 + 分类型 OCR + 定向识别（CR-05 需求①）。"""
-    files = {t: request.files.get('shot_' + t) for t in SHOT_TYPES}
+def _read_shot_uploads(files):
+    """校验三张截图上传（①② 必传、格式/大小），返回 [(type, file, ext, mime, size)]。
+
+    CR-07 ①：`/contracts/shots` 与 `/projects/new/recognize` 共用同一套校验。
+    """
     missing = [SHOT_LABELS[t] for t in SHOT_REQUIRED
                if not (files[t] and files[t].filename)]
     if missing:
-        flash('请上传：%s（截图①金额、②付款条件为必传项）' % '、'.join(missing), 'danger')
-        return redirect(url_for('main.contracts'))
-
+        raise ValidationError('请上传：%s（截图①金额、②付款条件为必传项）' % '、'.join(missing))
     prepared = []
     for shot_type in SHOT_TYPES:
         file_obj = files[shot_type]
@@ -1631,11 +1677,16 @@ def contract_shots_upload():
             continue
         ext, mime, size, error = _shot_file_error(file_obj, shot_type)
         if error:
-            flash(error, 'danger')
-            return redirect(url_for('main.contracts'))
+            raise ValidationError(error)
         prepared.append((shot_type, file_obj, ext, mime, size))
+    return prepared
 
-    actor = current_user()
+
+def _create_shot_draft(prepared, actor):
+    """落盘三张截图并建草稿（project_id 为空），做分类型 OCR + 定向识别。
+
+    Returns: ``(contract, shots, result)``；调用方负责 commit 之后的跳转/提示。
+    """
     file_name = '截图识别：' + '、'.join(
         (file_obj.filename or '') for _, file_obj, _, _, _ in prepared)
     contract = ContractFile(
@@ -1677,10 +1728,7 @@ def contract_shots_upload():
                      critical=False)
 
     merged = merge_shot_texts(sections)
-    meta = [{'shot_type': s.shot_type, 'shot_id': s.id,
-             'ocr_status': s.ocr_status, 'ocr_msg': s.ocr_msg,
-             'text_len': len(s.ocr_text or '')} for s in shots]
-    result = recognize_shots(sections, file_name, shot_meta=meta)
+    result = recognize_shots(sections, file_name, shot_meta=_shot_meta(shots))
     contract.raw_text = merged
     contract.result_json = json.dumps(result, ensure_ascii=False)
     contract.engine = result.get('engine', 'rules')
@@ -1689,7 +1737,7 @@ def contract_shots_upload():
     failed = [t for t in SHOT_TYPES
               if any(s.shot_type == t and s.ocr_status != 'ok' for s in shots)]
     if failed:
-        contract.error_msg = '截图 OCR 失败：%s（可在确认页手工填写）' % '、'.join(
+        contract.error_msg = '截图 OCR 失败：%s（可手工填写）' % '、'.join(
             SHOT_LABELS[t] for t in failed)
     audit_record('contract.shots.upload', 'contract', contract.id, None,
                  after={'shot_types': [s.shot_type for s in shots],
@@ -1698,8 +1746,136 @@ def contract_shots_upload():
                         'ocr_status': {s.shot_type: s.ocr_status for s in shots}},
                  critical=False)
     db.session.commit()
+    return contract, shots, result
+
+
+@bp.route('/contracts/shots', methods=['POST'])
+@login_required
+@role_required('admin', 'operator')
+def contract_shots_upload():
+    """三张截图上传 + 分类型 OCR + 定向识别（CR-05 需求①；旧入口保留给整份合同兜底）。"""
+    files = {t: request.files.get('shot_' + t) for t in SHOT_TYPES}
+    try:
+        prepared = _read_shot_uploads(files)
+    except ValidationError as exc:
+        for message in exc.errors:
+            flash(message, 'danger')
+        return redirect(url_for('main.contracts'))
+    contract, _shots, _result = _create_shot_draft(prepared, current_user())
     flash('截图识别完成，请对照原图核对识别结果后确认', 'success')
     return redirect(url_for('main.contract_confirm', contract_id=contract.id))
+
+
+@bp.route('/projects/new/recognize', methods=['POST'])
+@login_required
+@role_required('admin', 'operator')
+def project_new_recognize():
+    """CR-07 ①：新建项目页上传三张截图 → 建识别草稿 → PRG 回新建页回填。"""
+    files = {t: request.files.get('shot_' + t) for t in SHOT_TYPES}
+    try:
+        prepared = _read_shot_uploads(files)
+    except ValidationError as exc:
+        for message in exc.errors:
+            flash(message, 'danger')
+        return redirect(url_for('main.project_new'))
+    contract, shots, result = _create_shot_draft(prepared, current_user())
+    failed = [SHOT_LABELS[s.shot_type] for s in shots if s.ocr_status != 'ok']
+    if failed:
+        flash('识别完成，但 %s 未识别出文字，请对照原图核对后手工填写' % '、'.join(failed),
+              'warning')
+    else:
+        flash('识别完成，识别结果已填入下方表单，请对照原图核对后保存', 'success')
+    return redirect(url_for('main.project_new', contract_id=contract.id))
+
+
+def _load_shot_draft(contract_id):
+    """取本人（或 admin）未绑定的截图识别草稿；不可用返回 None。"""
+    if not contract_id:
+        return None
+    contract = db.session.get(ContractFile, contract_id)
+    if contract is None or contract.project_id is not None or contract.file_type != 'img':
+        return None
+    actor = current_user()
+    if actor is not None and contract.created_by != actor.id and actor.role != 'admin':
+        return None
+    return contract
+
+
+def _draft_shot_meta(draft):
+    """草稿的截图缩略图/OCR 状态，供新建页识别卡片渲染。"""
+    if draft is None:
+        return [], False
+    shots = sorted(draft.screenshots, key=lambda s: SHOT_TYPES.index(s.shot_type))
+    rows = [{'shot_id': s.id, 'shot_type': s.shot_type, 'label': SHOT_LABELS[s.shot_type],
+             'ocr_status': s.ocr_status, 'ocr_msg': s.ocr_msg} for s in shots]
+    failed_types = {s.shot_type for s in shots if s.ocr_status != 'ok'}
+    manual_required = bool(shots) and all(t in failed_types for t in SHOT_REQUIRED)
+    return rows, manual_required
+
+
+def _draft_prefill(draft):
+    """识别草稿 → 新建表单初值（§3.4：只填第一个科目；比例>0 的类型自动勾选）。"""
+    result = _parse_contract_result(draft) or {}
+    values = _recognized_contract_values(draft, result)
+    ratios = {nt: (values['ratios_pct'].get(nt) or '') for nt in NODE_TYPES}
+    selected = [nt for nt in NODE_TYPES if _dec_str(ratios.get(nt)) > 0]
+    payment_method = (values.get('payment_method') or '').strip()
+    shot_rows, manual_required = _draft_shot_meta(draft)
+    name = (values.get('contract_name') or '').strip()
+    if name.startswith('截图识别'):
+        name = ''
+    return {
+        'project_no': '',
+        'name': name[:256],
+        'remark': ('付款条件：' + payment_method) if payment_method else '',
+        'warranty_months': values.get('warranty_months') or '',
+        'ratios': ratios,
+        'selected': selected,
+        'item_rows': [{'item_name': '合同价款',
+                       'tax_rate': values.get('tax_rate') or '',
+                       'original_amount': (values.get('original_amount') or '').replace(',', ''),
+                       'additional_amount': '0.00'}],
+        'contract_id': draft.id,
+        'shots': shot_rows,
+        'manual_required': manual_required,
+        'engine': draft.engine or '',
+    }
+
+
+def _form_prefill(form, draft=None):
+    """校验失败/交互重渲染：保留用户输入（含草稿缩略图）。"""
+    names = form.getlist('item_name') or ['']
+    tax_rates = form.getlist('tax_rate')
+    originals = form.getlist('original_amount')
+    additionals = form.getlist('additional_amount')
+    items = []
+    for idx, item_name in enumerate(names):
+        items.append({
+            'item_name': item_name,
+            'tax_rate': tax_rates[idx] if idx < len(tax_rates) else '',
+            'original_amount': originals[idx] if idx < len(originals) else '',
+            'additional_amount': additionals[idx] if idx < len(additionals) else '',
+        })
+    base = _draft_prefill(draft) if draft is not None else {
+        'shots': [], 'manual_required': False, 'engine': '', 'contract_id': ''}
+    base.update({
+        'project_no': form.get('project_no') or '',
+        'name': form.get('name') or '',
+        'remark': form.get('remark') or '',
+        'warranty_months': form.get('warranty_months') or '',
+        'ratios': {nt: (form.get('ratio_' + nt) or '') for nt in NODE_TYPES},
+        'selected': [t for t in form.getlist('node_types') if t in NODE_TYPES],
+        'item_rows': items or [{'item_name': '', 'tax_rate': '', 'original_amount': '',
+                                'additional_amount': ''}],
+        'contract_id': form.get('contract_id') or '',
+        'manual_confirmed': bool((form.get('manual_confirm') or '').strip()),
+    })
+    if base['contract_id']:
+        try:
+            base['contract_id'] = int(base['contract_id'])
+        except (TypeError, ValueError):
+            base['contract_id'] = ''
+    return base
 
 
 @bp.route('/contracts/shots/<int:shot_id>/image')
