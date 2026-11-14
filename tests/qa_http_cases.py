@@ -3371,12 +3371,11 @@ def _cr07_1_cases(s_admin):
         filled = s_admin.get(BASE + '/projects/new?contract_id=%d' % cid).text
         check('CR07①新建页识别', '回填识别比例到新建表单（40/50/8/2）',
               all('value="%s.00"' % v in filled for v in ('40', '50', '8', '2')))
-        # CR07-01：识别金额是 float，_recognized_contract_values 把 float 交给
-        # parse_amount（只接受字符串）→ 抛 ValidationError → 降级 ZERO，回填成 0.00。
+        # CR07-01：识别金额是 float，曾把 float 直接交给 parse_amount → 降级 0.00；
+        # 开发 `addccb4` 改为先 str() 再解析，本断言转为正常断言。
         check('CR07①新建页识别', '回填识别合同金额到新建表单（165000.00）',
               'value="165000.00"' in filled,
-              'amount_ok=%s' % ('value="165000.00"' in filled),
-              xfail='CR07-01金额回填')
+              'amount_ok=%s' % ('value="165000.00"' in filled))
 
         # 4) operator 也可用（新建项目入口对他开放）
         s_op, _ = C.login(BASE, 'jbr', '123456')
