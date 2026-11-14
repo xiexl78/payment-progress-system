@@ -177,7 +177,7 @@
     <span class="sub">申请 / 开票 / 付款三本账并列，任意顺序、互不为前置；每本账各自累计不得超过应付。已发生任一业务（申请/开票/付款）的节点合同变更时冻结。</span>
   </div>
 
-  {% for node_type, g in node_groups.items() %}
+  {% for node_type, g in node_groups.items() if g.nodes %}
   <div class="node-section">
     <div class="node-block">
       <div class="node-head">
@@ -209,7 +209,7 @@
             {% for n in g.nodes %}
             {% set d = node_three[n.id] %}
             <tr>
-              <td>{{ n.item_name }}
+              <td>{{ n.item.item_name if n.item else '—' }}
                 {% if n.has_business %}<span class="badge badge-gray" title="已发生申请/开票/付款，合同变更时应付与状态冻结">已冻结</span>{% endif %}
                 {% if n.change_note %}<div class="text-muted" style="font-size:12px;">{{ n.change_note }}</div>{% endif %}
               </td>
