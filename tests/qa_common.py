@@ -38,9 +38,13 @@ COUNTS = {'PASS': 0, 'FAIL': 0, 'XFAIL': 0, 'XPASS': 0}
 RATIOS = {'first': Decimal('0.30'), 'progress': Decimal('0.52'),
           'acceptance': Decimal('0.15'), 'warranty': Decimal('0.03')}
 
-#: 新建项目表单的 4 个比例（百分数，CR-04 起必填、无默认值）
-RATIO_FORM = {'ratio_first': '30', 'ratio_progress': '52',
-              'ratio_acceptance': '15', 'ratio_warranty': '3'}
+#: CR-07 ②：新建项目改为勾选节点类型（未勾选即不存在），默认四类全勾选，
+#: 与 CR-04 起的「每科目 4 节点」口径保持一致；requests 对 list 值发重复字段。
+NODE_TYPES_FORM = {'node_types': ['first', 'progress', 'acceptance', 'warranty']}
+
+#: 新建项目表单的 4 个比例（百分数，CR-04 起必填、无默认值）+ 节点勾选集合
+RATIO_FORM = dict(NODE_TYPES_FORM, **{'ratio_first': '30', 'ratio_progress': '52',
+                                      'ratio_acceptance': '15', 'ratio_warranty': '3'})
 
 #: 当前活动测试库路径（LiveServer 启动时写入，供 post() 取节点一次性 token）
 ACTIVE_DB = None

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from collections import Counter
 
 import requests
 
@@ -64,6 +65,9 @@ def create_project(sess, no, name, items, remark='', ratios=None, warranty_month
     if warranty_months is not None:
         data['warranty_months'] = str(warranty_months)
     data.update(ratios or C.RATIO_FORM)
+    if 'node_types' not in data:
+        # 自定义 ratios 时按实际填写的比例反推勾选集合（CR-07 ②）
+        data['node_types'] = [k[len('ratio_'):] for k in data if k.startswith('ratio_')]
     r = C.post(sess, BASE, '/projects/new', data)
     loc = r.headers.get('Location', '')
     return r, (int(loc.rstrip('/').split('/')[-1]) if r.status_code == 302 and '/projects/' in loc else None)
@@ -667,9 +671,10 @@ def _concurrency(s_admin):
           '实测 (node_paid, records_sum, records, codes)=%s' % lost)
 
     # 并发同编号项目
-    res = run_threads(2, lambda s, i: C.post(s, BASE, '/projects/new',
-                                             {'project_no': 'QA-DUP', 'name': '重复编号',
-                                              'item_name': ['a'], 'original_amount': ['1']}))
+    dup_form = {'project_no': 'QA-DUP', 'name': '重复编号',
+                'item_name': ['a'], 'original_amount': ['1']}
+    dup_form.update(C.RATIO_FORM)  # CR-07 ②：节点勾选 + 比例
+    res = run_threads(2, lambda s, i: C.post(s, BASE, '/projects/new', dict(dup_form)))
     codes = sorted(getattr(x, 'status_code', 'EXC') for x in res)
     check('并发', '并发创建同编号项目不应 500', 500 not in codes, 'codes=%s' % codes)
 
@@ -1622,6 +1627,7 @@ def _ratio_required_cases(s_admin):
     def new_form(no):
         data = {'project_no': no, 'name': 'QA比例必填',
                 'item_name': ['科目'], 'original_amount': ['100000'], 'tax_rate': ['6%']}
+        data.update(C.NODE_TYPES_FORM)  # CR-07 ②：节点勾选必填，先满足它才能测比例口径
         return data
 
     r = C.post(s_admin, BASE, '/projects/new', new_form('QA-RATIO-NONE'))
@@ -2810,8 +2816,12 @@ def _cr06_review_cases(s_admin):
           cc_html.count('已发生业务节点') >= 2 and '已发生业务节点冻结未改' in rt_src,
           '变更页=%d flash=%s' % (cc_html.count('已发生业务节点'),
                                   '已发生业务节点冻结未改' in rt_src))
-    check('CR06评审', '详情页/新建页冻结口径同步为「已发生任一业务（申请/开票/付款）」',
-          '已发生任一业务' in pd_html and '已发生任一业务' in pf_html)
+    # CR-07 ③ 后按架构师口径：新建时项目还没有业务数据，冻结/锁定提示只放在
+    # 详情页与变更页；新建页不应出现冻结/锁定文案（否则干扰新建用户）。
+    check('CR06评审', '冻结口径只在详情页/变更页，新建页不出现冻结/锁定提示',
+          '已发生任一业务' in pd_html and ('冻结' not in pf_html and '锁定' not in pf_html),
+          '详情页=%s 新建页冻结=%s/锁定=%s' % ('已发生任一业务' in pd_html,
+                                              '冻结' in pf_html, '锁定' in pf_html))
 
     # ---------- ⑵ 未付格：异常备注同格标红，状态列不再承载备注 ----------
     def sql_exec(sql, args=()):
@@ -2904,6 +2914,149 @@ def _cr06_review_cases(s_admin):
           rrep.status_code == 200 and qrep < 30, 'q=%d status=%s' % (qrep, rrep.status_code))
 
 
+#: 付款节点管理里每组（node-section）的组名与 <tbody> 内容
+NODE_SECTION_RE = re.compile(
+    r'<div class="node-head">.*?<span class="t">([^<]*)</span>.*?<tbody>(.*?)</tbody>', re.S)
+ROW_FIRST_CELL_RE = re.compile(r'<tr>\s*<td>(.*?)</td>', re.S)
+
+
+def _detail_node_sections(sess, pid):
+    """解析详情页「付款节点管理」：返回 [(组名, [每行首列纯文本])]。"""
+    html = sess.get(BASE + '/projects/%d' % pid, timeout=60).text
+    out = []
+    for title, body in NODE_SECTION_RE.findall(html):
+        cells = []
+        for raw in ROW_FIRST_CELL_RE.findall(body):
+            text = re.sub(r'<[^>]+>', ' ', raw)
+            text = re.sub(r'\s+', ' ', text).strip()
+            cells.append(text)
+        out.append((title.strip(), cells))
+    return html, out
+
+
+def _cell_name_stats(cells, names):
+    """按科目名归类每行首列文本：详情页按节点类型分组，行序与库序不同。
+
+    返回 ``(是否每行恰好命中且数量吻合, 统计 Counter, 未命中明细)``。
+    """
+    stat = Counter()
+    bad = []
+    uniq = sorted(set(names))
+    for c in cells:
+        found = [nm for nm in uniq if nm in c]
+        if len(found) == 1:
+            stat[found[0]] += 1
+        else:
+            bad.append((c, found))
+    ok = (not bad and stat == Counter(names) and all(c.strip() for c in cells))
+    return ok, stat, bad
+
+
+NODE_TYPE_LABEL_ORDER = [('first', '首付款'), ('progress', '进度款'),
+                         ('acceptance', '验收款'), ('warranty', '质保金')]
+
+
+def _detail_grouped_check(sess, pid):
+    """按架构师口径校验详情页节点表：类型分组顺序 + 组内按科目顺序。
+
+    页面按节点类型渲染多张表（组内按科目顺序），不做 flatten 后与库序比较。
+    返回 ``(问题列表, 分组解析结果)``，空问题列表即通过。
+    """
+    _, sections = _detail_node_sections(sess, pid)
+    active = q(DB, 'SELECT n.node_type, i.item_name FROM payment_nodes n '
+                   'JOIN project_items i ON i.id = n.item_id '
+                   'WHERE n.project_id=? AND n.ratio > 0 ORDER BY n.id', (pid,))
+    expect_types = [t for t, _label in NODE_TYPE_LABEL_ORDER
+                    if any(r[0] == t for r in active)]
+    label_of = dict(NODE_TYPE_LABEL_ORDER)
+    problems = []
+    if len(sections) != len(expect_types):
+        problems.append('分组数 %d != 期望 %d' % (len(sections), len(expect_types)))
+    for idx, (title, cells) in enumerate(sections):
+        if idx >= len(expect_types):
+            break
+        nt = expect_types[idx]
+        if not title.startswith(label_of[nt]):
+            problems.append('第%d组标题 %r 应为 %s' % (idx + 1, title, label_of[nt]))
+        expect_names = [r[1] for r in active if r[0] == nt]
+        if len(cells) != len(expect_names):
+            problems.append('%s 行数 %d != %d' % (nt, len(cells), len(expect_names)))
+        for k, (cell, name) in enumerate(zip(cells, expect_names)):
+            if not cell.strip() or name not in cell:
+                problems.append('%s 第%d行 %r 应含 %r' % (nt, k + 1, cell, name))
+    return problems, sections
+
+
+def _cr07_3_cases(s_admin):
+    """CR-07 ③：付款节点管理「科目」列显示为空（模板用了不存在的 n.item_name）。"""
+    # 1) 种子项目（3 科目 × 4 类型）：类型分组顺序 + 组内科目顺序，首列非空不串行
+    probs1, sections1 = _detail_grouped_check(s_admin, 1)
+    check('CR07③科目列', '种子项目节点表每行首列 = 对应科目名（不再空白）',
+          not probs1 and sum(len(cs) for _t, cs in sections1) > 0,
+          'probs=%s 首列样例=%s' % (probs1[:3], [cs[:2] for _t, cs in sections1][:4]))
+    check('CR07③科目列', '种子项目按类型分组、组内按科目顺序展示',
+          not probs1 and len(sections1) >= 2,
+          'groups=%s' % [t for t, _cs in sections1])
+
+    # 2) 多科目项目：每行显示自己的科目名，不串到别的科目
+    _, pid2 = create_project(s_admin, 'QA-CR07-COL2', 'QA科目列多科目',
+                             [('QA甲科目', '10000', '0'), ('QA乙科目', '20000', '0')])
+    if pid2:
+        probs2, sections2 = _detail_grouped_check(s_admin, pid2)
+        names2 = set()
+        for _t, cs in sections2:
+            for c in cs:
+                hit = [nm for nm in ('QA甲科目', 'QA乙科目') if nm in c]
+                names2.update(hit)
+        check('CR07③科目列', '多科目项目逐行匹配、科目名不串行',
+              not probs2 and names2 == {'QA甲科目', 'QA乙科目'},
+              'probs=%s 命中=%s' % (probs2[:3], sorted(names2)))
+
+    # 3) 识别生成的「合同价款」项目：节点表显示「合同价款」
+    _, pid3 = create_project(s_admin, 'QA-CR07-COL3', 'QA合同价款科目',
+                             [('合同价款', '165000', '0')])
+    if pid3:
+        probs3, sections3 = _detail_grouped_check(s_admin, pid3)
+        all_cells3 = [c for _t, cs in sections3 for c in cs]
+        check('CR07③科目列', '「合同价款」项目节点表显示合同价款',
+              not probs3 and bool(all_cells3) and all('合同价款' in c for c in all_cells3),
+              'probs=%s cells=%s' % (probs3[:2], all_cells3[:4]))
+
+    # 4) 异常数据：节点 item 关联为空 → 显示「—」、页面不 500（手工制造脏数据）
+    if pid2:
+        nid = q1(DB, 'SELECT id FROM payment_nodes WHERE project_id=? ORDER BY id LIMIT 1', (pid2,))
+        old_item = q1(DB, 'SELECT item_id FROM payment_nodes WHERE id=?', (nid,))
+        conn = sqlite3.connect(DB, timeout=15)
+        try:
+            conn.execute('UPDATE payment_nodes SET item_id=999999 WHERE id=?', (nid,))
+            conn.commit()
+        finally:
+            conn.close()
+        resp, sections4 = _detail_node_sections(s_admin, pid2)
+        cells4 = [c for _t, cs in sections4 for c in cs]
+        conn = sqlite3.connect(DB, timeout=15)
+        try:  # 还原脏数据，避免影响后续导出/报表用例
+            conn.execute('UPDATE payment_nodes SET item_id=? WHERE id=?', (old_item, nid))
+            conn.commit()
+        finally:
+            conn.close()
+        check('CR07③科目列', 'item 关联为空时显示「—」且页面不 500',
+              '付款节点管理' in resp and '—' in cells4,
+              'cells=%s' % cells4[:6])
+
+    # 5) 未勾选的节点类型不出现空分组、不建节点（CR-07 ② 的详情侧口径）
+    _, pid5 = create_project(s_admin, 'QA-CR07-TYPES2', 'QA仅两类节点',
+                             [('科目', '10000', '0')],
+                             ratios={'node_types': ['first', 'progress'],
+                                     'ratio_first': '40', 'ratio_progress': '60'})
+    if pid5:
+        probs5, sections5 = _detail_grouped_check(s_admin, pid5)
+        n_db5 = q1(DB, 'SELECT COUNT(*) FROM payment_nodes WHERE project_id=?', (pid5,))
+        check('CR07③科目列', '只勾选两类节点时详情页只有两个分组、无空分组',
+              not probs5 and len(sections5) == 2 and n_db5 == 2,
+              'groups=%s db_nodes=%s probs=%s' % ([t for t, _cs in sections5], n_db5, probs5[:2]))
+
+
 def run(server):
     global DB, BASE, APP, UPLOAD_DIR
     DB, BASE, APP, UPLOAD_DIR = server.db_path, server.base, server.app, server.upload_dir
@@ -2944,5 +3097,6 @@ def run(server):
     section('########## 11k. CR-05 最终补充（②质保/③单号/⑤令牌/⑥上限/①兜底） ##########', lambda: _cr05_final_cases(s_admin))
     section('########## 11l. CR-06 付款/未付口径与冻结范围 ##########', lambda: _cr06_cases(s_admin))
     section('########## 11m. CR-06 评审修正（文案/未付异常归位/N+1） ##########', lambda: _cr06_review_cases(s_admin))
+    section('########## 11n. CR-07 ③ 付款节点科目列展示 ##########', lambda: _cr07_3_cases(s_admin))
     section('########## 12. 导出（批次 6a） ##########', lambda: _batch6_export_import(s_admin))
     section('########## 12. 审计补充（批次 3 补测，末项会删临时库 audit_logs） ##########', lambda: _audit_extras(s_admin))
