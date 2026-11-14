@@ -84,7 +84,7 @@ NODE_TEMPLATES = [
     {
         'node_type': 'warranty',
         'calc_base': 'total',
-        'trigger': '质保到期后触发（验收日期+3年）',
+        'trigger': '质保到期后触发（按项目填写的质保期计算）',
     },
 ]
 

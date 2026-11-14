@@ -149,7 +149,7 @@ class PaymentNode(db.Model):
     ratio = db.Column(db.Numeric(6, 4), nullable=False)    # 0.30 / 0.52 / 0.15 / 0.03
     calc_base = db.Column(db.String(16), nullable=False)   # original=按原金额 / total=按总金额
     due_amount = db.Column(db.Numeric(14, 2), nullable=False, default=0)   # 应付
-    due_date = db.Column(db.Date, nullable=True)           # 应付日期（质保金=验收日期+3年）
+    due_date = db.Column(db.Date, nullable=True)           # 应付日期（质保金=验收日期+项目质保期）
     trigger_date = db.Column(db.Date, nullable=True)       # 实际触发日期（试运行/验收日期等）
     applied_amount = db.Column(db.Numeric(14, 2), nullable=False, default=0)  # 申请累计（CR-04）
     invoice_amount = db.Column(db.Numeric(14, 2), nullable=False, default=0)
