@@ -3182,6 +3182,219 @@ def _cr07_2_cases(s_admin):
 
 
 
+def _cr07_4_cases(s_admin):
+    """CR-07 ④：回收站项目「彻底删除」（权限/二次确认/阻断/级联/备份）。"""
+    import json as _json
+
+    purge = lambda sid, pid, data=None: C.post(
+        sid, BASE, '/projects/%d/purge' % pid, data or {})
+    soft_delete = lambda pid: C.post(s_admin, BASE, '/projects/%d/delete' % pid)
+
+    def audit_json(action, pid):
+        raw = q1(DB, 'SELECT before_json FROM audit_logs WHERE action=? AND project_id=? '
+                     'ORDER BY id DESC LIMIT 1', (action, pid)) or ''
+        return _json.loads(raw) if raw else {}
+
+    def audit_after(action, pid):
+        raw = q1(DB, 'SELECT after_json FROM audit_logs WHERE action=? AND project_id=? '
+                     'ORDER BY id DESC LIMIT 1', (action, pid)) or ''
+        return _json.loads(raw) if raw else {}
+
+    # 1) 非 admin 一律 403，项目不消失
+    _, p_op = create_project(s_admin, 'QA-CR07-PG1', 'QA删除权限项目', [('科目', '1000', '0')])
+    if p_op:
+        soft_delete(p_op)
+        s_op, _ = C.login(BASE, 'jbr', '123456')
+        s_view, _ = C.login(BASE, 'viewer', '123456')
+        r1 = purge(s_op, p_op, {'confirm_name': 'QA删除权限项目', 'confirm_irreversible': '1'})
+        r2 = purge(s_view, p_op, {'confirm_name': 'QA删除权限项目', 'confirm_irreversible': '1'})
+        check('CR07④彻底删除', 'operator/viewer 彻底删除被拒（403）且项目保留',
+              r1.status_code == 403 and r2.status_code == 403
+              and q1(DB, 'SELECT COUNT(*) FROM projects WHERE id=?', (p_op,)) == 1,
+              'op=%s view=%s' % (r1.status_code, r2.status_code))
+
+        # 2) 未软删的项目不能彻底删除（404）
+        _, p_live = create_project(s_admin, 'QA-CR07-PG2', 'QA未软删项目', [('科目', '1000', '0')])
+        r3 = purge(s_admin, p_live, {'confirm_name': 'QA未软删项目', 'confirm_irreversible': '1'})
+        check('CR07④彻底删除', '未进回收站的项目彻底删除返回 404 且不删除',
+              r3.status_code == 404
+              and q1(DB, 'SELECT COUNT(*) FROM projects WHERE id=?', (p_live,)) == 1,
+              'code=%s' % r3.status_code)
+
+        # 3) 二次确认：名称不匹配 / 未勾选不可恢复 均不删除
+        r4 = purge(s_admin, p_op, {'confirm_name': '错的项目名', 'confirm_irreversible': '1'},
+                   )
+        r4b = s_admin.get(BASE + '/projects?deleted=1')
+        check('CR07④彻底删除', '确认名称不一致时拒绝删除并提示',
+              q1(DB, 'SELECT COUNT(*) FROM projects WHERE id=?', (p_op,)) == 1
+              and '名称输入不一致' in r4b.text, 'code=%s' % r4.status_code)
+        r5 = purge(s_admin, p_op, {'confirm_name': 'QA删除权限项目', 'confirm_irreversible': ''})
+        r5b = s_admin.get(BASE + '/projects?deleted=1')
+        check('CR07④彻底删除', '未勾选「不可恢复」时拒绝删除并提示',
+              q1(DB, 'SELECT COUNT(*) FROM projects WHERE id=?', (p_op,)) == 1
+              and '不可恢复' in r5b.text, 'code=%s' % r5.status_code)
+
+        # 4) 回收站列表：无业务项目渲染确认表单、有业务项目渲染禁用态
+        page_clean = s_admin.get(BASE + '/projects?deleted=1').text
+        check('CR07④彻底删除', '回收站无资金业务项目渲染彻底删除确认表单',
+              'confirm_name' in page_clean or '确认彻底删除' in page_clean)
+
+        # 5) 有资金业务：禁止彻底删除（只允许归档）
+        _, p_money = create_project(s_admin, 'QA-CR07-PGM', 'QA有业务项目', [('科目', '5000', '0')])
+        node_m = node_ids(p_money, 'first')[0]
+        C.post(s_admin, BASE, '/nodes/%d/update' % node_m,
+               {'action': 'apply', 'apply_amount': '1000'})
+        soft_delete(p_money)
+        r6 = purge(s_admin, p_money, {'confirm_name': 'QA有业务项目', 'confirm_irreversible': '1'},
+                   )
+        page_money = s_admin.get(BASE + '/projects?deleted=1').text
+        blocked_audit = q1(DB, "SELECT COUNT(*) FROM audit_logs WHERE action='project.purge.blocked' "
+                               "AND project_id=?", (p_money,))
+        check('CR07④彻底删除', '有申请/开票/付款的项目禁止彻底删除并保留在回收站',
+              q1(DB, 'SELECT COUNT(*) FROM projects WHERE id=?', (p_money,)) == 1
+              and '只能归档' in page_money and blocked_audit >= 1,
+              'blocked_audit=%s' % blocked_audit)
+
+        # 6) 正常彻底删除：级联清理 + 审计 + 备份可打开 + 其它回收站项目不受影响
+        n_before = q1(DB, 'SELECT COUNT(*) FROM payment_nodes WHERE project_id=?', (p_op,))
+        r7 = purge(s_admin, p_op, {'confirm_name': 'QA删除权限项目', 'confirm_irreversible': '1'})
+        left = dict(
+            projects=q1(DB, 'SELECT COUNT(*) FROM projects WHERE id=?', (p_op,)),
+            items=q1(DB, 'SELECT COUNT(*) FROM project_items WHERE project_id=?', (p_op,)),
+            nodes=q1(DB, 'SELECT COUNT(*) FROM payment_nodes WHERE project_id=?', (p_op,)),
+        )
+        detail404 = s_admin.get(BASE + '/projects/%d' % p_op).status_code
+        after = audit_after('project.purge', p_op)
+        check('CR07④彻底删除', '彻底删除后项目/科目/节点全部清空、详情 404',
+              r7.status_code == 302 and left == {'projects': 0, 'items': 0, 'nodes': 0}
+              and detail404 == 404,
+              'code=%s left=%s detail=%s nodes_before=%s' % (r7.status_code, left, detail404, n_before))
+        check('CR07④彻底删除', '审计 project.purge 记录删除计数',
+              bool(after) and (after.get('counts') or {}).get('projects') == 1,
+              'after=%s' % str(after)[:120])
+
+        before = audit_json('project.purge', p_op)
+        bak = (before.get('backup') or {}).get('path')
+        bak_ok = False
+        bak_detail = 'path=%s' % bak
+        if bak and os.path.exists(bak):
+            try:
+                bconn = sqlite3.connect(bak)
+                try:
+                    bak_ok = bconn.execute('SELECT COUNT(*) FROM projects WHERE id=?',
+                                           (p_op,)).fetchone()[0] == 1
+                finally:
+                    bconn.close()
+            except Exception as exc:
+                bak_detail += ' err=%r' % exc
+        check('CR07④彻底删除', '删除前已落备份且备份库可打开、含被删项目',
+              bak_ok, bak_detail)
+
+        # 7) 二次删除同一项目 → 404（无幽灵数据）
+        r8 = purge(s_admin, p_op, {'confirm_name': 'QA删除权限项目', 'confirm_irreversible': '1'})
+        check('CR07④彻底删除', '重复彻底删除同一项目返回 404', r8.status_code == 404,
+              'code=%s' % r8.status_code)
+
+        # 8) 另一个回收站项目不受影响
+        page_after = s_admin.get(BASE + '/projects?deleted=1').text
+        check('CR07④彻底删除', '彻底删除一个项目不影响其它回收站项目',
+              'QA有业务项目' in page_after)
+
+
+
+def _cr07_1_cases(s_admin):
+    """CR-07 ①：合同识别并入「新建项目」页（三图上传 → 识别回填 → 草稿丢弃）。"""
+    import io
+    from PIL import Image, ImageDraw, ImageFont
+
+    def _font(size=46):
+        for fp in (r'C:\Windows\Fonts\simhei.ttf', r'C:\Windows\Fonts\msyh.ttc'):
+            if os.path.exists(fp):
+                try:
+                    return ImageFont.truetype(fp, size)
+                except Exception:
+                    pass
+        return None
+
+    def png(lines):
+        im = Image.new('RGB', (1500, 620), 'white')
+        draw = ImageDraw.Draw(im)
+        font = _font()
+        y = 40
+        for text in lines:
+            if font:
+                draw.text((50, y), text, font=font, fill='black')
+            else:
+                draw.text((50, y), text, fill='black')
+            y += 92
+        buf = io.BytesIO()
+        im.save(buf, 'PNG')
+        return buf.getvalue()
+
+    def recognize(files, sess=None):
+        data = {'shot_' + k: (name, blob, 'image/png') for k, (name, blob) in files.items()}
+        return C.post(sess or s_admin, BASE, '/projects/new/recognize', files=data)
+
+    amount = png(['合同总金额：165000.00 元', '税率：13%', '合同名称：QA 新建页识别'])
+    pay = png(['首付款 40%', '进度款 50%', '验收款 8%', '质保金 2%', '付款方式：银行转账'])
+
+    # 1) 新建页展示三图上传控件，且标注①②必传
+    form = s_admin.get(BASE + '/projects/new')
+    check('CR07①新建页识别', '新建页含三张截图上传控件且①②标注必传',
+          all('shot_' + t in form.text for t in ('amount', 'payment', 'warranty'))
+          and '必传' in form.text)
+
+    # 2) 缺②被拒、不建草稿
+    c0 = q1(DB, 'SELECT COUNT(*) FROM contract_files')
+    r = recognize({'amount': ('a.png', amount)})
+    page_after = s_admin.get(BASE + '/projects/new').text
+    check('CR07①新建页识别', '只传①被拒并提示必传（不建草稿）',
+          r.status_code == 302 and q1(DB, 'SELECT COUNT(*) FROM contract_files') == c0
+          and '必传' in page_after)
+
+    # 3) ①②上传成功 → 回新建页回填识别结果
+    r2 = recognize({'amount': ('a.png', amount), 'payment': ('p.png', pay)})
+    loc = r2.headers.get('Location', '')
+    cid = None
+    m = re.search(r'contract_id=(\d+)', loc)
+    if m:
+        cid = int(m.group(1))
+    check('CR07①新建页识别', '①②上传后 302 回新建页并带草稿号',
+          r2.status_code == 302 and '/projects/new' in loc and cid is not None,
+          'loc=%s' % loc)
+    if cid:
+        check('CR07①新建页识别', '草稿落库（source=shots、project_id 为空、2 张截图）',
+              q1(DB, "SELECT COUNT(*) FROM contract_files WHERE id=? AND source='shots' "
+                     'AND project_id IS NULL', (cid,)) == 1
+              and q1(DB, 'SELECT COUNT(*) FROM contract_screenshots WHERE contract_id=?',
+                     (cid,)) == 2)
+        filled = s_admin.get(BASE + '/projects/new?contract_id=%d' % cid).text
+        check('CR07①新建页识别', '回填识别比例到新建表单（40/50/8/2）',
+              all('value="%s.00"' % v in filled for v in ('40', '50', '8', '2')))
+        # CR07-01：识别金额是 float，_recognized_contract_values 把 float 交给
+        # parse_amount（只接受字符串）→ 抛 ValidationError → 降级 ZERO，回填成 0.00。
+        check('CR07①新建页识别', '回填识别合同金额到新建表单（165000.00）',
+              'value="165000.00"' in filled,
+              'amount_ok=%s' % ('value="165000.00"' in filled),
+              xfail='CR07-01金额回填')
+
+        # 4) operator 也可用（新建项目入口对他开放）
+        s_op, _ = C.login(BASE, 'jbr', '123456')
+        rop = s_op.get(BASE + '/projects/new')
+        check('CR07①新建页识别', 'operator 可访问新建页与截图上传控件',
+              rop.status_code == 200 and 'shot_amount' in rop.text)
+
+        # 5) 丢弃草稿：截图与识别记录清空
+        rd = C.post(s_admin, BASE, '/projects/new/discard', {'contract_id': str(cid)})
+        check('CR07①新建页识别', '丢弃草稿后识别记录与截图删除',
+              rd.status_code == 302
+              and q1(DB, 'SELECT COUNT(*) FROM contract_files WHERE id=?', (cid,)) == 0
+              and q1(DB, 'SELECT COUNT(*) FROM contract_screenshots WHERE contract_id=?',
+                     (cid,)) == 0,
+              'code=%s' % rd.status_code)
+
+
+
 def run(server):
     global DB, BASE, APP, UPLOAD_DIR
     DB, BASE, APP, UPLOAD_DIR = server.db_path, server.base, server.app, server.upload_dir
@@ -3224,5 +3437,7 @@ def run(server):
     section('########## 11m. CR-06 评审修正（文案/未付异常归位/N+1） ##########', lambda: _cr06_review_cases(s_admin))
     section('########## 11n. CR-07 ③ 付款节点科目列展示 ##########', lambda: _cr07_3_cases(s_admin))
     section('########## 11o. CR-07 ② 勾选式付款节点 ##########', lambda: _cr07_2_cases(s_admin))
+    section('########## 11p. CR-07 ④ 回收站彻底删除 ##########', lambda: _cr07_4_cases(s_admin))
+    section('########## 11q. CR-07 ① 新建页截图识别 ##########', lambda: _cr07_1_cases(s_admin))
     section('########## 12. 导出（批次 6a） ##########', lambda: _batch6_export_import(s_admin))
     section('########## 12. 审计补充（批次 3 补测，末项会删临时库 audit_logs） ##########', lambda: _audit_extras(s_admin))
