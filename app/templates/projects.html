@@ -101,6 +101,28 @@
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <button type="submit" class="btn btn-success btn-sm">恢复</button>
           </form>
+          {% if p.id in business_project_ids %}
+          <span class="btn btn-ghost btn-sm" style="opacity:.55;cursor:not-allowed;" title="已有资金业务，只能归档（保留在回收站）">彻底删除</span>
+          <span class="src-text">已有资金业务，只能归档（保留在回收站）</span>
+          {% else %}
+          <details style="display:inline-block;position:relative;">
+            <summary class="btn btn-danger btn-sm" style="list-style:none;display:inline-block;">彻底删除</summary>
+            <div class="card" style="position:absolute;right:0;z-index:20;width:340px;margin-top:6px;text-align:left;">
+              <form method="post" action="{{ url_for('main.project_purge', project_id=p.id) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <div class="text-danger" style="font-weight:600;">此操作不可恢复，也不会进入回收站</div>
+                <div class="src-text" style="margin:6px 0;">将永久删除项目「{{ p.name }}」的全部科目、付款节点、验收记录、合同识别与截图，以及附件文件；删除前会自动备份数据库。</div>
+                <label style="display:block;margin-bottom:6px;">输入项目名称确认
+                  <input type="text" name="confirm_name" required autocomplete="off" placeholder="{{ p.name }}" style="width:100%;">
+                </label>
+                <label style="display:flex;gap:6px;align-items:center;margin-bottom:8px;">
+                  <input type="checkbox" name="confirm_irreversible" value="1" required> 我已知悉不可恢复
+                </label>
+                <button type="submit" class="btn btn-danger btn-sm">确认彻底删除</button>
+              </form>
+            </div>
+          </details>
+          {% endif %}
           {% else %}
           <form method="post" action="{{ url_for('main.project_delete', project_id=p.id) }}" style="display:inline;" onsubmit="return confirm('确定删除「{{ p.name }}」？删除后进入回收站，可由管理员恢复。');">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

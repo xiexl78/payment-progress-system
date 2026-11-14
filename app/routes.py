@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import shutil
+import sqlite3
 from datetime import date, timedelta, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from functools import wraps
@@ -691,8 +692,10 @@ def projects():
         'done': sum(1 for p in project_list if p.status == '已完成'),
         'amount': sum((p.total_amount() for p in project_list), ZERO),
     }
+    business_project_ids = _project_business_project_ids() if deleted_view else set()
     return render_template('projects.html', projects=project_list, stats=stats,
-                           keyword=keyword, status=status, deleted_view=deleted_view)
+                           keyword=keyword, status=status, deleted_view=deleted_view,
+                           business_project_ids=business_project_ids)
 
 
 def _create_item_nodes(item, ratios, operator_id=None, node_types=None):
@@ -1097,6 +1100,284 @@ def project_restore(project_id):
     db.session.commit()
     flash('项目「%s」已恢复' % project.name, 'success')
     return redirect(url_for('main.project_detail', project_id=project.id))
+
+
+PURGE_BACKUP_KEEP_DAYS = 7
+PURGE_BLOCKED_MSG = '该项目已有申请/开票/付款记录，不可彻底删除，保留在回收站即视为归档'
+
+
+def _project_node_ids(project_id):
+    return [nid for (nid,) in db.session.query(PaymentNode.id)
+            .filter(PaymentNode.project_id == project_id).all()]
+
+
+def _project_business_project_ids():
+    """回收站列表用：一次聚合查询算出「有资金业务」的项目 id 集合（CR-07 ④ / §5.1）。"""
+    ids = set()
+    ids.update(pid for (pid,) in db.session.query(PaymentNode.project_id)
+               .join(PaymentApplication, PaymentApplication.node_id == PaymentNode.id)
+               .distinct().all())
+    ids.update(pid for (pid,) in db.session.query(PaymentNode.project_id)
+               .join(PaymentRecord, PaymentRecord.node_id == PaymentNode.id)
+               .distinct().all())
+    ids.update(pid for (pid,) in db.session.query(PaymentInvoice.project_id)
+               .filter(PaymentInvoice.project_id.isnot(None)).distinct().all())
+    ids.update(pid for (pid,) in db.session.query(PaymentNode.project_id)
+               .join(PaymentInvoice, PaymentInvoice.node_id == PaymentNode.id)
+               .distinct().all())
+    return {pid for pid in ids if pid is not None}
+
+
+def _project_has_money_business(project_id):
+    node_ids = _project_node_ids(project_id)
+    if not node_ids:
+        return db.session.query(PaymentInvoice.id).filter(
+            PaymentInvoice.project_id == project_id).first() is not None
+    app_ids = [aid for (aid,) in db.session.query(PaymentApplication.id).filter(
+        PaymentApplication.node_id.in_(node_ids)).all()]
+    if app_ids:
+        return True
+    if db.session.query(PaymentRecord.id).filter(or_(
+            PaymentRecord.node_id.in_(node_ids),
+            PaymentRecord.application_id.in_(app_ids or [-1]))).first() is not None:
+        return True
+    if db.session.query(PaymentInvoice.id).filter(or_(
+            PaymentInvoice.node_id.in_(node_ids),
+            PaymentInvoice.project_id == project_id)).first() is not None:
+        return True
+    return False
+
+
+def _sqlite_db_path():
+    uri = (current_app.config.get('SQLALCHEMY_DATABASE_URI') or '').strip()
+    if not uri.startswith('sqlite:///'):
+        return None
+    path = uri[len('sqlite:///'):]
+    return os.path.abspath(path.replace('/', os.sep))
+
+
+def _purge_backup_dir():
+    """备份目录：``<backups>/purge``。
+
+    优先 ``PURGE_BACKUP_DIR`` 配置（测试注入），其次 ``$PAYMENT_BACKUP_DIR``，
+    再次 ``%ProgramData%\\PaymentSystem\\backups``（生产），开发环境回退仓库 ``backups/``。
+    """
+    configured = current_app.config.get('PURGE_BACKUP_DIR')
+    if configured:
+        root = configured
+    else:
+        root = os.environ.get('PAYMENT_BACKUP_DIR')
+        if not root:
+            if (current_app.config.get('APP_ENV') or 'development') == 'production':
+                program_data = os.environ.get('ProgramData') or 'C:\\ProgramData'
+                root = os.path.join(program_data, 'PaymentSystem', 'backups')
+            else:
+                root = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')),
+                                    'backups')
+    return os.path.join(root, 'purge')
+
+
+def _backup_before_purge(project):
+    """SQLite 在线备份；返回 (路径, 字节数)。失败抛 RuntimeError（调用方中止删除）。"""
+    db_path = _sqlite_db_path()
+    if not db_path or not os.path.isfile(db_path):
+        raise RuntimeError('找不到数据库文件，无法备份')
+    backup_dir = _purge_backup_dir()
+    os.makedirs(backup_dir, exist_ok=True)
+    stamp = timeutil.utcnow().strftime('%Y%m%d%H%M%S')
+    safe_no = re.sub(r'[^A-Za-z0-9_.-]+', '_', project.project_no or ('project-%d' % project.id))
+    target = os.path.join(backup_dir, '%s-%s.db' % (safe_no, stamp))
+    suffix = 1
+    while os.path.exists(target):
+        suffix += 1
+        target = os.path.join(backup_dir, '%s-%s-%d.db' % (safe_no, stamp, suffix))
+    src = sqlite3.connect(db_path)
+    try:
+        dst = sqlite3.connect(target)
+        try:
+            src.backup(dst)
+            dst.commit()
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    if not os.path.isfile(target):
+        raise RuntimeError('备份文件未生成')
+    return target, os.path.getsize(target)
+
+
+def _cleanup_expired_purge_backups():
+    """清理 purge/ 下超过 7 天的 .db（失败只记 warning，不影响删除结果）。"""
+    backup_dir = _purge_backup_dir()
+    if not os.path.isdir(backup_dir):
+        return {'removed': [], 'errors': []}
+    cutoff = timeutil.utcnow().timestamp() - PURGE_BACKUP_KEEP_DAYS * 86400
+    removed, errors = [], []
+    for name in sorted(os.listdir(backup_dir)):
+        if not name.lower().endswith('.db'):
+            continue
+        path = os.path.join(backup_dir, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed.append(name)
+        except OSError as exc:
+            current_app.logger.warning('清理过期 purge 备份失败：%s（%s）', path, exc)
+            errors.append({'path': path, 'error': str(exc)[:120]})
+    return {'removed': removed, 'errors': errors}
+
+
+def _project_attachment_paths(project_id):
+    """待清理附件：合同文件 + 截图原图 + shots/<id>/ 目录；只保留落在 UPLOAD_DIR 内的路径。"""
+    upload_dir = os.path.realpath(contract_upload_dir())
+    files, dirs = [], []
+    contracts = db.session.query(ContractFile).filter(ContractFile.project_id == project_id).all()
+    for contract in contracts:
+        path = contract_storage_path(contract)
+        if path and os.path.isfile(path):
+            real = os.path.realpath(path)
+            if real.startswith(upload_dir + os.sep):
+                files.append(real)
+        shot_dir = os.path.join(upload_dir, 'shots', str(contract.id))
+        if os.path.isdir(shot_dir):
+            dirs.append(os.path.realpath(shot_dir))
+    shots = db.session.query(ContractScreenshot).filter(
+        ContractScreenshot.project_id == project_id).all()
+    for shot in shots:
+        path = screenshot_storage_path(shot)
+        if path and os.path.isfile(path):
+            real = os.path.realpath(path)
+            if real.startswith(upload_dir + os.sep):
+                files.append(real)
+    seen = set()
+    files = [p for p in files if not (p in seen or seen.add(p))]
+    return files, dirs
+
+
+def _purge_project_rows(project_id):
+    """按 §5.3 顺序级联删除（同一事务，不 commit）；返回各表删除行数。"""
+    node_ids = _project_node_ids(project_id)
+    app_sub = db.session.query(PaymentApplication.id).filter(
+        PaymentApplication.node_id.in_(node_ids))
+    contract_sub = db.session.query(ContractFile.id).filter(
+        ContractFile.project_id == project_id)
+    counts = {}
+    counts['node_action_tokens'] = db.session.query(NodeActionToken).filter(
+        NodeActionToken.node_id.in_(node_ids)).delete(synchronize_session=False) if node_ids else 0
+    record_filter = or_(PaymentRecord.node_id.in_(node_ids),
+                        PaymentRecord.application_id.in_(app_sub))
+    counts['payment_records'] = db.session.query(PaymentRecord).filter(
+        record_filter).delete(synchronize_session=False)
+    counts['payment_applications'] = db.session.query(PaymentApplication).filter(
+        PaymentApplication.node_id.in_(node_ids)).delete(synchronize_session=False)
+    counts['payment_invoices'] = db.session.query(PaymentInvoice).filter(
+        or_(PaymentInvoice.node_id.in_(node_ids), PaymentInvoice.project_id == project_id)
+    ).delete(synchronize_session=False)
+    counts['payment_nodes'] = db.session.query(PaymentNode).filter(
+        PaymentNode.project_id == project_id).delete(synchronize_session=False)
+    counts['project_items'] = db.session.query(ProjectItem).filter(
+        ProjectItem.project_id == project_id).delete(synchronize_session=False)
+    counts['acceptance_records'] = db.session.query(AcceptanceRecord).filter(
+        AcceptanceRecord.project_id == project_id).delete(synchronize_session=False)
+    counts['contract_screenshots'] = db.session.query(ContractScreenshot).filter(
+        or_(ContractScreenshot.project_id == project_id,
+            ContractScreenshot.contract_id.in_(contract_sub))).delete(synchronize_session=False)
+    counts['contract_files'] = db.session.query(ContractFile).filter(
+        ContractFile.project_id == project_id).delete(synchronize_session=False)
+    counts['projects'] = db.session.query(Project).filter(
+        Project.id == project_id).delete(synchronize_session=False)
+    return counts
+
+
+@bp.route('/projects/<int:project_id>/purge', methods=['POST'])
+@login_required
+def project_purge(project_id):
+    """回收站「彻底删除」（CR-07 ④ / 设计 §5）：仅 admin、需二次确认、备份失败即中止。"""
+    user = current_user()
+    if user.role != 'admin':
+        audit_record('project.purge.denied', 'project', project_id, project_id,
+                     after={'role': user.role}, result='denied', critical=False)
+        db.session.commit()
+        abort(403)
+    project = db.session.get(Project, project_id)
+    if not project or project.deleted_at is None:
+        abort(404)
+    if _project_has_money_business(project_id):
+        audit_record('project.purge.blocked', 'project', project_id, project_id,
+                     after={'reason': 'has_money_business'}, result='denied', critical=False)
+        db.session.commit()
+        flash(PURGE_BLOCKED_MSG, 'danger')
+        return redirect(url_for('main.projects', deleted=1))
+
+    confirm_name = (request.form.get('confirm_name') or '').strip()
+    irreversible = (request.form.get('confirm_irreversible') or '').strip()
+    if confirm_name != (project.name or '').strip():
+        flash('项目名称输入不一致，未执行删除（请输入完整项目名称）', 'danger')
+        return redirect(url_for('main.projects', deleted=1))
+    if irreversible not in ('1', 'on', 'true', 'yes'):
+        flash('请先勾选「我已知悉不可恢复」，未执行删除', 'danger')
+        return redirect(url_for('main.projects', deleted=1))
+
+    before_snapshot = _project_snapshot(project)
+    project_name = project.name
+    files, dirs = _project_attachment_paths(project_id)
+    try:
+        backup_path, backup_bytes = _backup_before_purge(project)
+    except Exception as exc:
+        current_app.logger.warning('purge 备份失败：项目 #%s（%s）', project_id, exc)
+        flash('备份失败，已中止删除（数据未变更）：%s' % str(exc)[:120], 'danger')
+        return redirect(url_for('main.projects', deleted=1))
+    before_snapshot['counts'] = {
+        'items': len(project.items), 'nodes': len(project.nodes),
+        'acceptances': len(project.acceptances),
+        'contracts': db.session.query(ContractFile).filter(
+            ContractFile.project_id == project_id).count(),
+        'screenshots': db.session.query(ContractScreenshot).filter(
+            ContractScreenshot.project_id == project_id).count(),
+    }
+    before_snapshot['files'] = files + dirs
+    before_snapshot['backup'] = {'path': backup_path, 'bytes': backup_bytes}
+
+    try:
+        counts = _purge_project_rows(project_id)
+        if not counts.get('projects'):
+            db.session.rollback()
+            abort(404)
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        current_app.logger.exception('purge 失败：项目 #%s', project_id)
+        flash('删除失败，数据未变更，请重试（%s）' % str(exc)[:120], 'danger')
+        return redirect(url_for('main.projects', deleted=1))
+
+    file_errors = []
+    for path in files:
+        try:
+            os.remove(path)
+        except OSError as exc:
+            current_app.logger.warning('purge 删除附件失败：%s（%s）', path, exc)
+            file_errors.append({'path': path, 'error': str(exc)[:120]})
+    for directory in dirs:
+        try:
+            shutil.rmtree(directory)
+        except OSError as exc:
+            current_app.logger.warning('purge 删除附件目录失败：%s（%s）', directory, exc)
+            file_errors.append({'path': directory, 'error': str(exc)[:120]})
+    expired = _cleanup_expired_purge_backups()
+    try:
+        audit_record('project.purge', 'project', project_id, project_id,
+                     before=before_snapshot,
+                     after={'purged': True, 'counts': counts, 'file_errors': file_errors,
+                            'expired_backups': expired['removed'],
+                            'expired_backup_errors': expired['errors']},
+                     result='ok' if not file_errors else 'partial')
+        db.session.commit()
+    except Exception:
+        current_app.logger.exception('purge 审计写入失败：项目 #%s', project_id)
+        db.session.rollback()
+    flash('项目「%s」已彻底删除（不可恢复），删除前备份：%s'
+          % (project_name, backup_path), 'success')
+    return redirect(url_for('main.projects', deleted=1))
 
 
 def _flash_node_token_failure(token_status):

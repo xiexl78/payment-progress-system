@@ -216,6 +216,8 @@ def load_config(base_dir, config_file=None, explicit=False):
         'TRUSTED_PROXY_COUNT': int(trusted_proxy),
         'NODE_TOKEN_TTL_MINUTES': float(node_token_ttl_minutes),
         'DRAFT_RETENTION_DAYS': int(draft_retention_days),
+        # CR-07 ④：purge 前 SQLite 备份根目录（空=按生产/开发约定推导，见 routes._purge_backup_dir）
+        'PURGE_BACKUP_DIR': _raw(file_values, 'PURGE_BACKUP_DIR') or None,
         'CSRF_ENABLED': True,
         'TESTING': False,
         'FORCE_DEFAULT_PASSWORD_CHANGE': (app_env == 'production'),
