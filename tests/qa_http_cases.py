@@ -3057,6 +3057,123 @@ def _cr07_3_cases(s_admin):
               'groups=%s db_nodes=%s probs=%s' % ([t for t, _cs in sections5], n_db5, probs5[:2]))
 
 
+def _cr07_2_cases(s_admin):
+    """CR-07 ②：新建/加科目改为勾选式付款节点（未勾选即不存在、不展示）。"""
+
+    def post_new(no, name, node_types, ratios):
+        data = {'project_no': no, 'name': name, 'item_name': ['科目甲'],
+                'tax_rate': ['6%'], 'original_amount': ['10000']}
+        if node_types is not None:
+            data['node_types'] = list(node_types)
+        for k, v in (ratios or {}).items():
+            data['ratio_' + k] = v
+        return C.post(s_admin, BASE, '/projects/new', data)
+
+    def new_pid(r):
+        loc = r.headers.get('Location', '')
+        return int(loc.rstrip('/').split('/')[-1]) if r.status_code == 302 and '/projects/' in loc else None
+
+    # 1) 只勾 1 类（首付 100%）：库与详情只有 1 个节点 / 1 个分组
+    r1 = post_new('QA-CR07-N1', 'QA单节点项目', ['first'], {'first': '100'})
+    pid1 = new_pid(r1)
+    if pid1:
+        types1 = [x[0] for x in q(DB, 'SELECT node_type FROM payment_nodes WHERE project_id=? ORDER BY id', (pid1,))]
+        probs1, sections1 = _detail_grouped_check(s_admin, pid1)
+        due1 = d2(q1(DB, 'SELECT SUM(due_amount) FROM payment_nodes WHERE project_id=?', (pid1,)) or 0)
+        check('CR07②勾选节点', '只勾 1 类时只建 1 个节点且详情仅 1 组 1 行',
+              types1 == ['first'] and not probs1 and len(sections1) == 1
+              and len(sections1[0][1]) == 1 and due1 == d2('10000'),
+              'types=%s groups=%s probs=%s due=%s' % (types1, [t for t, _c in sections1], probs1[:2], due1))
+    else:
+        check('CR07②勾选节点', '只勾 1 类时只建 1 个节点且详情仅 1 组 1 行', False,
+              'code=%s 未建项目' % r1.status_code)
+
+    # 2) 勾 3 类（40/50/10）：只建 3 个节点、金额按比例
+    r2 = post_new('QA-CR07-N3', 'QA三类节点', ['first', 'progress', 'acceptance'],
+                  {'first': '40', 'progress': '50', 'acceptance': '10'})
+    pid2b = new_pid(r2)
+    if pid2b:
+        rows2 = q(DB, 'SELECT node_type, due_amount FROM payment_nodes WHERE project_id=? ORDER BY id', (pid2b,))
+        dues2 = {t: d2(v) for t, v in rows2}
+        probs2, sections2 = _detail_grouped_check(s_admin, pid2b)
+        check('CR07②勾选节点', '勾 3 类时只建 3 个节点且金额按勾选比例',
+              len(rows2) == 3 and set(dues2) == {'first', 'progress', 'acceptance'}
+              and dues2['first'] == d2('4000') and dues2['progress'] == d2('5000')
+              and dues2['acceptance'] == d2('1000') and not probs2,
+              'rows=%s probs=%s' % (rows2, probs2[:2]))
+        check('CR07②勾选节点', '未勾选的质保金不建节点、详情表无该分组',
+              'warranty' not in dues2 and not any(t.startswith('质保金') for t, _c in sections2),
+              'groups=%s' % [t for t, _c in sections2])
+    else:
+        check('CR07②勾选节点', '勾 3 类时只建 3 个节点且金额按勾选比例', False,
+              'code=%s 未建项目' % r2.status_code)
+        check('CR07②勾选节点', '未勾选的质保金不建节点、详情表无该分组', False, '依赖上一条')
+
+    # 3) 0 勾选：拒绝且不建项目
+    r3 = post_new('QA-CR07-N0', 'QA零勾选', [], None)
+    check('CR07②勾选节点', '一个都不勾选时拒绝新建（提示至少勾选一类）',
+          r3.status_code == 200 and '至少勾选' in r3.text
+          and not q1(DB, 'SELECT id FROM projects WHERE project_no=?', ('QA-CR07-N0',)),
+          'code=%s 提示=%s' % (r3.status_code, '至少勾选' in r3.text))
+
+    # 4) 只勾非法类型：等价 0 勾选，拒绝
+    r4 = post_new('QA-CR07-NX', 'QA非法类型', ['bogus'], None)
+    check('CR07②勾选节点', '只传非法节点类型时拒绝（按未勾选处理）',
+          r4.status_code == 200 and not q1(DB, 'SELECT id FROM projects WHERE project_no=?', ('QA-CR07-NX',)),
+          'code=%s' % r4.status_code)
+
+    # 5) 勾选类型比例合计 != 100：拒绝
+    r5 = post_new('QA-CR07-N90', 'QA比例90', ['first', 'progress'],
+                  {'first': '40', 'progress': '50'})
+    check('CR07②勾选节点', '勾选类型比例合计 90% 时拒绝新建',
+          r5.status_code == 200 and not q1(DB, 'SELECT id FROM projects WHERE project_no=?', ('QA-CR07-N90',)),
+          'code=%s' % r5.status_code)
+
+    # 6) 勾选但该类型比例为 0：拒绝
+    r6 = post_new('QA-CR07-NZ', 'QA零比例', ['first', 'progress'],
+                  {'first': '0', 'progress': '100'})
+    check('CR07②勾选节点', '勾选类型比例为 0 时拒绝新建',
+          r6.status_code == 200 and not q1(DB, 'SELECT id FROM projects WHERE project_no=?', ('QA-CR07-NZ',)),
+          'code=%s' % r6.status_code)
+
+    # 7) 加科目不新增节点类型：节点数翻倍、类型集合不变
+    if pid1:
+        before = q1(DB, 'SELECT COUNT(*) FROM payment_nodes WHERE project_id=?', (pid1,))
+        item_data = {'item_name': 'QA追加科目', 'tax_rate': '6%', 'original_amount': '5000',
+                     'ratio_first': '100'}
+        C.post(s_admin, BASE, '/projects/%d/items' % pid1, item_data)
+        after = q1(DB, 'SELECT COUNT(*) FROM payment_nodes WHERE project_id=?', (pid1,))
+        types_after = sorted(set(x[0] for x in q(DB, 'SELECT node_type FROM payment_nodes WHERE project_id=?', (pid1,))))
+        check('CR07②勾选节点', '加科目沿用项目已有节点类型、不新增未勾选类型',
+              after == before * 2 and types_after == ['first'],
+              'before=%s after=%s types=%s' % (before, after, types_after))
+
+    # 8) 导出只包含存在的节点（3 类项目：节点行只 3 个、无质保金）
+    if pid2b:
+        resp = s_admin.get(BASE + '/projects/%d/export.xlsx' % pid2b, timeout=120)
+        node_rows = 0
+        has_warranty = False
+        bad = ''
+        try:
+            from io import BytesIO
+            from openpyxl import load_workbook
+            wb = load_workbook(BytesIO(resp.content))
+            for ws in wb.worksheets:
+                for row in ws.iter_rows(values_only=True):
+                    line = ' '.join(str(c) if c is not None else '' for c in row)
+                    if any(k in line for k in ('首付款', '进度款', '验收款', '质保金')):
+                        node_rows += 1
+                        if '质保金' in line:
+                            has_warranty = True
+            ok8 = resp.status_code == 200 and node_rows == 3 and not has_warranty
+        except Exception as exc:  # 解析失败按失败上报
+            ok8 = False
+            bad = repr(exc)
+        check('CR07②勾选节点', '项目导出 xlsx 只含存在的 3 个节点、无质保金行',
+              ok8, 'code=%s rows=%s warranty=%s %s' % (resp.status_code, node_rows, has_warranty, bad))
+
+
+
 def run(server):
     global DB, BASE, APP, UPLOAD_DIR
     DB, BASE, APP, UPLOAD_DIR = server.db_path, server.base, server.app, server.upload_dir
@@ -3098,5 +3215,6 @@ def run(server):
     section('########## 11l. CR-06 付款/未付口径与冻结范围 ##########', lambda: _cr06_cases(s_admin))
     section('########## 11m. CR-06 评审修正（文案/未付异常归位/N+1） ##########', lambda: _cr06_review_cases(s_admin))
     section('########## 11n. CR-07 ③ 付款节点科目列展示 ##########', lambda: _cr07_3_cases(s_admin))
+    section('########## 11o. CR-07 ② 勾选式付款节点 ##########', lambda: _cr07_2_cases(s_admin))
     section('########## 12. 导出（批次 6a） ##########', lambda: _batch6_export_import(s_admin))
     section('########## 12. 审计补充（批次 3 补测，末项会删临时库 audit_logs） ##########', lambda: _audit_extras(s_admin))
