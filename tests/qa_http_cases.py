@@ -3394,6 +3394,196 @@ def _cr07_1_cases(s_admin):
 
 
 
+def _cr08_review_cases(s_admin):
+    """CR-08 收尾批次 4 条遗留：备注三处同源 / change_note 操作人 / OCR 比例 / 截图文件头。"""
+    import io as _io8
+    import shutil as _sh8
+    from openpyxl import load_workbook as _lw8
+    from app.money import fmt_money as _fmt8
+
+    def _sql8b(sql, args=()):
+        conn = sqlite3.connect(DB)
+        try:
+            conn.execute(sql, args)
+            conn.commit()
+        finally:
+            conn.close()
+
+    # ---------- ①「未付异常备注」页面 / app/exporter / scripts 三处同源 ----------
+    _, pn = create_project(s_admin, 'QA-CR08-NOTE', 'QA备注同源项目',
+                           [('QA-CR08备注科目', '30000', '0')],
+                           ratios={'node_types': ['first'], 'ratio_first': '100'})
+    if pn:
+        nn = node_ids(pn, 'first')[0]
+        _sql8b('UPDATE payment_nodes SET applied_amount=?, paid_amount=? WHERE id=?',
+                 ('32000', '34000', nn))
+        expected_note = ('超付申请 %s；超额申请 %s'
+                         % (_fmt8(2000, symbol=True), _fmt8(2000, symbol=True)))
+
+        rep = s_admin.get(BASE + '/reports', timeout=60).text
+        row_page = ''
+        for tr in re.findall(r'<tr[^>]*>.*?</tr>', rep, re.S):
+            if 'QA-CR08-NOTE' in tr:
+                row_page = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', tr))
+                break
+        check('CR08', '报表页「未付异常备注」与模型同源（超付申请+超额申请）',
+              expected_note in row_page, '期望=%r 页面行=%r' % (expected_note, row_page[:220]))
+
+        def _report_note(wb):
+            for ws_ in wb.worksheets:
+                rows_ = list(ws_.iter_rows(values_only=True))
+                if not rows_:
+                    continue
+                hdr_ = [str(c) if c is not None else '' for c in rows_[0]]
+                if '未付异常备注' not in hdr_ or '项目编号' not in hdr_:
+                    continue
+                i_note = hdr_.index('未付异常备注')
+                i_no = hdr_.index('项目编号')
+                for row_ in rows_[1:]:
+                    if str(row_[i_no] or '') == 'QA-CR08-NOTE':
+                        note = str(row_[i_note] or '')
+                        if note:
+                            return note
+                        for cell in row_:
+                            if cell and '超付申请' in str(cell):
+                                return str(cell)
+                        return ''
+            return None
+
+        resp_rep = s_admin.get(BASE + '/reports/export.xlsx', timeout=60)
+        note_web = None
+        try:
+            note_web = _report_note(_lw8(_io8.BytesIO(resp_rep.content)))
+        except Exception as e:
+            check('CR08', '报表导出 xlsx 可解析', False,
+                  'status=%s %r' % (resp_rep.status_code, e))
+        check('CR08', 'Web 报表导出「未付异常备注」与页面一致',
+              note_web == expected_note, '导出=%r 期望=%r' % (note_web, expected_note))
+
+        tmpd = tempfile.mkdtemp(prefix='qa_cr08_exp_')
+        try:
+            dbcopy = os.path.join(tmpd, 'copy.db')
+            # WAL 模式下直接拷 .db 会丢未 checkpoint 的数据，用 backup API 取一致快照
+            _src8 = sqlite3.connect(DB)
+            _dst8 = sqlite3.connect(dbcopy)
+            try:
+                _src8.backup(_dst8)
+            finally:
+                _dst8.close()
+                _src8.close()
+            outdir = os.path.join(tmpd, 'out')
+            os.makedirs(outdir, exist_ok=True)
+            env = os.environ.copy()
+            env['PYTHONIOENCODING'] = 'utf-8'
+            env['PYTHONUTF8'] = '1'
+            proc = subprocess.run(
+                [sys.executable, os.path.join(PROJECT_ROOT, 'scripts', 'export_excel.py'),
+                 '--db', dbcopy, '--out', outdir, '--no-audit'],
+                cwd=PROJECT_ROOT, capture_output=True, text=True,
+                encoding='utf-8', errors='replace', timeout=180, env=env)
+            note_cli = None
+            for name in sorted(os.listdir(outdir)):
+                if not name.lower().endswith('.xlsx'):
+                    continue
+                note_cli = _report_note(_lw8(os.path.join(outdir, name)))
+                if note_cli is not None:
+                    break
+            check('CR08', '命令行导出「未付异常备注」与页面/Web 导出同源',
+                  proc.returncode == 0 and note_cli == expected_note,
+                  'rc=%s 脚本=%r 期望=%r err=%s' % (
+                      proc.returncode, note_cli, expected_note,
+                      (proc.stderr or '')[-200:]))
+        finally:
+            _sh8.rmtree(tmpd, ignore_errors=True)
+
+    # ---------- ② 合同变更冻结节点：change_note 记操作人 ----------
+    _, pc = create_project(s_admin, 'QA-CR08-CH', 'QA变更操作人项目',
+                           [('QA-CR08变更科目', '30000', '0')])
+    if pc:
+        nc = node_ids(pc, 'first')[0]
+        C.post(s_admin, BASE, '/nodes/%d/update' % nc,
+               {'action': 'apply', 'apply_amount': '100',
+                'apply_no': C.next_apply_no('QA-CR08-CH')})
+        iid_c = item_ids(pc)[0]
+        contract_change(s_admin, pc, {iid_c: '40000'})
+        rows_c = q(DB, 'SELECT change_note, updated_by FROM payment_nodes WHERE id=?', (nc,))
+        note_c = (rows_c[0][0] or '') if rows_c else ''
+        upd_c = rows_c[0][1] if rows_c else None
+        admin_id = q1(DB, "SELECT id FROM users WHERE username='admin'")
+        check('CR08', '合同变更冻结节点写 change_note 并记录 updated_by（操作人）',
+              '已冻结' in note_c and upd_c == admin_id,
+              'note=%r updated_by=%r admin_id=%r' % (note_c, upd_c, admin_id))
+        check('CR08', '冻结节点 change_note 文本中可直接看到操作人',
+              '操作人' in note_c or 'admin' in note_c,
+              'note=%r' % (note_c,))
+        page_c = s_admin.get(BASE + '/projects/%d' % pc, timeout=60).text
+        check('CR08', '详情页可看到该冻结备注（含操作人）',
+              '已冻结' in page_c and ('操作人' in page_c or 'admin' in page_c),
+              '详情页未显示操作人')
+
+    # ---------- ③ OCR 比例：收紧后不误报且主链路不回归 ----------
+    from app.contract_engine import extract_ratios as _er
+
+    def _rt(text):
+        return {k: v[0] for k, v in _er(text).items()}
+
+    simple = _rt('首付款 40%\n进度款 50%\n验收款 8%\n质保金 2%')
+    check('CR08', 'OCR 比例：简单比例行全部识别（主链路不回归）',
+          simple == {'first': 0.4, 'progress': 0.5, 'acceptance': 0.08,
+                     'warranty': 0.02}, '%s' % simple)
+    natural = _rt('首付款：合同签订后支付 40%\n进度款：到货验收后支付 50%'
+                  '\n验收款：验收合格后支付 8%\n质保金：质保期满支付 2%')
+    check('CR08', 'OCR 比例：自然句式（…后支付 40%）仍能识别（主链路不回归）',
+          natural == {'first': 0.4, 'progress': 0.5, 'acceptance': 0.08,
+                      'warranty': 0.02}, '%s' % natural)
+    tricky = _rt('首付款 40%\n进度款：到货验收后支付 50%\n验收款 8%\n质保金 2%')
+    check('CR08', 'OCR 比例：进度款行含「验收」不再误判为验收款',
+          tricky.get('acceptance') == 0.08 and tricky.get('progress') == 0.5,
+          '%s' % tricky)
+
+    # ---------- ④ 截图上传：文件头（魔数）校验 ----------
+    from PIL import Image as _Img8
+
+    def _png8(lines=('QA CR08',)):
+        im = _Img8.new('RGB', (620, 220), 'white')
+        buf = _io8.BytesIO()
+        im.save(buf, 'PNG')
+        return buf.getvalue()
+
+    good = _png8()
+    cnt0 = q1(DB, 'SELECT COUNT(*) FROM contract_files')
+    r_fake = C.post(s_admin, BASE, '/contracts/shots',
+                    files={'shot_amount': ('fake.png', b'this is not a png', 'image/png'),
+                           'shot_payment': ('pay.png', good, 'image/png')})
+    flash_fake = ''
+    if r_fake.status_code == 302:
+        flash_fake = s_admin.get(BASE + (r_fake.headers.get('Location') or '/contracts'),
+                                 timeout=60).text
+    cnt1 = q1(DB, 'SELECT COUNT(*) FROM contract_files')
+    check('CR08', '伪造 PNG（文件头非法）上传被拒且不落库',
+          r_fake.status_code == 302 and cnt1 == cnt0,
+          'code=%s cnt=%s→%s' % (r_fake.status_code, cnt0, cnt1))
+    check('CR08', '非法文件头提示为中文（含「文件」或「图片」）',
+          ('文件' in flash_fake or '图片' in flash_fake),
+          '未看到中文提示')
+
+    def _valid_shots():
+        out = {}
+        for st, txt in (('amount', '合同总金额：120000.00 元'),
+                        ('payment', '首付款 40%')):
+            im = _Img8.new('RGB', (1200, 400), 'white')
+            buf = _io8.BytesIO()
+            im.save(buf, 'PNG')
+            out['shot_' + st] = (st + '.png', buf.getvalue(), 'image/png')
+        return out
+
+    r_ok = C.post(s_admin, BASE, '/contracts/shots', files=_valid_shots())
+    cnt2 = q1(DB, 'SELECT COUNT(*) FROM contract_files')
+    check('CR08', '合法 PNG 文件头校验通过（正常建草稿）',
+          r_ok.status_code == 302 and cnt2 == cnt1 + 1,
+          'code=%s cnt=%s→%s' % (r_ok.status_code, cnt1, cnt2))
+
+
 def run(server):
     global DB, BASE, APP, UPLOAD_DIR
     DB, BASE, APP, UPLOAD_DIR = server.db_path, server.base, server.app, server.upload_dir
@@ -3438,5 +3628,6 @@ def run(server):
     section('########## 11o. CR-07 ② 勾选式付款节点 ##########', lambda: _cr07_2_cases(s_admin))
     section('########## 11p. CR-07 ④ 回收站彻底删除 ##########', lambda: _cr07_4_cases(s_admin))
     section('########## 11q. CR-07 ① 新建页截图识别 ##########', lambda: _cr07_1_cases(s_admin))
+    section('########## 11r. CR-08 收尾复核（4 条遗留） ##########', lambda: _cr08_review_cases(s_admin))
     section('########## 12. 导出（批次 6a） ##########', lambda: _batch6_export_import(s_admin))
     section('########## 12. 审计补充（批次 3 补测，末项会删临时库 audit_logs） ##########', lambda: _audit_extras(s_admin))
