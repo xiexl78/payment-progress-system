@@ -135,19 +135,14 @@ def _export_reports(app, projects, out_dir):
             [(Decimal(node.paid_amount or 0) - Decimal(node.due_amount or 0)).quantize(CENT)
              for node in project.nodes
              if Decimal(node.paid_amount or 0) > Decimal(node.due_amount or 0)])
-        note_parts = []
-        if project.over_paid_application > 0:
-            note_parts.append('超付申请 %s' % ('￥' + format(
-                project.over_paid_application, ',.2f')))
-        if project.over_applied > 0:
-            note_parts.append('超额申请 %s' % ('￥' + format(
-                project.over_applied, ',.2f')))
+        # 与页面 / app/exporter.py 同源：直接复用模型派生备注（CR-06/CR-07 收尾）
+        unpaid_note = project.unpaid_note
         progress = ((paid / due * Decimal('100')).quantize(Decimal('0.1'))
                     if due else Decimal('0'))
         rows.append({'project': project, 'contract': project.total_amount(),
                      'due': due, 'applied': applied, 'invoice': invoice,
                      'paid': paid, 'unpaid': unpaid, 'unapplied': unapplied,
-                     'unpaid_note': '；'.join(note_parts),
+                     'unpaid_note': unpaid_note,
                      'progress': progress, 'overpaid_due': overpaid_due})
     totals = {
         'contract': sum_money(r['contract'] for r in rows),

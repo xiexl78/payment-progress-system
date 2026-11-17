@@ -1728,6 +1728,13 @@ SHOT_REQUIRED = ('amount', 'payment')
 SHOT_EXTS = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
              'bmp': 'image/bmp', 'webp': 'image/webp'}
 MAX_SHOT_BYTES = 10 * 1024 * 1024
+#: 图片文件头（魔数）：只校验扩展名会被改后缀的假图片绕过
+SHOT_MAGIC = {
+    'jpg': (b'\xff\xd8\xff',), 'jpeg': (b'\xff\xd8\xff',),
+    'png': (b'\x89PNG\r\n\x1a\n',),
+    'bmp': (b'BM',),
+    'webp': (b'RIFF',),
+}
 
 
 
@@ -1910,8 +1917,25 @@ def screenshot_storage_path(shot):
     return os.path.join(contract_upload_dir(), name)
 
 
+def _shot_magic_ok(stream, ext):
+    """校验图片文件头（魔数）与扩展名一致；WEBP 还需在第 8~12 字节出现 ``WEBP``。"""
+    try:
+        stream.seek(0)
+        head = stream.read(16)
+        stream.seek(0)
+    except (OSError, AttributeError):
+        return True  # 读不到文件头时按原流程交由 OCR 判定，不误伤
+    if not head:
+        return False
+    if not head.startswith(SHOT_MAGIC[ext][0]):
+        return False
+    if ext == 'webp':
+        return b'WEBP' in head[8:12]
+    return True
+
+
 def _shot_file_error(file_obj, shot_type):
-    """校验单张截图扩展名与大小，返回 (ext, mime, size, error)。"""
+    """校验单张截图扩展名、大小与文件头，返回 (ext, mime, size, error)。"""
     name = file_obj.filename or ''
     ext = (name.rsplit('.', 1)[-1] if '.' in name else '').lower()
     if ext not in SHOT_EXTS:
@@ -1925,6 +1949,9 @@ def _shot_file_error(file_obj, shot_type):
         size = 0
     if size > MAX_SHOT_BYTES:
         return ext, None, size, '%s：图片超过 10MB，请压缩后重传' % SHOT_LABELS[shot_type]
+    if not _shot_magic_ok(file_obj.stream, ext):
+        return ext, None, size, '%s：文件内容与图片格式不符（不是有效的 %s 图片），请重新导出后上传' \
+            % (SHOT_LABELS[shot_type], ext.upper())
     return ext, SHOT_EXTS[ext], size, None
 
 
@@ -3028,6 +3055,8 @@ def _contract_change_values(project):
 def _apply_contract_change(project, plan):
     """应用变更：科目增补金额 + 未付节点应付/状态 + 节点变更备注；已发生业务节点不动。"""
     operator_id = _operator_id()
+    operator = current_user()
+    operator_name = (operator.display_name or operator.username) if operator else '系统'
     before = {'items': {c['item'].id: {'name': c['item'].item_name,
                                        'total': format(c['old_total'], 'f')}
                         for c in plan['item_changes']},
@@ -3045,10 +3074,11 @@ def _apply_contract_change(project, plan):
         if row['frozen']:
             # CR-06：唯一冻结口径（has_business）——金额/状态/日期一律不动，
             # 仅允许追加 change_note 记录本次变更（§2.2 第 8 步）。
-            note = '合同变更：节点已冻结（已申请/开票/付款），应付 %s 未变' % (
-                fmt_money(row['old_due']))
+            note = '合同变更：节点已冻结（已申请/开票/付款），应付 %s 未变（操作人：%s）' % (
+                fmt_money(row['old_due']), operator_name)
             node.change_note = (note if not node.change_note
                                 else (node.change_note + '；' + note))[:255]
+            node.updated_by = operator_id
             after_nodes[node.id] = {'due': format(row['old_due'], 'f'),
                                     'status': node.status,
                                     'frozen': True}
@@ -3172,11 +3202,6 @@ def _reports_data():
              if Decimal(n.paid_amount or 0) > Decimal(n.due_amount or 0)])
         over_paid_application = p.over_paid_application
         over_applied = p.over_applied
-        note_parts = []
-        if over_paid_application > 0:
-            note_parts.append('超付申请 %s' % fmt_money(over_paid_application, symbol=True))
-        if over_applied > 0:
-            note_parts.append('超额申请 %s' % fmt_money(over_applied, symbol=True))
         progress = ((paid / due * Decimal('100')).quantize(Decimal('0.1'))
                     if due else ZERO)
         rows.append({
@@ -3184,7 +3209,7 @@ def _reports_data():
             'due': due, 'applied': applied,
             'invoice': invoice, 'paid': paid,
             'unpaid': unpaid, 'unapplied': unapplied,
-            'unpaid_note': '；'.join(note_parts),
+            'unpaid_note': p.unpaid_note,
             'progress': progress,
             'overpaid_due': overpaid_due,
             'over_paid_application': over_paid_application,

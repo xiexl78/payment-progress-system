@@ -93,6 +93,17 @@ class Project(db.Model):
         """超额申请 = Σ max(0, 已申请 − 应付)。"""
         return sum((n.over_applied for n in self.nodes), ZERO).quantize(CENT)
 
+    @property
+    def unpaid_note(self):
+        """未付异常备注（超付申请/超额申请）：报表页面、Web 导出、命令行导出同源。"""
+        from .money import fmt_money
+        parts = []
+        if self.over_paid_application > 0:
+            parts.append('超付申请 ' + fmt_money(self.over_paid_application, symbol=True))
+        if self.over_applied > 0:
+            parts.append('超额申请 ' + fmt_money(self.over_applied, symbol=True))
+        return '；'.join(parts)
+
     def to_dict(self):
         return {
             'id': self.id, 'project_no': self.project_no, 'name': self.name,

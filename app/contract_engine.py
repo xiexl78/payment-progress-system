@@ -165,9 +165,46 @@ NODE_PATTERNS = {
     ],
 }
 
+#: 各节点比例关键词（用于收紧误报：比例数值前最近的节点关键词必须是本类型）
+NODE_KEYWORDS = {
+    'first': re.compile(r'(?:首付款?|预付款?|预付定?金|定金|签约款|合同签订|签订合同|合同生效)'),
+    'progress': re.compile(r'(?:进度款?|货到|到货|交付|安装)'),
+    # 验收类必须带「款」才算比例字段：「到货验收后支付 50%」是进度款、不是验收款
+    'acceptance': re.compile(r'(?:验收款|尾款|完工结算|余额|余款)'),
+    'warranty': re.compile(r'(?:质保金|保修金|质保款|保证金)'),
+}
+
 #: CR-04：系统不再提供任何默认比例，未识别比例留空由人工填写。
 NODE_NAMES = {'first': '首付款', 'progress': '进度款', 'acceptance': '验收款', 'warranty': '质保金'}
 CALC_BASES = {'first': 'total', 'progress': 'total', 'acceptance': 'total', 'warranty': 'total'}
+
+
+def _line_head(text, pos):
+    """取 ``pos`` 之前同一行/同一分句的文字（到换行或「。；;」为止）。"""
+    cut = max(text.rfind('\n', 0, pos), text.rfind('。', 0, pos),
+              text.rfind('；', 0, pos), text.rfind(';', 0, pos))
+    return text[cut + 1:pos]
+
+
+def _ratio_anchor_ok(node_type, text, match):
+    """比例数值必须归属本类型节点，避免全文其它百分比（税率/违约金/别家比例）被误取。
+
+    判定：取数值前同句内「最近的节点关键词」，其类型必须等于本类型；
+    「首付款：合同签订后支付 40%」这类自然句式仍然通过（中间只隔描述词）。
+    数值前没有节点关键词时，只接受「5%作为质保金」这种数值后紧跟质保表述的写法。
+    """
+    num_start = match.start(1)
+    head = _line_head(text, num_start)
+    nearest = None
+    for nt, kw in NODE_KEYWORDS.items():
+        for km in kw.finditer(head):
+            if nearest is None or km.end() > nearest[0]:
+                nearest = (km.end(), nt)
+    if nearest is not None:
+        return nearest[1] == node_type
+    suffix = text[match.end(1):match.end()]
+    return '质保金' in suffix or '保证金' in suffix or '保修金' in suffix
+
 
 
 #: 中文数字 → 月份（合同里「两年」「十二个月」这类写法）
@@ -186,14 +223,17 @@ def extract_ratios(text):
     for nt, pats in NODE_PATTERNS.items():
         found = False
         for p in pats:
-            m = p.search(text)
-            if m:
+            for m in p.finditer(text):
+                if not _ratio_anchor_ok(nt, text, m):
+                    continue
                 try:
                     r = float(m.group(1)) / 100.0
                 except (ValueError, KeyError):
                     continue
                 result[nt] = (r, m.group(0).strip(), True)
                 found = True
+                break
+            if found:
                 break
         if not found:
             result[nt] = (None, None, False)
